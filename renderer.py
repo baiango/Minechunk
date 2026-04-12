@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import cProfile
-import heapq
 import ctypes
 import os
 import math
@@ -44,6 +43,7 @@ CHUNK_PREP_TOKEN_CAP = 500.0
 CHUNK_FORWARD_CONE_LATERAL_RATIO = 0.5
 CHUNK_PREP_REQUEST_BUDGET_CAP = 8
 CHUNK_PREP_REQUEST_BATCH_SIZE = 8
+CHUNK_PREP_REORDER_YAW_DELTA = math.radians(10.0)
 ENGINE_MODE_CPU = "cpu"
 ENGINE_MODE_GPU = "gpu"
 ENGINE_MODE = ENGINE_MODE_GPU
@@ -1698,7 +1698,10 @@ class TerrainRenderer:
         self._visible_chunk_origin: tuple[int, int] | None = None
         self._visible_displayed_coords: set[tuple[int, int]] = set()
         self._visible_missing_coords: set[tuple[int, int]] = set()
-        self._visible_missing_queue: deque[tuple[int, int]] = deque()
+        self._chunk_request_queue: deque[tuple[int, int]] = deque()
+        self._chunk_request_queue_origin: tuple[int, int] | None = None
+        self._chunk_request_queue_yaw = 0.0
+        self._chunk_request_queue_dirty = True
         self._pending_chunk_coords: set[tuple[int, int]] = set()
         self._transient_render_buffers: list[list[wgpu.GPUBuffer]] = []
         self._tile_render_batches: dict[tuple[int, int], ChunkRenderBatch] = {}
@@ -2823,6 +2826,9 @@ class TerrainRenderer:
         self.chunk_cache.clear()
         self._mesh_buffer_refs.clear()
         self._pending_chunk_coords.clear()
+        self._chunk_request_queue.clear()
+        self._chunk_request_queue_origin = None
+        self._chunk_request_queue_dirty = True
         self._pending_voxel_mesh_results.clear()
         while self._pending_gpu_mesh_batches:
             pending = self._pending_gpu_mesh_batches.popleft()
@@ -2898,7 +2904,7 @@ class TerrainRenderer:
                 self._visible_displayed_coords.discard(old_key)
                 if old_key not in self._pending_chunk_coords:
                     self._visible_missing_coords.add(old_key)
-                    self._visible_missing_queue.append(old_key)
+                    self._chunk_request_queue_dirty = True
 
     def _chunk_mesh_age(self, mesh: ChunkMesh) -> float:
         return max(0.0, time.perf_counter() - mesh.created_at)
@@ -4236,6 +4242,7 @@ class TerrainRenderer:
             )
         return meshes
 
+    @profile
     def _gpu_make_chunk_mesh_batch_from_surface_gpu_batch(
         self,
         surface_batch: ChunkSurfaceGpuBatch,
@@ -4384,7 +4391,54 @@ class TerrainRenderer:
                 missing.add(coord)
         self._visible_displayed_coords = displayed
         self._visible_missing_coords = missing
-        self._visible_missing_queue = deque(self._visible_chunk_coords)
+        self._chunk_request_queue.clear()
+        self._chunk_request_queue_origin = None
+        self._chunk_request_queue_dirty = True
+
+    def _chunk_request_queue_needs_rebuild(self, current_origin: tuple[int, int]) -> bool:
+        if self._chunk_request_queue_dirty:
+            return True
+        if self._chunk_request_queue_origin != current_origin:
+            return True
+        if self._visible_missing_coords and not self._chunk_request_queue:
+            return True
+        yaw_delta = abs(math.atan2(
+            math.sin(self.camera.yaw - self._chunk_request_queue_yaw),
+            math.cos(self.camera.yaw - self._chunk_request_queue_yaw),
+        ))
+        return yaw_delta >= CHUNK_PREP_REORDER_YAW_DELTA
+
+    def _rebuild_chunk_request_queue(
+        self,
+        camera_chunk_x: int,
+        camera_chunk_z: int,
+    ) -> None:
+        if not self._visible_missing_coords:
+            self._chunk_request_queue.clear()
+            self._chunk_request_queue_origin = (camera_chunk_x, camera_chunk_z)
+            self._chunk_request_queue_yaw = self.camera.yaw
+            self._chunk_request_queue_dirty = False
+            return
+
+        forward = flat_forward_vector(self.camera.yaw)
+        right = right_vector(self.camera.yaw)
+        ordered = sorted(
+            self._visible_missing_coords,
+            key=lambda coord: self._chunk_prep_priority(
+                coord[0],
+                coord[1],
+                camera_chunk_x,
+                camera_chunk_z,
+                forward[0],
+                forward[2],
+                right[0],
+                right[2],
+            ),
+        )
+        self._chunk_request_queue = deque(ordered)
+        self._chunk_request_queue_origin = (camera_chunk_x, camera_chunk_z)
+        self._chunk_request_queue_yaw = self.camera.yaw
+        self._chunk_request_queue_dirty = False
 
     def _refresh_visible_chunk_set(self) -> float:
         visibility_start = time.perf_counter()
@@ -4502,59 +4556,29 @@ class TerrainRenderer:
 
         camera_chunk_x = current_origin[0]
         camera_chunk_z = current_origin[1]
-        forward_x = forward[0]
-        forward_z = forward[2]
-        right_x = right[0]
-        right_z = right[2]
-        lateral_ratio = CHUNK_FORWARD_CONE_LATERAL_RATIO
         pending_chunk_coords = self._pending_chunk_coords
         displayed_chunk_coords = self._visible_displayed_coords
 
-        front_candidates: list[tuple[tuple[float, int, int], tuple[float, int, int], tuple[int, int]]] = []
-        other_candidates: list[tuple[tuple[int, float, float, float, int, int], tuple[int, float, float, float, int, int], tuple[int, int]]] = []
+        if prep_budget > 0 and missing_count > 0 and self._chunk_request_queue_needs_rebuild(current_origin):
+            self._rebuild_chunk_request_queue(camera_chunk_x, camera_chunk_z)
 
-        missing_queue = self._visible_missing_queue
-        scan_budget = min(len(missing_queue), max(512, candidate_cap * 128))
-        for _ in range(scan_budget):
-            if not missing_queue:
-                break
-            coord = missing_queue.popleft()
-            if coord not in missing_coords or coord in pending_chunk_coords:
+        request_coords: list[tuple[int, int]] = []
+        request_queue = self._chunk_request_queue
+        while request_queue and len(request_coords) < prep_budget:
+            coord = request_queue.popleft()
+            if coord in pending_chunk_coords or coord not in missing_coords:
                 continue
+            request_coords.append(coord)
 
-            chunk_x, chunk_z = coord
-            dx = chunk_x - camera_chunk_x
-            dz = chunk_z - camera_chunk_z
-            abs_dx = abs(dx)
-            abs_dz = abs(dz)
-            distance_sq = float(dx * dx + dz * dz)
-            forward_score = dx * forward_x + dz * forward_z
-            lateral_score = abs(dx * right_x + dz * right_z)
+        if not request_coords and prep_budget > 0 and missing_count > 0 and self._visible_missing_coords:
+            self._rebuild_chunk_request_queue(camera_chunk_x, camera_chunk_z)
+            request_queue = self._chunk_request_queue
+            while request_queue and len(request_coords) < prep_budget:
+                coord = request_queue.popleft()
+                if coord in pending_chunk_coords or coord not in missing_coords:
+                    continue
+                request_coords.append(coord)
 
-            if forward_score > 0.0 and lateral_score <= forward_score * lateral_ratio:
-                key = (distance_sq, abs_dz, abs_dx)
-                inv_key = (-distance_sq, -abs_dz, -abs_dx)
-                entry = (inv_key, key, coord)
-                if len(front_candidates) < candidate_cap:
-                    heapq.heappush(front_candidates, entry)
-                elif inv_key > front_candidates[0][0]:
-                    heapq.heapreplace(front_candidates, entry)
-            else:
-                key = (1, distance_sq, lateral_score, -forward_score, abs_dz, abs_dx)
-                inv_key = (-1, -distance_sq, -lateral_score, forward_score, -abs_dz, -abs_dx)
-                entry = (inv_key, key, coord)
-                if len(other_candidates) < candidate_cap:
-                    heapq.heappush(other_candidates, entry)
-                elif inv_key > other_candidates[0][0]:
-                    heapq.heapreplace(other_candidates, entry)
-
-            missing_queue.append(coord)
-
-        front_cone_coords = [coord for _, _, coord in sorted(front_candidates, key=lambda item: item[1])]
-        other_coords = [coord for _, _, coord in sorted(other_candidates, key=lambda item: item[1])]
-        request_coords = front_cone_coords[:prep_budget]
-        if not request_coords:
-            request_coords = other_coords[:prep_budget]
         if request_coords:
             batch_size = max(1, min(self.mesh_batch_size, CHUNK_PREP_REQUEST_BATCH_SIZE))
             request_batches = [
