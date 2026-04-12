@@ -1,25 +1,41 @@
 # Infinite Procedural World
 
-A real-time voxel terrain renderer built in Python on top of `wgpu-py`, with deterministic procedural generation, pluggable CPU/GPU terrain backends, GPU meshing, GPU-driven visibility culling, indirect draw submission, and an in-engine profiling HUD.
+A real-time voxel terrain renderer built in Python on top of `wgpu-py`, with deterministic procedural generation, pluggable CPU/GPU terrain backends, GPU meshing, GPU-driven visibility culling, indirect draw submission, and in-engine profiling HUDs.
 
 ## Screenshots
 
-| CPU path | GPU path |
+| CPU backend | GPU backend |
 | --- | --- |
 | ![CPU mode screenshot](docs/m4-cpu-demo-screenshot.png) | ![GPU mode screenshot](docs/m4-gpu-demo-screenshot.png) |
 
 ## Overview
 
-This project is a renderer-first voxel terrain tech demo focused on frame-time decomposition and architecture exploration rather than gameplay systems.
+This project is a renderer-first voxel terrain tech demo focused on frame-time decomposition, chunk streaming, and render-path experimentation.
 
 The world is chunked in the X/Z plane, generated deterministically from `(seed, chunk_x, chunk_z)`, and streamed on demand as the camera moves. The renderer supports both CPU and GPU execution paths for terrain generation and meshing, and includes internal tooling to benchmark chunk throughput, batch sizing, frame breakdown, and render capacity.
+
+## Performance
+
+This is not a synthetic offline terrain test. It is a live renderer.
+
+In local testing, the CPU terrain backend can generate roughly **~500 real chunks/second on a single core while maintaining a live, viewable scene**. At that point, terrain generation is no longer the dominant ceiling in that configuration; render cost, mesh density, visibility, draw submission, and GPU work start to matter more.
+
+That is the important threshold for a voxel engine: once chunk generation becomes fast enough, the problem shifts from “can the world keep up?” to “can the renderer keep up?”
+
+### Why that matters
+
+- Real chunk dimensions: `32 x 128 x 32`
+- Single-core CPU terrain generation
+- Live scene on screen, not an offline bake
+- Benchmark path measures real chunk drain rate in chunks/second
+- Renderer includes profiling overlays and frame breakdown instrumentation
 
 ## Core technical features
 
 - Infinite procedural terrain with deterministic sampling
 - Chunk size `32 x 128 x 32`
 - CPU terrain backend
-- GPU terrain backend slot with compute-based chunk generation path
+- GPU terrain backend slot using compute-based terrain generation
 - CPU voxel meshing path
 - GPU voxel meshing path
 - GPU visibility culling using per-mesh bounding spheres
@@ -27,8 +43,8 @@ The world is chunked in the X/Z plane, generated deterministically from `(seed, 
 - Persistent mesh slab allocator for chunk vertex storage
 - Chunk cache with eviction and reuse
 - Optional merged render batches for distant terrain
-- Real-time profiling HUD and frame breakdown overlay
-- Benchmark harness for terrain throughput, render scaling, and validation
+- Profiling HUD and frame breakdown overlay
+- Benchmark harness for terrain throughput, validation, and render scaling
 
 ## Runtime model
 
@@ -66,27 +82,27 @@ The render loop uses `wgpu-py` and a custom WGSL pipeline:
 6. Run GPU visibility culling
 7. Emit indirect draw commands
 8. Submit render pass
-9. Overlay profiling HUD
+9. Overlay profiling HUDs
 
 ## Renderer architecture
 
 ### Chunk streaming
 
-The renderer tracks visible chunk coordinates around the camera and schedules chunk preparation with bounded request budgets. Chunk generation is demand-driven and decoupled from visibility checks so the frame loop can trade chunk latency against frame stability.
+The renderer tracks visible chunk coordinates around the camera and schedules chunk preparation with bounded request budgets. Missing chunks are prioritized with a forward-cone heuristic so camera-facing terrain arrives first.
 
 ### Chunk cache
 
 Chunk meshes are stored in an ordered cache keyed by `(chunk_x, chunk_z)`. Cached meshes include:
 
-- GPU vertex buffer handle
 - vertex count
+- GPU vertex buffer handle
 - chunk-space bounds
 - allocation metadata
 - creation timestamp
 
 ### Mesh storage allocator
 
-Chunk mesh output is not stored as one buffer per chunk by default. Instead, the renderer maintains persistent mesh output slabs and suballocates aligned regions from them. This reduces churn from per-chunk buffer creation and enables reuse of large GPU allocations.
+Chunk mesh output is stored in persistent GPU slabs and suballocated into aligned regions rather than always allocating one standalone GPU buffer per chunk. This reduces allocation churn and makes chunk mesh residency more stable under heavy streaming.
 
 Tracked allocator state includes:
 
@@ -100,18 +116,18 @@ Tracked allocator state includes:
 
 Resident chunk meshes carry bounding spheres derived from chunk center and max height. These bounds are uploaded into a visibility-record buffer, and a compute pass tests them against the camera frustum. Surviving meshes write indirect draw commands; rejected meshes write zero-vertex commands.
 
-This keeps visibility classification on GPU and reduces CPU-side draw filtering overhead.
+This keeps visibility classification on GPU and reduces CPU-side draw filtering overhead when many chunk meshes are resident.
 
 ### Indirect draw path
 
-The renderer supports indirect draw command buffers, allowing GPU-generated visibility results to flow directly into submission. This reduces CPU work when many chunk meshes are resident.
+The renderer supports indirect draw command buffers, allowing GPU-generated visibility results to flow directly into submission. This reduces CPU work when scene residency grows.
 
 ### Profiling overlays
 
 Two HUDs are built into the engine:
 
-- **Profiler HUD**: frame stats, top CPU hotspots, backend labels, allocator state
-- **Frame breakdown HUD**: averaged timings for world update, visibility lookup, chunk streaming, camera upload, render encode, command finish, queue submit, draw calls, visible vertices, pending chunk requests, and chunk memory
+- **Profiler HUD**: frame stats, CPU hotspots, backend labels, allocator state
+- **Frame breakdown HUD**: world update, visibility lookup, chunk streaming, camera upload, render encode, command finish, queue submit, wall-frame timing, draw calls, visible vertices, pending chunk requests, and chunk memory
 
 ## Procedural generation
 
@@ -153,7 +169,7 @@ The main terrain render shader performs camera-relative projection in shader cod
 - terrain backend validation
 - GPU timestamp-assisted render timing where supported
 
-This makes the repo useful both as a renderer demo and as a profiling/optimization sandbox.
+This makes the repo useful both as a renderer demo and as a profiling / optimization sandbox.
 
 ## Repo layout
 
@@ -167,7 +183,7 @@ Main engine loop, input, camera, chunk streaming, cache management, GPU meshing 
 World façade exposing deterministic terrain queries and backend routing.
 
 ### `cpu_terrain_backend.py`
-CPU implementation of surface-grid and voxel-grid generation, with batched request/poll interfaces.
+CPU implementation of surface-grid and voxel-grid generation, with batched request / poll interfaces.
 
 ### `metal_terrain_backend.py`
 GPU terrain backend slot using compute-driven chunk generation through `wgpu-py`.
@@ -186,17 +202,15 @@ Microbenchmark and validation harness for terrain, meshing, and render throughpu
 ```bash
 pip install -r requirements.txt
 python3 main.py
-````
+```
 
 ## Dependencies
 
-```txt
-wgpu
-rendercanvas
-glfw
-numpy
-numba
-```
+* `wgpu`
+* `rendercanvas`
+* `glfw`
+* `numpy`
+* `numba`
 
 ## Controls
 
@@ -208,22 +222,27 @@ numba
 * `F3` — toggle profiling HUD
 * `R` — regenerate world with a new seed
 
-## Current focus
+## Why this repo exists
 
-This demo is primarily a sandbox for investigating voxel-engine bottlenecks such as:
+This project is mainly a sandbox for pushing a voxel engine until the bottleneck moves.
 
-* terrain generation throughput
-* chunk streaming latency
-* CPU vs GPU meshing tradeoffs
-* draw-call pressure
-* visibility-culling cost
-* chunk memory pressure
-* frame issue time vs wall-frame time
-* transition from CPU-bound to GPU-bound rendering
+Useful questions here are not only:
+
+* How fast is terrain generation?
+* How many chunks per second can the backend sustain?
+
+But also:
+
+* When does chunk generation stop being the bottleneck?
+* When do draw calls dominate?
+* How much does GPU meshing shift the ceiling?
+* How expensive is visibility?
+* How much chunk residency can the renderer carry before frame time collapses?
+* When does the engine become primarily render-bound?
 
 ## Notes
 
 * Default engine mode is configured in code and currently targets the GPU path
-* The GPU terrain backend is intentionally isolated behind a backend interface
+* GPU terrain is isolated behind a backend interface and falls back to CPU if setup fails
 * GPU meshing falls back to CPU meshing if required compute pipelines cannot be created
-* The project is designed for iteration and profiling, so internal instrumentation is part of the runtime design
+* The project is designed for iteration and profiling, so instrumentation is part of the runtime design rather than an external afterthought
