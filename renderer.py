@@ -148,6 +148,8 @@ HUD_LINE_SPACING = 3
 HUD_GLYPH_SPACING = 1
 PROFILE_REPORT_INTERVAL = 1.0
 FRAME_BREAKDOWN_SAMPLE_WINDOW = 120
+SWAPCHAIN_MAX_FPS = 320
+SWAPCHAIN_USE_VSYNC = False
 SPRINT_FLY_SPEED = 500.0
 
 
@@ -1638,8 +1640,8 @@ class TerrainRenderer:
             title=self.base_title,
             size=(1280, 800),
             update_mode="continuous",
-            max_fps=320,
-            vsync=False,
+            max_fps=SWAPCHAIN_MAX_FPS,
+            vsync=SWAPCHAIN_USE_VSYNC,
         )
         request_adapter = getattr(wgpu.gpu, "request_adapter_sync", wgpu.gpu.request_adapter)
         self.adapter = request_adapter(canvas=self.canvas, power_preference="high-performance")
@@ -1741,6 +1743,7 @@ class TerrainRenderer:
             "chunk_stream_bytes": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "chunk_displayed_added": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "camera_upload": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
+            "swapchain_acquire": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "render_encode": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "command_finish": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "queue_submit": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
@@ -2249,6 +2252,7 @@ class TerrainRenderer:
             f"CHUNK DIMS {CHUNK_SIZE}x{WORLD_HEIGHT}x{CHUNK_SIZE}",
             f"BATCH SIZE {self.terrain_batch_size}",
             f"MESH DRAIN {self.mesh_batch_size}",
+            f"PRESENT    FPS {SWAPCHAIN_MAX_FPS}  VSYNC {'ON' if SWAPCHAIN_USE_VSYNC else 'OFF'}",
             "MESH SLABS --  USED --.- MIB  FREE --.- MIB",
             "MESH BIGGEST GAP --.- MIB  ALLOCS --",
             f"CHUNK REQUEST BATCH SIZE {CHUNK_PREP_REQUEST_BATCH_SIZE}",
@@ -2264,12 +2268,14 @@ class TerrainRenderer:
             "  CHUNK STREAM: --.- MS",
             "  CHUNK STREAM BW: --.- MIB/S",
             "  CAMERA UPLOAD: --.- MS",
+            "  SWAPCHAIN ACQUIRE: --.- MS",
             "  RENDER ENCODE: --.- MS",
             "  COMMAND FINISH: --.- MS",
             "  QUEUE SUBMIT: --.- MS",
             f"CHUNK DIMS: {CHUNK_SIZE}x{WORLD_HEIGHT}x{CHUNK_SIZE}",
             f"BACKEND POLL SIZE: {self.terrain_batch_size}",
             f"MESH DRAIN SIZE: {self.mesh_batch_size}",
+            f"PRESENT PACING: FPS {SWAPCHAIN_MAX_FPS}  VSYNC {'ON' if SWAPCHAIN_USE_VSYNC else 'OFF'}",
             f"CHUNK REQUEST BATCH SIZE: {CHUNK_PREP_REQUEST_BATCH_SIZE}",
             "MESH SLABS: --  USED --.- MIB  FREE --.- MIB",
             "MESH BIGGEST GAP: --.- MIB  ALLOCS --",
@@ -2331,6 +2337,7 @@ class TerrainRenderer:
             f"FRAME P50 {frame_p50_ms:5.1f}MS  P95 {frame_p95_ms:5.1f}MS  P99 {frame_p99_ms:5.1f}MS",
             f"RENDER API  {self.render_api_label}",
             f"ENGINE MODE {self.engine_mode_label}",
+            f"PRESENT     FPS {SWAPCHAIN_MAX_FPS}  VSYNC {'ON' if SWAPCHAIN_USE_VSYNC else 'OFF'}",
             f"MESH SLABS {slab_count:2d}  USED {slab_used_bytes / (1024.0 * 1024.0):4.1f} MIB  FREE {slab_free_bytes / (1024.0 * 1024.0):4.1f} MIB",
             f"MESH BIGGEST GAP {slab_largest_free_bytes / (1024.0 * 1024.0):4.1f} MIB  ALLOCS {slab_alloc_count:3d}",
         ]
@@ -2422,13 +2429,23 @@ class TerrainRenderer:
         avg_chunk_stream_bytes = self._frame_breakdown_average("chunk_stream_bytes")
         avg_new_displayed_chunks = self._frame_breakdown_average("chunk_displayed_added")
         avg_camera_upload = self._frame_breakdown_average("camera_upload")
+        avg_swapchain_acquire = self._frame_breakdown_average("swapchain_acquire")
         avg_render_encode = self._frame_breakdown_average("render_encode")
         avg_command_finish = self._frame_breakdown_average("command_finish")
         avg_queue_submit = self._frame_breakdown_average("queue_submit")
         avg_wall_frame = self._frame_breakdown_average("wall_frame")
         pending_chunk_requests = int(round(self._frame_breakdown_average("pending_chunk_requests")))
         visible_vertices = int(round(self._frame_breakdown_average("visible_vertices")))
-        avg_issue_encode = avg_world_update + avg_visibility_lookup + avg_chunk_stream + avg_camera_upload + avg_render_encode + avg_command_finish + avg_queue_submit
+        avg_issue_encode = (
+            avg_world_update
+            + avg_visibility_lookup
+            + avg_chunk_stream
+            + avg_camera_upload
+            + avg_swapchain_acquire
+            + avg_render_encode
+            + avg_command_finish
+            + avg_queue_submit
+        )
         draw_calls = int(round(self._frame_breakdown_average("draw_calls")))
         merged_chunks = int(round(self._frame_breakdown_average("merged_chunks")))
         visible_chunk_targets = int(round(self._frame_breakdown_average("visible_chunk_targets")))
@@ -2463,6 +2480,7 @@ class TerrainRenderer:
             f"  CHUNK STREAM BANDWIDTH: {chunk_stream_bandwidth_mib_s:5.1f} MIB/S",
             f"  NEW GENERATED CHUNKS / S: {chunk_generation_per_s:5.1f}",
             f"  CAMERA UPLOAD: {avg_camera_upload:5.1f} MS",
+            f"  SWAPCHAIN ACQUIRE: {avg_swapchain_acquire:5.1f} MS",
             f"  RENDER ENCODE: {avg_render_encode:5.1f} MS",
             f"  COMMAND FINISH: {avg_command_finish:5.1f} MS",
             f"  QUEUE SUBMIT: {avg_queue_submit:5.1f} MS",
@@ -4211,19 +4229,27 @@ class TerrainRenderer:
         self._store_chunk_mesh(mesh)
         return mesh
 
-    def _prepare_chunks(self, dt: float) -> tuple[float, float]:
+    def _refresh_visible_chunk_set(self) -> float:
         visibility_start = time.perf_counter()
         current_origin = (int(self.camera.position[0] // CHUNK_SIZE), int(self.camera.position[2] // CHUNK_SIZE))
         if self._visible_chunk_origin != current_origin or not self._visible_chunk_coords:
             self._visible_chunk_origin = current_origin
             self._visible_chunk_coords = self._chunk_coords_in_view()
         self._warn_if_visible_exceeds_cache()
-        visibility_lookup_ms = (time.perf_counter() - visibility_start) * 1000.0
+        return (time.perf_counter() - visibility_start) * 1000.0
 
-        prep_start = time.perf_counter()
+    def _service_background_gpu_work(self) -> None:
         self._process_gpu_buffer_cleanup()
         if self.use_gpu_meshing:
             self._finalize_pending_gpu_mesh_batches()
+
+    def _prepare_chunks(self, dt: float) -> tuple[float, float]:
+        visibility_lookup_ms = 0.0
+        current_origin = (int(self.camera.position[0] // CHUNK_SIZE), int(self.camera.position[2] // CHUNK_SIZE))
+        if self._visible_chunk_origin != current_origin or not self._visible_chunk_coords:
+            visibility_lookup_ms = self._refresh_visible_chunk_set()
+
+        prep_start = time.perf_counter()
         forward = flat_forward_vector(self.camera.yaw)
         right = right_vector(self.camera.yaw)
         using_gpu_terrain = self.world.terrain_backend_label() == "GPU"
@@ -4438,7 +4464,11 @@ class TerrainRenderer:
         else:
             visible_batches, render_encode_ms, draw_calls, merged_batches, visible_chunks, visible_vertices = self._visible_render_batches(encoder)
 
+        # Drawable acquisition can block when GPU/display work backs up, so keep it
+        # measured separately in the HUD instead of folding it into generic encode time.
+        acquire_start = time.perf_counter()
         current_texture = self.context.get_current_texture()
+        swapchain_acquire_ms = (time.perf_counter() - acquire_start) * 1000.0
         color_view = current_texture.create_view()
         render_pass = encoder.begin_render_pass(
             color_attachments=[
@@ -4485,6 +4515,7 @@ class TerrainRenderer:
         stats = {
             "camera_upload_ms": camera_upload_ms,
             "visibility_lookup_ms": 0.0,
+            "swapchain_acquire_ms": swapchain_acquire_ms,
             "render_encode_ms": render_encode_ms,
             "draw_calls": draw_calls,
             "merged_chunks": merged_batches,
@@ -4504,10 +4535,11 @@ class TerrainRenderer:
             self._update_camera(dt)
             world_update_ms = (time.perf_counter() - update_start) * 1000.0
 
-            vis_lookup_ms, chunk_stream_ms = self._prepare_chunks(dt)
+            visibility_lookup_ms = self._refresh_visible_chunk_set()
             encoder, color_view, render_stats = self._submit_render()
-            visibility_lookup_ms = vis_lookup_ms + render_stats["visibility_lookup_ms"]
+            visibility_lookup_ms += render_stats["visibility_lookup_ms"]
             camera_upload_ms = render_stats["camera_upload_ms"]
+            swapchain_acquire_ms = render_stats["swapchain_acquire_ms"]
             render_encode_ms = render_stats["render_encode_ms"]
             draw_calls = int(render_stats["draw_calls"])
             merged_chunks = int(render_stats["merged_chunks"])
@@ -4524,6 +4556,10 @@ class TerrainRenderer:
             queue_submit_start = time.perf_counter()
             self.device.queue.submit([command_buffer])
             queue_submit_ms = (time.perf_counter() - queue_submit_start) * 1000.0
+
+            self._service_background_gpu_work()
+            _, chunk_stream_ms = self._prepare_chunks(dt)
+
             wall_frame_ms = (time.perf_counter() - frame_start) * 1000.0
 
             self._record_frame_breakdown_sample("world_update", world_update_ms)
@@ -4531,6 +4567,7 @@ class TerrainRenderer:
             self._record_frame_breakdown_sample("chunk_stream", chunk_stream_ms)
             self._record_frame_breakdown_sample("chunk_displayed_added", float(self._last_new_displayed_chunks))
             self._record_frame_breakdown_sample("camera_upload", camera_upload_ms)
+            self._record_frame_breakdown_sample("swapchain_acquire", swapchain_acquire_ms)
             self._record_frame_breakdown_sample("render_encode", render_encode_ms)
             self._record_frame_breakdown_sample("command_finish", command_finish_ms)
             self._record_frame_breakdown_sample("queue_submit", queue_submit_ms)
