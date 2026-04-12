@@ -3223,6 +3223,155 @@ class TerrainRenderer:
         visible_vertex_count = sum(batch.vertex_count for batch in draw_batches)
         return draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count
 
+    def _build_grouped_tile_draw_commands(
+        self,
+        meshes: list[ChunkMesh],
+        encoder,
+        *,
+        age_gate: bool,
+    ) -> tuple[
+        OrderedDict[tuple[int, int], list[object]],
+        int,
+        int,
+        int,
+        int,
+    ]:
+        tile_groups: dict[tuple[int, int], list[ChunkMesh]] = {}
+        for mesh in meshes:
+            if mesh.vertex_count <= 0:
+                continue
+            tile_groups.setdefault(self._tile_key(mesh.chunk_x, mesh.chunk_z), []).append(mesh)
+
+        current_tile_keys = set(tile_groups.keys())
+        stale_keys = [tile_key for tile_key in self._tile_render_batches if tile_key not in current_tile_keys]
+        for tile_key in stale_keys:
+            batch = self._tile_render_batches.pop(tile_key)
+            self._retire_tile_render_batch(batch)
+
+        command_groups: OrderedDict[tuple[int, int], list[object]] = OrderedDict()
+        merged_chunk_count = 0
+        visible_chunk_count = 0
+        visible_vertex_count = 0
+        command_count = 0
+        mature_cutoff = time.perf_counter() - MERGED_TILE_MIN_AGE_SECONDS if age_gate else None
+
+        def emit_command(
+            vertex_buffer: wgpu.GPUBuffer,
+            binding_offset: int,
+            vertex_count: int,
+            first_vertex: int,
+            bounds: tuple[float, float, float, float],
+            chunk_count: int,
+        ) -> None:
+            nonlocal command_count, visible_vertex_count
+            key = (id(vertex_buffer), binding_offset)
+            group = command_groups.get(key)
+            if group is None:
+                group = [vertex_buffer, binding_offset, []]
+                command_groups[key] = group
+            group[2].append((bounds, vertex_count, first_vertex, chunk_count))
+            command_count += 1
+            visible_vertex_count += vertex_count
+
+        for tile_key in sorted(tile_groups):
+            tile_meshes = tile_groups[tile_key]
+            tile_meshes.sort(key=lambda mesh: (mesh.chunk_z, mesh.chunk_x))
+            if mature_cutoff is None:
+                mature_meshes = tile_meshes
+                immature_meshes: list[ChunkMesh] = []
+            else:
+                mature_meshes = []
+                immature_meshes = []
+                for mesh in tile_meshes:
+                    if mesh.created_at <= mature_cutoff:
+                        mature_meshes.append(mesh)
+                    else:
+                        immature_meshes.append(mesh)
+
+            if len(tile_meshes) == 1:
+                mesh = tile_meshes[0]
+                emit_command(
+                    mesh.vertex_buffer,
+                    mesh.binding_offset,
+                    mesh.vertex_count,
+                    mesh.first_vertex,
+                    mesh.bounds,
+                    1,
+                )
+                visible_chunk_count += 1
+                continue
+
+            existing = self._tile_render_batches.get(tile_key)
+            merge_eligible = self._tile_merge_eligible(tile_key, tile_meshes, mature_meshes)
+            if not merge_eligible:
+                if existing is not None:
+                    self._tile_render_batches.pop(tile_key, None)
+                    self._retire_tile_render_batch(existing)
+                for mesh in immature_meshes:
+                    emit_command(
+                        mesh.vertex_buffer,
+                        mesh.binding_offset,
+                        mesh.vertex_count,
+                        mesh.first_vertex,
+                        mesh.bounds,
+                        1,
+                    )
+                    visible_chunk_count += 1
+                for mesh in mature_meshes:
+                    emit_command(
+                        mesh.vertex_buffer,
+                        mesh.binding_offset,
+                        mesh.vertex_count,
+                        mesh.first_vertex,
+                        mesh.bounds,
+                        1,
+                    )
+                    visible_chunk_count += 1
+                continue
+
+            signature = tuple((mesh.chunk_x, mesh.chunk_z) for mesh in mature_meshes)
+            batch_vertex_count = sum(mesh.vertex_count for mesh in mature_meshes)
+            if (
+                existing is None
+                or existing.signature != signature
+                or existing.vertex_count != batch_vertex_count
+            ):
+                merged_bounds = self._merge_chunk_bounds(mature_meshes)
+                merged_buffer = self._merge_tile_meshes(mature_meshes, encoder)
+                self._tile_render_batches[tile_key] = ChunkRenderBatch(
+                    signature=signature,
+                    vertex_count=batch_vertex_count,
+                    vertex_buffer=merged_buffer,
+                    bounds=merged_bounds,
+                    chunk_count=len(mature_meshes),
+                )
+                if existing is not None:
+                    self._retire_tile_render_batch(existing)
+
+            batch = self._tile_render_batches[tile_key]
+            emit_command(
+                batch.vertex_buffer,
+                0,
+                batch.vertex_count,
+                0,
+                batch.bounds,
+                batch.chunk_count,
+            )
+            merged_chunk_count += batch.chunk_count
+            visible_chunk_count += batch.chunk_count
+            for mesh in immature_meshes:
+                emit_command(
+                    mesh.vertex_buffer,
+                    mesh.binding_offset,
+                    mesh.vertex_count,
+                    mesh.first_vertex,
+                    mesh.bounds,
+                    1,
+                )
+                visible_chunk_count += 1
+
+        return command_groups, command_count, merged_chunk_count, visible_chunk_count, visible_vertex_count
+
     def _ensure_mesh_draw_indirect_scratch(self, command_capacity: int) -> None:
         needed = max(1, int(command_capacity))
         target_capacity = max(256, 1 << (needed - 1).bit_length())
@@ -3268,20 +3417,12 @@ class TerrainRenderer:
         encoder,
     ) -> tuple[list[tuple[wgpu.GPUBuffer, int, int, int]], int, int, int, int]:
         visible_meshes = self._visible_meshes()
-        draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count = self._build_tile_draw_batches(
+        command_groups, command_count, merged_chunk_count, visible_chunk_count, visible_vertex_count = self._build_grouped_tile_draw_commands(
             visible_meshes,
             encoder,
             age_gate=True,
         )
 
-        groups: OrderedDict[tuple[int, int], tuple[wgpu.GPUBuffer, int, list[ChunkDrawBatch]]] = OrderedDict()
-        for batch in draw_batches:
-            key = (id(batch.vertex_buffer), batch.binding_offset)
-            if key not in groups:
-                groups[key] = (batch.vertex_buffer, batch.binding_offset, [])
-            groups[key][2].append(batch)
-
-        command_count = len(draw_batches)
         self._ensure_mesh_visibility_scratch(command_count)
         metadata_buffer = self._mesh_visibility_record_buffer
         metadata_array = self._mesh_visibility_record_array
@@ -3291,14 +3432,14 @@ class TerrainRenderer:
 
         render_batches: list[tuple[wgpu.GPUBuffer, int, int, int]] = []
         command_index = 0
-        for vertex_buffer, binding_offset, batches in groups.values():
+        for vertex_buffer, binding_offset, commands in command_groups.values():
             batch_start = command_index
-            for batch in batches:
-                metadata_array[command_index]["bounds"] = batch.bounds
+            for bounds, vertex_count, first_vertex, _chunk_count in commands:
+                metadata_array[command_index]["bounds"] = bounds
                 metadata_array[command_index]["draw"] = (
-                    batch.vertex_count,
+                    vertex_count,
                     1,
-                    batch.first_vertex,
+                    first_vertex,
                     0,
                 )
                 command_index += 1
@@ -3316,20 +3457,12 @@ class TerrainRenderer:
     ) -> tuple[list[tuple[wgpu.GPUBuffer, int, int, int]], float, int, int, int, int]:
         encode_start = time.perf_counter()
         visible_meshes = self._visible_meshes()
-        draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count = self._build_tile_draw_batches(
+        command_groups, command_count, merged_chunk_count, visible_chunk_count, visible_vertex_count = self._build_grouped_tile_draw_commands(
             visible_meshes,
             encoder,
             age_gate=True,
         )
 
-        groups: OrderedDict[tuple[int, int], tuple[wgpu.GPUBuffer, int, list[ChunkDrawBatch]]] = OrderedDict()
-        for batch in draw_batches:
-            key = (id(batch.vertex_buffer), batch.binding_offset)
-            if key not in groups:
-                groups[key] = (batch.vertex_buffer, batch.binding_offset, [])
-            groups[key][2].append(batch)
-
-        command_count = len(draw_batches)
         self._ensure_mesh_draw_indirect_scratch(command_count)
         indirect_buffer = self._mesh_draw_indirect_buffer
         indirect_array = self._mesh_draw_indirect_array
@@ -3337,12 +3470,12 @@ class TerrainRenderer:
 
         render_batches: list[tuple[wgpu.GPUBuffer, int, int, int]] = []
         command_index = 0
-        for vertex_buffer, binding_offset, batches in groups.values():
+        for vertex_buffer, binding_offset, commands in command_groups.values():
             batch_start = command_index
-            for batch in batches:
-                indirect_array[command_index, 0] = np.uint32(batch.vertex_count)
+            for _bounds, vertex_count, first_vertex, _chunk_count in commands:
+                indirect_array[command_index, 0] = np.uint32(vertex_count)
                 indirect_array[command_index, 1] = np.uint32(1)
-                indirect_array[command_index, 2] = np.uint32(batch.first_vertex)
+                indirect_array[command_index, 2] = np.uint32(first_vertex)
                 indirect_array[command_index, 3] = np.uint32(0)
                 command_index += 1
             render_batches.append((vertex_buffer, binding_offset, batch_start, command_index - batch_start))
