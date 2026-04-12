@@ -2889,20 +2889,58 @@ class TerrainRenderer:
         self._tile_render_batches.clear()
 
     def _merge_chunk_bounds(self, tile_meshes: list[ChunkMesh]) -> tuple[float, float, float, float]:
-        min_x = min(mesh.bounds[0] - mesh.bounds[3] for mesh in tile_meshes)
-        max_x = max(mesh.bounds[0] + mesh.bounds[3] for mesh in tile_meshes)
-        min_y = min(mesh.bounds[1] - mesh.bounds[3] for mesh in tile_meshes)
-        max_y = max(mesh.bounds[1] + mesh.bounds[3] for mesh in tile_meshes)
-        min_z = min(mesh.bounds[2] - mesh.bounds[3] for mesh in tile_meshes)
-        max_z = max(mesh.bounds[2] + mesh.bounds[3] for mesh in tile_meshes)
+        if not tile_meshes:
+            raise ValueError("min() arg is an empty sequence")
+
+        bounds = tile_meshes[0].bounds
+        bx = bounds[0]
+        by = bounds[1]
+        bz = bounds[2]
+        br = bounds[3]
+
+        min_x = bx - br
+        max_x = bx + br
+        min_y = by - br
+        max_y = by + br
+        min_z = bz - br
+        max_z = bz + br
+
+        for index in range(1, len(tile_meshes)):
+            bounds = tile_meshes[index].bounds
+            bx = bounds[0]
+            by = bounds[1]
+            bz = bounds[2]
+            br = bounds[3]
+
+            left = bx - br
+            right = bx + br
+            bottom = by - br
+            top = by + br
+            near = bz - br
+            far = bz + br
+
+            if left < min_x:
+                min_x = left
+            if right > max_x:
+                max_x = right
+            if bottom < min_y:
+                min_y = bottom
+            if top > max_y:
+                max_y = top
+            if near < min_z:
+                min_z = near
+            if far > max_z:
+                max_z = far
+
         center_x = (min_x + max_x) * 0.5
         center_y = (min_y + max_y) * 0.5
         center_z = (min_z + max_z) * 0.5
-        radius = math.sqrt(
-            (max_x - center_x) * (max_x - center_x)
-            + (max_y - center_y) * (max_y - center_y)
-            + (max_z - center_z) * (max_z - center_z)
-        )
+
+        dx = max_x - center_x
+        dy = max_y - center_y
+        dz = max_z - center_z
+        radius = math.sqrt(dx * dx + dy * dy + dz * dz)
+
         return center_x, center_y, center_z, radius
 
     def _merge_tile_meshes(self, tile_meshes: list[ChunkMesh], encoder) -> wgpu.GPUBuffer:
