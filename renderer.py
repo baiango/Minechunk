@@ -1601,6 +1601,25 @@ class ChunkDrawBatch:
 
 
 @dataclass
+class AsyncVoxelMeshBatchResources:
+    sample_size: int
+    height_limit: int
+    chunk_capacity: int
+    column_capacity: int
+    blocks_buffer: wgpu.GPUBuffer
+    materials_buffer: wgpu.GPUBuffer
+    coords_buffer: wgpu.GPUBuffer
+    column_totals_buffer: wgpu.GPUBuffer
+    chunk_totals_buffer: wgpu.GPUBuffer
+    chunk_offsets_buffer: wgpu.GPUBuffer
+    params_buffer: wgpu.GPUBuffer
+    readback_buffer: wgpu.GPUBuffer
+    coords_array: np.ndarray
+    zero_counts_array: np.ndarray
+    count_bind_group: object | None = None
+
+
+@dataclass
 class PendingChunkMeshBatch:
     chunk_coords: list[tuple[int, int]]
     chunk_count: int
@@ -1615,6 +1634,7 @@ class PendingChunkMeshBatch:
     chunk_offsets_buffer: wgpu.GPUBuffer
     params_buffer: wgpu.GPUBuffer
     readback_buffer: wgpu.GPUBuffer
+    resources: AsyncVoxelMeshBatchResources | None = None
     metadata_promise: object | None = None
     submitted_at: float = 0.0
 
@@ -1738,6 +1758,9 @@ class TerrainRenderer:
         self._pending_voxel_mesh_results: deque = deque()
         self._pending_gpu_mesh_batches: deque[PendingChunkMeshBatch] = deque()
         self._gpu_mesh_deferred_buffer_cleanup: deque[tuple[int, list[wgpu.GPUBuffer]]] = deque()
+        self._gpu_mesh_deferred_batch_resource_releases: deque[tuple[int, AsyncVoxelMeshBatchResources]] = deque()
+        self._async_voxel_mesh_batch_pool: deque[AsyncVoxelMeshBatchResources] = deque()
+        self._async_voxel_mesh_batch_pool_limit = 8
         self._gpu_mesh_async_finalize_budget = max(1, self.mesh_batch_size)
         self.profiling_enabled = False
         self.profiler: cProfile.Profile | None = None
@@ -2832,6 +2855,14 @@ class TerrainRenderer:
         self._pending_voxel_mesh_results.clear()
         while self._pending_gpu_mesh_batches:
             pending = self._pending_gpu_mesh_batches.popleft()
+            if pending.readback_buffer.map_state != "unmapped":
+                try:
+                    pending.readback_buffer.unmap()
+                except Exception:
+                    pass
+            if pending.resources is not None:
+                self._destroy_async_voxel_mesh_batch_resources(pending.resources)
+                continue
             for buffer in (
                 pending.blocks_buffer,
                 pending.materials_buffer,
@@ -2853,6 +2884,11 @@ class TerrainRenderer:
                     buffer.destroy()
                 except Exception:
                     pass
+        while self._gpu_mesh_deferred_batch_resource_releases:
+            _, resources = self._gpu_mesh_deferred_batch_resource_releases.popleft()
+            self._destroy_async_voxel_mesh_batch_resources(resources)
+        while self._async_voxel_mesh_batch_pool:
+            self._destroy_async_voxel_mesh_batch_resources(self._async_voxel_mesh_batch_pool.popleft())
         self._clear_tile_render_batches()
         self._clear_transient_render_buffers()
         self._visible_chunk_origin = None
@@ -3699,79 +3735,173 @@ class TerrainRenderer:
         self._voxel_mesh_scratch_chunk_totals_array = np.empty(max_chunk_count, dtype=np.uint32)
         self._voxel_mesh_scratch_chunk_offsets_array = np.empty(max_chunk_count, dtype=np.uint32)
 
-    def _create_dedicated_voxel_mesh_batch_buffers(
+    def _create_async_voxel_mesh_batch_resources(
         self,
         sample_size: int,
         height_limit: int,
         chunk_count: int,
-    ) -> dict[str, wgpu.GPUBuffer]:
-        chunk_count = max(1, int(chunk_count))
-        max_column_plane = max(1, (sample_size - 2) * (sample_size - 2))
-        blocks_bytes = chunk_count * height_limit * sample_size * sample_size * 4
-        coords_bytes = chunk_count * 2 * 4
-        column_totals_bytes = chunk_count * max_column_plane * 4
-        chunk_totals_bytes = chunk_count * 4
-        return {
-            "blocks": self.device.create_buffer(
+    ) -> AsyncVoxelMeshBatchResources:
+        self._ensure_voxel_mesh_batch_scratch(sample_size, height_limit, 1)
+        dummy_vertex_buffer = self._voxel_mesh_scratch_batch_vertex_buffer
+        assert dummy_vertex_buffer is not None
+
+        chunk_capacity = max(1, int(chunk_count))
+        column_capacity = max(1, (sample_size - 2) * (sample_size - 2) * chunk_capacity)
+        blocks_bytes = chunk_capacity * height_limit * sample_size * sample_size * 4
+        coords_bytes = chunk_capacity * 2 * 4
+        chunk_totals_bytes = chunk_capacity * 4
+        resources = AsyncVoxelMeshBatchResources(
+            sample_size=int(sample_size),
+            height_limit=int(height_limit),
+            chunk_capacity=chunk_capacity,
+            column_capacity=column_capacity,
+            blocks_buffer=self.device.create_buffer(
                 size=max(1, blocks_bytes),
                 usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
             ),
-            "materials": self.device.create_buffer(
+            materials_buffer=self.device.create_buffer(
                 size=max(1, blocks_bytes),
                 usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
             ),
-            "coords": self.device.create_buffer(
+            coords_buffer=self.device.create_buffer(
                 size=max(1, coords_bytes),
                 usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
             ),
-            "column_totals": self.device.create_buffer(
-                size=max(1, column_totals_bytes),
+            column_totals_buffer=self.device.create_buffer(
+                size=max(1, column_capacity * 4),
                 usage=wgpu.BufferUsage.STORAGE,
             ),
-            "chunk_totals": self.device.create_buffer(
+            chunk_totals_buffer=self.device.create_buffer(
                 size=max(1, chunk_totals_bytes),
                 usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
             ),
-            "chunk_offsets": self.device.create_buffer(
+            chunk_offsets_buffer=self.device.create_buffer(
                 size=max(1, chunk_totals_bytes),
                 usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
             ),
-            "params": self.device.create_buffer(
+            params_buffer=self.device.create_buffer(
                 size=16,
                 usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
             ),
-            "readback": self.device.create_buffer(
+            readback_buffer=self.device.create_buffer(
                 size=max(8, chunk_totals_bytes),
                 usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
             ),
-        }
+            coords_array=np.empty((chunk_capacity, 2), dtype=np.int32),
+            zero_counts_array=np.zeros(chunk_capacity, dtype=np.uint32),
+        )
+        resources.count_bind_group = self.device.create_bind_group(
+            layout=self.voxel_mesh_count_bind_group_layout,
+            entries=[
+                {"binding": 0, "resource": {"buffer": resources.blocks_buffer}},
+                {"binding": 1, "resource": {"buffer": resources.materials_buffer}},
+                {"binding": 2, "resource": {"buffer": resources.coords_buffer}},
+                {"binding": 3, "resource": {"buffer": resources.column_totals_buffer}},
+                {"binding": 4, "resource": {"buffer": resources.chunk_totals_buffer}},
+                {"binding": 5, "resource": {"buffer": resources.chunk_offsets_buffer}},
+                {"binding": 6, "resource": {"buffer": dummy_vertex_buffer}},
+                {"binding": 8, "resource": {"buffer": resources.params_buffer, "offset": 0, "size": 16}},
+            ],
+        )
+        return resources
+
+    def _async_voxel_mesh_batch_resources_match(
+        self,
+        resources: AsyncVoxelMeshBatchResources,
+        sample_size: int,
+        height_limit: int,
+        chunk_count: int,
+    ) -> bool:
+        return (
+            resources.sample_size == int(sample_size)
+            and resources.height_limit == int(height_limit)
+            and resources.chunk_capacity >= max(1, int(chunk_count))
+        )
+
+    def _destroy_async_voxel_mesh_batch_resources(self, resources: AsyncVoxelMeshBatchResources) -> None:
+        if resources.readback_buffer.map_state != "unmapped":
+            try:
+                resources.readback_buffer.unmap()
+            except Exception:
+                pass
+        for buffer in (
+            resources.blocks_buffer,
+            resources.materials_buffer,
+            resources.coords_buffer,
+            resources.column_totals_buffer,
+            resources.chunk_totals_buffer,
+            resources.chunk_offsets_buffer,
+            resources.params_buffer,
+            resources.readback_buffer,
+        ):
+            try:
+                buffer.destroy()
+            except Exception:
+                pass
+
+    def _acquire_async_voxel_mesh_batch_resources(
+        self,
+        sample_size: int,
+        height_limit: int,
+        chunk_count: int,
+    ) -> AsyncVoxelMeshBatchResources:
+        target_chunk_count = max(1, int(chunk_count))
+        pool_size = len(self._async_voxel_mesh_batch_pool)
+        for _ in range(pool_size):
+            resources = self._async_voxel_mesh_batch_pool.popleft()
+            if self._async_voxel_mesh_batch_resources_match(resources, sample_size, height_limit, target_chunk_count):
+                return resources
+            self._async_voxel_mesh_batch_pool.append(resources)
+        return self._create_async_voxel_mesh_batch_resources(sample_size, height_limit, target_chunk_count)
+
+    def _release_async_voxel_mesh_batch_resources(self, resources: AsyncVoxelMeshBatchResources) -> None:
+        if len(self._async_voxel_mesh_batch_pool) >= self._async_voxel_mesh_batch_pool_limit:
+            self._destroy_async_voxel_mesh_batch_resources(resources)
+            return
+        self._async_voxel_mesh_batch_pool.append(resources)
+
+    def _schedule_async_voxel_mesh_batch_resource_release(
+        self,
+        resources: AsyncVoxelMeshBatchResources,
+        frames: int = 2,
+    ) -> None:
+        self._gpu_mesh_deferred_batch_resource_releases.append((max(1, int(frames)), resources))
 
     def _schedule_gpu_buffer_cleanup(self, buffers: list[wgpu.GPUBuffer], frames: int = 2) -> None:
         if buffers:
             self._gpu_mesh_deferred_buffer_cleanup.append((max(1, int(frames)), list(buffers)))
 
     def _process_gpu_buffer_cleanup(self) -> None:
-        if not self._gpu_mesh_deferred_buffer_cleanup:
-            return
-        next_queue: deque[tuple[int, list[wgpu.GPUBuffer]]] = deque()
-        while self._gpu_mesh_deferred_buffer_cleanup:
-            frames_left, buffers = self._gpu_mesh_deferred_buffer_cleanup.popleft()
-            frames_left -= 1
-            if frames_left <= 0:
-                for buffer in buffers:
-                    try:
-                        buffer.destroy()
-                    except Exception:
-                        pass
-            else:
-                next_queue.append((frames_left, buffers))
-        self._gpu_mesh_deferred_buffer_cleanup = next_queue
+        if self._gpu_mesh_deferred_buffer_cleanup:
+            next_queue: deque[tuple[int, list[wgpu.GPUBuffer]]] = deque()
+            while self._gpu_mesh_deferred_buffer_cleanup:
+                frames_left, buffers = self._gpu_mesh_deferred_buffer_cleanup.popleft()
+                frames_left -= 1
+                if frames_left <= 0:
+                    for buffer in buffers:
+                        try:
+                            buffer.destroy()
+                        except Exception:
+                            pass
+                else:
+                    next_queue.append((frames_left, buffers))
+            self._gpu_mesh_deferred_buffer_cleanup = next_queue
+
+        if self._gpu_mesh_deferred_batch_resource_releases:
+            next_resource_queue: deque[tuple[int, AsyncVoxelMeshBatchResources]] = deque()
+            while self._gpu_mesh_deferred_batch_resource_releases:
+                frames_left, resources = self._gpu_mesh_deferred_batch_resource_releases.popleft()
+                frames_left -= 1
+                if frames_left <= 0:
+                    self._release_async_voxel_mesh_batch_resources(resources)
+                else:
+                    next_resource_queue.append((frames_left, resources))
+            self._gpu_mesh_deferred_batch_resource_releases = next_resource_queue
 
     def _enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
         self,
         chunk_coords: list[tuple[int, int]],
-        blocks_buffer,
-        materials_buffer,
+        resources: AsyncVoxelMeshBatchResources,
         sample_size: int,
         height_limit: int,
     ) -> None:
@@ -3786,25 +3916,15 @@ class TerrainRenderer:
         chunk_coords_list = chunk_coords if isinstance(chunk_coords, list) else list(chunk_coords)
         chunk_count = len(chunk_coords_list)
         columns_per_side = sample_size - 2
-        self._ensure_voxel_mesh_batch_scratch(sample_size, height_limit, 1)
-        dummy_vertex_buffer = self._voxel_mesh_scratch_batch_vertex_buffer
-        assert dummy_vertex_buffer is not None
+        if not self._async_voxel_mesh_batch_resources_match(resources, sample_size, height_limit, chunk_count):
+            raise RuntimeError("Async voxel mesh batch resources do not match requested batch size.")
+        count_bind_group = resources.count_bind_group
+        assert count_bind_group is not None
 
-        dedicated = self._create_dedicated_voxel_mesh_batch_buffers(sample_size, height_limit, chunk_count)
-        coords_array = getattr(self, "_gpu_async_chunk_coords_array", None)
-        if coords_array is None or coords_array.shape[0] < chunk_count:
-            coords_array = np.empty((chunk_count, 2), dtype=np.int32)
-            self._gpu_async_chunk_coords_array = coords_array
-        coords_view = coords_array[:chunk_count]
+        coords_view = resources.coords_array[:chunk_count]
         coords_view[:] = np.asarray(chunk_coords_list, dtype=np.int32)
-
-        zero_counts = getattr(self, "_gpu_async_zero_counts_array", None)
-        if zero_counts is None or zero_counts.shape[0] < chunk_count:
-            zero_counts = np.zeros(chunk_count, dtype=np.uint32)
-            self._gpu_async_zero_counts_array = zero_counts
-        else:
-            zero_counts[:chunk_count].fill(0)
-        zero_view = zero_counts[:chunk_count]
+        zero_view = resources.zero_counts_array[:chunk_count]
+        zero_view.fill(0)
         params_bytes = struct.pack(
             "<4I",
             int(sample_size),
@@ -3813,35 +3933,21 @@ class TerrainRenderer:
             int(CHUNK_SIZE),
         )
 
-        self.device.queue.write_buffer(dedicated["coords"], 0, memoryview(coords_view))
-        self.device.queue.write_buffer(dedicated["chunk_totals"], 0, memoryview(zero_view))
-        self.device.queue.write_buffer(dedicated["chunk_offsets"], 0, memoryview(zero_view))
-        self.device.queue.write_buffer(dedicated["params"], 0, params_bytes)
+        self.device.queue.write_buffer(resources.coords_buffer, 0, memoryview(coords_view))
+        self.device.queue.write_buffer(resources.chunk_totals_buffer, 0, memoryview(zero_view))
+        self.device.queue.write_buffer(resources.chunk_offsets_buffer, 0, memoryview(zero_view))
+        self.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
 
-        shared_entries = [
-            {"binding": 0, "resource": {"buffer": blocks_buffer}},
-            {"binding": 1, "resource": {"buffer": materials_buffer}},
-            {"binding": 2, "resource": {"buffer": dedicated["coords"]}},
-            {"binding": 3, "resource": {"buffer": dedicated["column_totals"]}},
-            {"binding": 4, "resource": {"buffer": dedicated["chunk_totals"]}},
-            {"binding": 5, "resource": {"buffer": dedicated["chunk_offsets"]}},
-            {"binding": 6, "resource": {"buffer": dummy_vertex_buffer}},
-            {"binding": 8, "resource": {"buffer": dedicated["params"], "offset": 0, "size": 16}},
-        ]
-        count_bind_group = self.device.create_bind_group(
-            layout=self.voxel_mesh_count_bind_group_layout,
-            entries=shared_entries,
-        )
         encoder = self.device.create_command_encoder()
         compute_pass = encoder.begin_compute_pass()
         compute_pass.set_pipeline(self.voxel_mesh_count_pipeline)
         compute_pass.set_bind_group(0, count_bind_group)
         compute_pass.dispatch_workgroups(columns_per_side, columns_per_side, chunk_count)
         compute_pass.end()
-        encoder.copy_buffer_to_buffer(dedicated["chunk_totals"], 0, dedicated["readback"], 0, chunk_count * 4)
+        encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, chunk_count * 4)
         self.device.queue.submit([encoder.finish()])
 
-        metadata_promise = dedicated["readback"].map_async(wgpu.MapMode.READ, 0, chunk_count * 4)
+        metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 4)
         self._pending_gpu_mesh_batches.append(
             PendingChunkMeshBatch(
                 chunk_coords=chunk_coords_list,
@@ -3849,14 +3955,15 @@ class TerrainRenderer:
                 sample_size=int(sample_size),
                 height_limit=int(height_limit),
                 columns_per_side=int(columns_per_side),
-                blocks_buffer=blocks_buffer,
-                materials_buffer=materials_buffer,
-                coords_buffer=dedicated["coords"],
-                column_totals_buffer=dedicated["column_totals"],
-                chunk_totals_buffer=dedicated["chunk_totals"],
-                chunk_offsets_buffer=dedicated["chunk_offsets"],
-                params_buffer=dedicated["params"],
-                readback_buffer=dedicated["readback"],
+                blocks_buffer=resources.blocks_buffer,
+                materials_buffer=resources.materials_buffer,
+                coords_buffer=resources.coords_buffer,
+                column_totals_buffer=resources.column_totals_buffer,
+                chunk_totals_buffer=resources.chunk_totals_buffer,
+                chunk_offsets_buffer=resources.chunk_offsets_buffer,
+                params_buffer=resources.params_buffer,
+                readback_buffer=resources.readback_buffer,
+                resources=resources,
                 metadata_promise=metadata_promise,
                 submitted_at=time.perf_counter(),
             )
@@ -3933,19 +4040,22 @@ class TerrainRenderer:
                     )
                 )
 
-            self._schedule_gpu_buffer_cleanup(
-                [
-                    pending.blocks_buffer,
-                    pending.materials_buffer,
-                    pending.coords_buffer,
-                    pending.column_totals_buffer,
-                    pending.chunk_totals_buffer,
-                    pending.chunk_offsets_buffer,
-                    pending.params_buffer,
-                    pending.readback_buffer,
-                ],
-                frames=2,
-            )
+            if pending.resources is not None:
+                self._schedule_async_voxel_mesh_batch_resource_release(pending.resources, frames=2)
+            else:
+                self._schedule_gpu_buffer_cleanup(
+                    [
+                        pending.blocks_buffer,
+                        pending.materials_buffer,
+                        pending.coords_buffer,
+                        pending.column_totals_buffer,
+                        pending.chunk_totals_buffer,
+                        pending.chunk_offsets_buffer,
+                        pending.params_buffer,
+                        pending.readback_buffer,
+                    ],
+                    frames=2,
+                )
             completed += 1
         self._pending_gpu_mesh_batches = remaining
         return completed
@@ -4242,7 +4352,6 @@ class TerrainRenderer:
             )
         return meshes
 
-    @profile
     def _gpu_make_chunk_mesh_batch_from_surface_gpu_batch(
         self,
         surface_batch: ChunkSurfaceGpuBatch,
@@ -4265,11 +4374,12 @@ class TerrainRenderer:
             int(chunk_count),
             int(CHUNK_SIZE),
         )
+        async_resources: AsyncVoxelMeshBatchResources | None = None
         if defer_finalize:
-            dedicated = self._create_dedicated_voxel_mesh_batch_buffers(sample_size, height_limit, chunk_count)
-            blocks_buffer = dedicated["blocks"]
-            materials_buffer = dedicated["materials"]
-            params_buffer = dedicated["params"]
+            async_resources = self._acquire_async_voxel_mesh_batch_resources(sample_size, height_limit, chunk_count)
+            blocks_buffer = async_resources.blocks_buffer
+            materials_buffer = async_resources.materials_buffer
+            params_buffer = async_resources.params_buffer
         else:
             self._ensure_voxel_mesh_batch_scratch(sample_size, height_limit, chunk_count)
             blocks_buffer = self._voxel_mesh_scratch_blocks_buffer
@@ -4300,10 +4410,10 @@ class TerrainRenderer:
         self.device.queue.submit([encoder.finish()])
 
         if defer_finalize:
+            assert async_resources is not None
             self._enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
                 chunk_coords,
-                blocks_buffer,
-                materials_buffer,
+                async_resources,
                 sample_size,
                 height_limit,
             )
