@@ -2886,6 +2886,7 @@ class TerrainRenderer:
 
     def _store_chunk_mesh(self, mesh: ChunkMesh) -> None:
         key = (mesh.chunk_x, mesh.chunk_z)
+        self._pending_chunk_coords.discard(key)
         existing = self.chunk_cache.pop(key, None)
         if existing is not None:
             self._release_chunk_mesh_storage(existing)
