@@ -1700,6 +1700,8 @@ class TerrainRenderer:
         self._visible_chunks_cache: list[tuple[int, int, ChunkMesh]] = []
         self._visible_meshes_cache: list[ChunkMesh] = []
         self._visible_chunk_cache_dirty = True
+        self._visible_displayed_coords: set[tuple[int, int]] = set()
+        self._visible_missing_coords: set[tuple[int, int]] = set()
         self._pending_chunk_coords: set[tuple[int, int]] = set()
         self._transient_render_buffers: list[list[wgpu.GPUBuffer]] = []
         self._tile_render_batches: dict[tuple[int, int], ChunkRenderBatch] = {}
@@ -2855,6 +2857,8 @@ class TerrainRenderer:
         self._visible_chunks_cache = []
         self._visible_meshes_cache = []
         self._visible_chunk_cache_dirty = True
+        self._visible_displayed_coords = set()
+        self._visible_missing_coords = set()
         self.world = VoxelWorld(
             int(time.time()) & 0x7FFFFFFF,
             gpu_device=self.device,
@@ -2897,6 +2901,8 @@ class TerrainRenderer:
             pass
         elif self._coord_in_visible_window(key):
             self._upsert_visible_chunk_cache(mesh)
+            self._visible_displayed_coords.add(key)
+            self._visible_missing_coords.discard(key)
         while len(self.chunk_cache) > self.max_cached_chunks:
             old_key, old_mesh = self.chunk_cache.popitem(last=False)
             self._release_chunk_mesh_storage(old_mesh)
@@ -2904,6 +2910,8 @@ class TerrainRenderer:
                 continue
             if self._coord_in_visible_window(old_key):
                 self._remove_visible_chunk_from_cache(old_key)
+                self._visible_displayed_coords.discard(old_key)
+                self._visible_missing_coords.add(old_key)
 
     def _chunk_mesh_age(self, mesh: ChunkMesh) -> float:
         return max(0.0, time.perf_counter() - mesh.created_at)
@@ -3421,6 +3429,7 @@ class TerrainRenderer:
         self._visible_chunk_origin = current_origin
         self._visible_chunk_coords = self._chunk_coords_in_view()
         self._invalidate_visible_chunk_cache()
+        self._rebuild_visible_presence_sets()
 
     def _warn_if_visible_exceeds_cache(self) -> None:
         visible_count = len(self._visible_chunk_coords)
@@ -3482,6 +3491,19 @@ class TerrainRenderer:
     def _invalidate_visible_chunk_cache(self) -> None:
         self._visible_chunk_cache_dirty = True
 
+    def _rebuild_visible_presence_sets(self) -> None:
+        visible_displayed_coords: set[tuple[int, int]] = set()
+        visible_missing_coords: set[tuple[int, int]] = set()
+        chunk_cache = self.chunk_cache
+        pending_chunk_coords = self._pending_chunk_coords
+        for coord in self._visible_chunk_coords:
+            if coord in chunk_cache:
+                visible_displayed_coords.add(coord)
+            elif coord not in pending_chunk_coords:
+                visible_missing_coords.add(coord)
+        self._visible_displayed_coords = visible_displayed_coords
+        self._visible_missing_coords = visible_missing_coords
+
     def _coord_in_visible_window(self, key: tuple[int, int]) -> bool:
         if not self._visible_chunk_coords:
             return False
@@ -3494,6 +3516,7 @@ class TerrainRenderer:
         )
 
     def _remove_visible_chunk_from_cache(self, key: tuple[int, int]) -> None:
+        self._visible_displayed_coords.discard((int(key[0]), int(key[1])))
         chunk_x = int(key[0])
         chunk_z = int(key[1])
         visible_chunks = self._visible_chunks_cache
@@ -3509,6 +3532,8 @@ class TerrainRenderer:
 
     def _upsert_visible_chunk_cache(self, mesh: ChunkMesh) -> None:
         key = (int(mesh.chunk_x), int(mesh.chunk_z))
+        self._visible_displayed_coords.add(key)
+        self._visible_missing_coords.discard(key)
         visible_chunks = self._visible_chunks_cache
         for index, (cached_x, cached_z, _) in enumerate(visible_chunks):
             if cached_x == key[0] and cached_z == key[1]:
@@ -3551,6 +3576,11 @@ class TerrainRenderer:
                 append_visible_mesh(mesh)
         self._visible_chunks_cache = visible_chunks
         self._visible_meshes_cache = visible_meshes
+        self._visible_displayed_coords = {(chunk_x, chunk_z) for chunk_x, chunk_z, _ in visible_chunks}
+        self._visible_missing_coords = {
+            coord for coord in self._visible_chunk_coords
+            if coord not in self._visible_displayed_coords and coord not in self._pending_chunk_coords
+        }
         self._visible_chunk_cache_dirty = False
 
     def _visible_chunks(self) -> list[tuple[int, int, ChunkMesh]]:
@@ -4600,20 +4630,16 @@ class TerrainRenderer:
         chunk_cache = self.chunk_cache
         pending_chunk_coords = self._pending_chunk_coords
 
-        missing_count = 0
-        displayed_chunk_coords: set[tuple[int, int]] = set()
+        missing_coords = self._visible_missing_coords
+        missing_count = len(missing_coords)
+        displayed_chunk_coords = self._visible_displayed_coords
         front_candidates: list[tuple[tuple[float, int, int], tuple[float, int, int], tuple[int, int]]] = []
         other_candidates: list[tuple[tuple[int, float, float, float, int, int], tuple[int, float, float, float, int, int], tuple[int, int]]] = []
 
-        for coord in self._visible_chunk_coords:
-            mesh = chunk_cache.get(coord)
-            if mesh is not None:
-                displayed_chunk_coords.add(coord)
-                continue
+        for coord in missing_coords:
             if coord in pending_chunk_coords:
                 continue
 
-            missing_count += 1
             chunk_x, chunk_z = coord
             dx = chunk_x - camera_chunk_x
             dz = chunk_z - camera_chunk_z
@@ -4662,10 +4688,11 @@ class TerrainRenderer:
                 self.world.request_chunk_voxel_batch(batch)
             for coord in request_coords:
                 pending_chunk_coords.add(coord)
+                self._visible_missing_coords.discard(coord)
             self._chunk_prep_tokens -= float(len(request_coords))
 
         self._last_new_displayed_chunks = len(displayed_chunk_coords - self._last_displayed_chunk_coords)
-        self._last_displayed_chunk_coords = displayed_chunk_coords
+        self._last_displayed_chunk_coords = set(displayed_chunk_coords)
         chunk_stream_ms = (time.perf_counter() - prep_start) * 1000.0
         self._last_chunk_stream_drained = chunk_stream_drained
         self._record_frame_breakdown_sample("chunk_stream_bytes", chunk_stream_bytes)
