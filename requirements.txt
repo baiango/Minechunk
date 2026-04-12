@@ -1,0 +1,5 @@
+wgpu>=0.24
+rendercanvas>=2.2
+glfw>=2.7
+numpy>=1.24
+numba>=0.60
