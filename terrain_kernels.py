@@ -420,6 +420,110 @@ def _emit_voxel_face(
 
 
 @njit(cache=True, fastmath=True)
+def _emit_quad_components(
+    vertices: np.ndarray,
+    vertex_index: int,
+    p0x: float, p0y: float, p0z: float,
+    p1x: float, p1y: float, p1z: float,
+    p2x: float, p2y: float, p2z: float,
+    p3x: float, p3y: float, p3z: float,
+    nx: float, ny: float, nz: float,
+    cr: float, cg: float, cb: float,
+) -> int:
+    row = vertices[vertex_index]
+    row[0] = p0x
+    row[1] = p0y
+    row[2] = p0z
+    row[3] = 1.0
+    row[4] = nx
+    row[5] = ny
+    row[6] = nz
+    row[7] = 0.0
+    row[8] = cr
+    row[9] = cg
+    row[10] = cb
+    row[11] = 1.0
+    vertex_index += 1
+
+    row = vertices[vertex_index]
+    row[0] = p1x
+    row[1] = p1y
+    row[2] = p1z
+    row[3] = 1.0
+    row[4] = nx
+    row[5] = ny
+    row[6] = nz
+    row[7] = 0.0
+    row[8] = cr
+    row[9] = cg
+    row[10] = cb
+    row[11] = 1.0
+    vertex_index += 1
+
+    row = vertices[vertex_index]
+    row[0] = p2x
+    row[1] = p2y
+    row[2] = p2z
+    row[3] = 1.0
+    row[4] = nx
+    row[5] = ny
+    row[6] = nz
+    row[7] = 0.0
+    row[8] = cr
+    row[9] = cg
+    row[10] = cb
+    row[11] = 1.0
+    vertex_index += 1
+
+    row = vertices[vertex_index]
+    row[0] = p0x
+    row[1] = p0y
+    row[2] = p0z
+    row[3] = 1.0
+    row[4] = nx
+    row[5] = ny
+    row[6] = nz
+    row[7] = 0.0
+    row[8] = cr
+    row[9] = cg
+    row[10] = cb
+    row[11] = 1.0
+    vertex_index += 1
+
+    row = vertices[vertex_index]
+    row[0] = p2x
+    row[1] = p2y
+    row[2] = p2z
+    row[3] = 1.0
+    row[4] = nx
+    row[5] = ny
+    row[6] = nz
+    row[7] = 0.0
+    row[8] = cr
+    row[9] = cg
+    row[10] = cb
+    row[11] = 1.0
+    vertex_index += 1
+
+    row = vertices[vertex_index]
+    row[0] = p3x
+    row[1] = p3y
+    row[2] = p3z
+    row[3] = 1.0
+    row[4] = nx
+    row[5] = ny
+    row[6] = nz
+    row[7] = 0.0
+    row[8] = cr
+    row[9] = cg
+    row[10] = cb
+    row[11] = 1.0
+    vertex_index += 1
+
+    return vertex_index
+
+
+@njit(cache=True, fastmath=True)
 def build_chunk_vertex_array_from_voxels(
     blocks: np.ndarray,
     materials: np.ndarray,
@@ -428,120 +532,190 @@ def build_chunk_vertex_array_from_voxels(
     chunk_size: int,
     height_limit: int,
 ) -> tuple[np.ndarray, int]:
-    sample_size = chunk_size + 2
-    vertex_count = 0
-
-    for y in range(height_limit):
-        for local_z in range(1, sample_size - 1):
-            for local_x in range(1, sample_size - 1):
-                if blocks[y, local_z, local_x] == 0:
-                    continue
-                if y == height_limit - 1 or blocks[y + 1, local_z, local_x] == 0:
-                    vertex_count += VERTICES_PER_FACE
-                if y == 0 or blocks[y - 1, local_z, local_x] == 0:
-                    vertex_count += VERTICES_PER_FACE
-                if blocks[y, local_z, local_x + 1] == 0:
-                    vertex_count += VERTICES_PER_FACE
-                if blocks[y, local_z, local_x - 1] == 0:
-                    vertex_count += VERTICES_PER_FACE
-                if blocks[y, local_z + 1, local_x] == 0:
-                    vertex_count += VERTICES_PER_FACE
-                if blocks[y, local_z - 1, local_x] == 0:
-                    vertex_count += VERTICES_PER_FACE
-
+    vertex_count = count_chunk_voxel_vertices(blocks, chunk_size, height_limit)
     vertices = np.empty((vertex_count, VERTEX_COMPONENTS), dtype=np.float32)
+    if vertex_count == 0:
+        return vertices, 0
+
+    sample_size = chunk_size + 2
+    end = sample_size - 1
+    last_y = height_limit - 1
+    origin_x = float(chunk_x * chunk_size)
+    origin_z = float(chunk_z * chunk_size)
     vertex_index = 0
-    origin_x = chunk_x * chunk_size
-    origin_z = chunk_z * chunk_size
 
     for y in range(height_limit):
-        for local_z in range(1, sample_size - 1):
-            for local_x in range(1, sample_size - 1):
-                if blocks[y, local_z, local_x] == 0:
+        plane = blocks[y]
+        mat_plane = materials[y]
+        above = blocks[y + 1] if y < last_y else plane
+        below = blocks[y - 1] if y > 0 else plane
+        y0 = float(y)
+        y1 = y0 + 1.0
+
+        z0 = origin_z
+        for local_z in range(1, end):
+            row = plane[local_z]
+            row_mat = mat_plane[local_z]
+            row_north = plane[local_z - 1]
+            row_south = plane[local_z + 1]
+            row_above = above[local_z]
+            row_below = below[local_z]
+            z1 = z0 + 1.0
+
+            x0 = origin_x
+            for local_x in range(1, end):
+                if row[local_x] == 0:
+                    x0 += 1.0
                     continue
 
-                material = int(materials[y, local_z, local_x])
-                color = _voxel_material_color(material, y)
-                top = color
-                east = _scale_color(color, 0.80)
-                west = _scale_color(color, 0.64)
-                south = _scale_color(color, 0.72)
-                north = _scale_color(color, 0.60)
-                bottom = _scale_color(color, 0.50)
-
-                x0 = float(origin_x + local_x - 1)
                 x1 = x0 + 1.0
-                z0 = float(origin_z + local_z - 1)
-                z1 = z0 + 1.0
-                y0 = float(y)
-                y1 = y0 + 1.0
+                material = int(row_mat[local_x])
 
-                if y == height_limit - 1 or blocks[y + 1, local_z, local_x] == 0:
-                    vertex_index = _emit_voxel_face(
+                if material == BEDROCK:
+                    cr = 0.24
+                    cg = 0.22
+                    cb = 0.20
+                elif material == STONE:
+                    cr = 0.42
+                    cg = 0.40
+                    cb = 0.38
+                elif material == DIRT:
+                    cr = 0.47
+                    cg = 0.31
+                    cb = 0.18
+                elif material == GRASS:
+                    cr = 0.31
+                    cg = 0.68
+                    cb = 0.24
+                elif material == SAND:
+                    cr = 0.78
+                    cg = 0.71
+                    cb = 0.49
+                elif material == SNOW:
+                    cr = 0.95
+                    cg = 0.97
+                    cb = 0.98
+                else:
+                    if y <= 14:
+                        cr = 0.78
+                        cg = 0.71
+                        cb = 0.49
+                    elif y >= 90:
+                        cr = 0.95
+                        cg = 0.97
+                        cb = 0.98
+                    elif y >= 70:
+                        cr = 0.60
+                        cg = 0.72
+                        cb = 0.49
+                    elif y >= 40:
+                        cr = 0.38
+                        cg = 0.64
+                        cb = 0.31
+                    else:
+                        cr = 0.28
+                        cg = 0.54
+                        cb = 0.22
+
+                top_r = cr
+                top_g = cg
+                top_b = cb
+
+                east_r = cr * 0.80
+                east_g = cg * 0.80
+                east_b = cb * 0.80
+
+                west_r = cr * 0.64
+                west_g = cg * 0.64
+                west_b = cb * 0.64
+
+                south_r = cr * 0.72
+                south_g = cg * 0.72
+                south_b = cb * 0.72
+
+                north_r = cr * 0.60
+                north_g = cg * 0.60
+                north_b = cb * 0.60
+
+                bottom_r = cr * 0.50
+                bottom_g = cg * 0.50
+                bottom_b = cb * 0.50
+
+                if y == last_y or row_above[local_x] == 0:
+                    vertex_index = _emit_quad_components(
                         vertices,
                         vertex_index,
-                        (x0, y1, z0),
-                        (x1, y1, z0),
-                        (x1, y1, z1),
-                        (x0, y1, z1),
-                        (0.0, 1.0, 0.0),
-                        top,
+                        x0, y1, z0,
+                        x1, y1, z0,
+                        x1, y1, z1,
+                        x0, y1, z1,
+                        0.0, 1.0, 0.0,
+                        top_r, top_g, top_b,
                     )
-                if y == 0 or blocks[y - 1, local_z, local_x] == 0:
-                    vertex_index = _emit_voxel_face(
+
+                if y == 0 or row_below[local_x] == 0:
+                    vertex_index = _emit_quad_components(
                         vertices,
                         vertex_index,
-                        (x0, y0, z0),
-                        (x0, y0, z1),
-                        (x1, y0, z1),
-                        (x1, y0, z0),
-                        (0.0, -1.0, 0.0),
-                        bottom,
+                        x0, y0, z0,
+                        x0, y0, z1,
+                        x1, y0, z1,
+                        x1, y0, z0,
+                        0.0, -1.0, 0.0,
+                        bottom_r, bottom_g, bottom_b,
                     )
-                if blocks[y, local_z, local_x + 1] == 0:
-                    vertex_index = _emit_voxel_face(
+
+                if row[local_x + 1] == 0:
+                    vertex_index = _emit_quad_components(
                         vertices,
                         vertex_index,
-                        (x1, y0, z0),
-                        (x1, y1, z0),
-                        (x1, y1, z1),
-                        (x1, y0, z1),
-                        (1.0, 0.0, 0.0),
-                        east,
+                        x1, y0, z0,
+                        x1, y1, z0,
+                        x1, y1, z1,
+                        x1, y0, z1,
+                        1.0, 0.0, 0.0,
+                        east_r, east_g, east_b,
                     )
-                if blocks[y, local_z, local_x - 1] == 0:
-                    vertex_index = _emit_voxel_face(
+
+                if row[local_x - 1] == 0:
+                    vertex_index = _emit_quad_components(
                         vertices,
                         vertex_index,
-                        (x0, y0, z0),
-                        (x0, y0, z1),
-                        (x0, y1, z1),
-                        (x0, y1, z0),
-                        (-1.0, 0.0, 0.0),
-                        west,
+                        x0, y0, z0,
+                        x0, y0, z1,
+                        x0, y1, z1,
+                        x0, y1, z0,
+                        -1.0, 0.0, 0.0,
+                        west_r, west_g, west_b,
                     )
-                if blocks[y, local_z + 1, local_x] == 0:
-                    vertex_index = _emit_voxel_face(
+
+                if row_south[local_x] == 0:
+                    vertex_index = _emit_quad_components(
                         vertices,
                         vertex_index,
-                        (x0, y0, z1),
-                        (x1, y0, z1),
-                        (x1, y1, z1),
-                        (x0, y1, z1),
-                        (0.0, 0.0, 1.0),
-                        south,
+                        x0, y0, z1,
+                        x1, y0, z1,
+                        x1, y1, z1,
+                        x0, y1, z1,
+                        0.0, 0.0, 1.0,
+                        south_r, south_g, south_b,
                     )
-                if blocks[y, local_z - 1, local_x] == 0:
-                    vertex_index = _emit_voxel_face(
+
+                if row_north[local_x] == 0:
+                    vertex_index = _emit_quad_components(
                         vertices,
                         vertex_index,
-                        (x0, y0, z0),
-                        (x0, y1, z0),
-                        (x1, y1, z0),
-                        (x1, y0, z0),
-                        (0.0, 0.0, -1.0),
-                        north,
+                        x0, y0, z0,
+                        x0, y1, z0,
+                        x1, y1, z0,
+                        x1, y0, z0,
+                        0.0, 0.0, -1.0,
+                        north_r, north_g, north_b,
                     )
+
+                x0 = x1
+
+            z0 = z1
 
     return vertices, vertex_index
 
@@ -549,22 +723,36 @@ def build_chunk_vertex_array_from_voxels(
 @njit(cache=True, fastmath=True)
 def count_chunk_voxel_vertices(blocks: np.ndarray, chunk_size: int, height_limit: int) -> int:
     sample_size = chunk_size + 2
+    end = sample_size - 1
+    last_y = height_limit - 1
     vertex_count = 0
+
     for y in range(height_limit):
-        for local_z in range(1, sample_size - 1):
-            for local_x in range(1, sample_size - 1):
-                if blocks[y, local_z, local_x] == 0:
+        plane = blocks[y]
+        above = blocks[y + 1] if y < last_y else plane
+        below = blocks[y - 1] if y > 0 else plane
+
+        for local_z in range(1, end):
+            row = plane[local_z]
+            row_north = plane[local_z - 1]
+            row_south = plane[local_z + 1]
+            row_above = above[local_z]
+            row_below = below[local_z]
+
+            for local_x in range(1, end):
+                if row[local_x] == 0:
                     continue
-                if y == height_limit - 1 or blocks[y + 1, local_z, local_x] == 0:
+                if y == last_y or row_above[local_x] == 0:
                     vertex_count += VERTICES_PER_FACE
-                if y == 0 or blocks[y - 1, local_z, local_x] == 0:
+                if y == 0 or row_below[local_x] == 0:
                     vertex_count += VERTICES_PER_FACE
-                if blocks[y, local_z, local_x + 1] == 0:
+                if row[local_x + 1] == 0:
                     vertex_count += VERTICES_PER_FACE
-                if blocks[y, local_z, local_x - 1] == 0:
+                if row[local_x - 1] == 0:
                     vertex_count += VERTICES_PER_FACE
-                if blocks[y, local_z + 1, local_x] == 0:
+                if row_south[local_x] == 0:
                     vertex_count += VERTICES_PER_FACE
-                if blocks[y, local_z - 1, local_x] == 0:
+                if row_north[local_x] == 0:
                     vertex_count += VERTICES_PER_FACE
+
     return vertex_count

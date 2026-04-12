@@ -3454,13 +3454,13 @@ class TerrainRenderer:
         visible_vertex_count = sum(vertex_count for _, vertex_count, _ in render_batches)
         return render_batches, render_encode_ms, len(render_batches), merged_chunk_count, len(visible_chunks), visible_vertex_count
 
-    def _build_chunk_vertex_bytes(
+    def _build_chunk_vertex_array(
         self,
         voxel_grid,
         material_grid,
         chunk_x: int,
         chunk_z: int,
-    ) -> bytes:
+    ) -> tuple[np.ndarray, int, int]:
         vertex_array, vertex_count = build_chunk_vertex_array_from_voxels(
             voxel_grid,
             material_grid,
@@ -3469,7 +3469,95 @@ class TerrainRenderer:
             CHUNK_SIZE,
             WORLD_HEIGHT,
         )
-        return vertex_array[:vertex_count].tobytes()
+        used_vertex_count = int(vertex_count)
+        used_vertex_array = np.ascontiguousarray(vertex_array[:used_vertex_count])
+        chunk_max_height = (
+            int(voxel_grid.shape[0])
+            if getattr(voxel_grid, "ndim", 0) == 3
+            else int(np.max(voxel_grid))
+        )
+        return used_vertex_array, used_vertex_count, chunk_max_height
+
+    def _cpu_make_chunk_mesh_batch_from_voxels(
+        self,
+        chunk_results: list[ChunkVoxelResult],
+    ) -> list[ChunkMesh]:
+        if not chunk_results:
+            return []
+
+        built_chunks: list[tuple[int, int, np.ndarray, int, int, int]] = []
+        total_vertex_bytes = 0
+        created_at = time.perf_counter()
+
+        for result in chunk_results:
+            chunk_x = int(result.chunk_x)
+            chunk_z = int(result.chunk_z)
+            vertex_array, vertex_count, chunk_max_height = self._build_chunk_vertex_array(
+                result.blocks,
+                result.materials,
+                chunk_x,
+                chunk_z,
+            )
+            vertex_bytes = int(vertex_count) * VERTEX_STRIDE
+            built_chunks.append(
+                (
+                    chunk_x,
+                    chunk_z,
+                    vertex_array,
+                    int(vertex_count),
+                    int(vertex_bytes),
+                    int(chunk_max_height),
+                )
+            )
+            total_vertex_bytes += vertex_bytes
+
+        batch_allocation = self._allocate_mesh_output_range(total_vertex_bytes)
+        batch_buffer = batch_allocation.buffer
+        batch_base_offset = batch_allocation.offset_bytes
+
+        meshes: list[ChunkMesh] = []
+        cursor_bytes = 0
+        for chunk_x, chunk_z, vertex_array, vertex_count, vertex_bytes, chunk_max_height in built_chunks:
+            vertex_offset = batch_base_offset + cursor_bytes
+            if vertex_bytes > 0:
+                vertex_view = memoryview(vertex_array.view(np.uint8).reshape(-1))
+                self.device.queue.write_buffer(batch_buffer, vertex_offset, vertex_view)
+            meshes.append(
+                ChunkMesh(
+                    chunk_x=chunk_x,
+                    chunk_z=chunk_z,
+                    vertex_count=vertex_count,
+                    vertex_buffer=batch_buffer,
+                    vertex_offset=vertex_offset,
+                    max_height=chunk_max_height,
+                    created_at=created_at,
+                    allocation_id=batch_allocation.allocation_id,
+                )
+            )
+            cursor_bytes += vertex_bytes
+
+        return meshes
+
+
+    def _cpu_make_chunk_mesh_from_voxels(
+        self,
+        chunk_x: int,
+        chunk_z: int,
+        voxel_grid,
+        material_grid,
+    ) -> ChunkMesh:
+        meshes = self._cpu_make_chunk_mesh_batch_from_voxels(
+            [
+                ChunkVoxelResult(
+                    chunk_x=int(chunk_x),
+                    chunk_z=int(chunk_z),
+                    blocks=np.ascontiguousarray(voxel_grid, dtype=np.uint32),
+                    materials=np.ascontiguousarray(material_grid, dtype=np.uint32),
+                    source="cpu",
+                )
+            ]
+        )
+        return meshes[0]
 
     def _ensure_voxel_mesh_batch_scratch(
         self,
@@ -4192,21 +4280,7 @@ class TerrainRenderer:
                 self.use_gpu_meshing = False
                 self.mesh_backend_label = "CPU"
                 print(f"Warning: GPU meshing failed ({exc!s}); using CPU meshing.", file=sys.stderr)
-        vertex_bytes = self._build_chunk_vertex_bytes(voxel_grid, material_grid, chunk_x, chunk_z)
-        vertex_count = len(vertex_bytes) // VERTEX_STRIDE
-        chunk_max_height = int(voxel_grid.shape[0]) if getattr(voxel_grid, "ndim", 0) == 3 else int(np.max(voxel_grid))
-        vertex_buffer = self.device.create_buffer_with_data(
-            data=vertex_bytes,
-            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.COPY_SRC,
-        )
-        return ChunkMesh(
-            chunk_x=chunk_x,
-            chunk_z=chunk_z,
-            vertex_count=vertex_count,
-            vertex_buffer=vertex_buffer,
-            max_height=chunk_max_height,
-            created_at=time.perf_counter(),
-        )
+        return self._cpu_make_chunk_mesh_from_voxels(chunk_x, chunk_z, voxel_grid, material_grid)
 
     def _make_chunk_mesh(self, chunk_x: int, chunk_z: int) -> ChunkMesh:
         voxel_grid, material_grid = self.world.chunk_voxel_grid(chunk_x, chunk_z)
@@ -4292,7 +4366,9 @@ class TerrainRenderer:
                     batch = [self._pending_voxel_mesh_results.popleft() for _ in range(batch_size)]
                     chunk_stream_drained += len(batch)
                     drain_budget -= len(batch)
-                    for mesh in self._gpu_make_chunk_mesh_batch_from_voxels(batch, defer_finalize=True):
+                    for result in batch:
+                        chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
+                    for mesh in self._cpu_make_chunk_mesh_batch_from_voxels(batch):
                         self._store_chunk_mesh(mesh)
             else:
                 chunk_stream_added = 0
