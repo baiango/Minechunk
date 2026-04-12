@@ -1,6 +1,8 @@
-# Infinite Procedural World
+# Minechunk
 
-A real-time voxel terrain renderer built in Python on top of `wgpu-py`, with deterministic procedural generation, pluggable CPU/GPU terrain backends, GPU meshing, GPU-driven visibility culling, indirect draw submission, and in-engine profiling HUDs.
+Minechunk is a live voxel terrain playground built in Python on top of `wgpu-py`. It is designed to show how far a procedural world can be pushed when terrain generation, meshing, visibility, and rendering all stay on the critical path in real time.
+
+It combines deterministic world generation, swappable CPU/GPU terrain backends, GPU meshing, GPU-driven visibility culling, indirect draw submission, and in-engine profiling overlays.
 
 ## Screenshots
 
@@ -8,29 +10,34 @@ A real-time voxel terrain renderer built in Python on top of `wgpu-py`, with det
 | --- | --- |
 | ![CPU mode screenshot](docs/m4-cpu-demo-screenshot.png) | ![GPU mode screenshot](docs/m4-gpu-demo-screenshot.png) |
 
-## Overview
+## What Makes It Interesting
 
-This project is a renderer-first voxel terrain tech demo focused on frame-time decomposition, chunk streaming, and render-path experimentation.
+Minechunk is renderer-first by design. Instead of baking terrain ahead of time, it streams chunked terrain on demand, builds meshes as the camera moves, and keeps enough instrumentation in the loop to show where the frame time is really going.
 
-The world is chunked in the X/Z plane, generated deterministically from `(seed, chunk_x, chunk_z)`, and streamed on demand as the camera moves. The renderer supports both CPU and GPU execution paths for terrain generation and meshing, and includes internal tooling to benchmark chunk throughput, batch sizing, frame breakdown, and render capacity.
+That makes it useful as more than a demo:
 
-## Performance
+- a practical testbed for procedural terrain ideas
+- a benchmark harness for chunk throughput and mesh generation
+- a profiling sandbox for CPU/GPU tradeoffs
+- a render-path experiment for visibility, batching, and indirect submission
 
-This is not a synthetic offline terrain test. It is a live renderer.
+## Performance Snapshot
 
-In local testing, the CPU terrain backend can generate roughly **~500 real chunks/second on a single core while maintaining a live, viewable scene**. At that point, terrain generation is no longer the dominant ceiling in that configuration; render cost, mesh density, visibility, draw submission, and GPU work start to matter more.
+This is a live renderer, not an offline terrain generator.
 
-That is the important threshold for a voxel engine: once chunk generation becomes fast enough, the problem shifts from “can the world keep up?” to “can the renderer keep up?”
+In local testing, the CPU terrain backend can generate roughly **~500 real chunks/second on a single core** while still maintaining a viewable scene. Once terrain generation reaches that level, the bottleneck shifts: render cost, mesh density, visibility, draw submission, and GPU work start to matter more.
+
+That is the interesting part of a voxel engine. When the world keeps up, the renderer becomes the challenge.
 
 ### Why that matters
 
 - Real chunk dimensions: `32 x 128 x 32`
 - Single-core CPU terrain generation
-- Live scene on screen, not an offline bake
+- Live scene on screen, not a static bake
 - Benchmark path measures real chunk drain rate in chunks/second
-- Renderer includes profiling overlays and frame breakdown instrumentation
+- Built-in profiling overlays and frame breakdown instrumentation
 
-## Core technical features
+## Core Highlights
 
 - Infinite procedural terrain with deterministic sampling
 - Chunk size `32 x 128 x 32`
@@ -46,51 +53,51 @@ That is the important threshold for a voxel engine: once chunk generation become
 - Profiling HUD and frame breakdown overlay
 - Benchmark harness for terrain throughput, validation, and render scaling
 
-## Runtime model
+## Runtime Model
 
-### World representation
+### World Representation
 
-The terrain is infinite in X/Z and vertically capped at `128` blocks. Surface generation is deterministic and driven from a compact procedural height/material sampler. Chunk requests are resolved lazily and cached once meshed.
+Terrain extends infinitely in X/Z and is vertically capped at `128` blocks. Surface generation is deterministic and driven from a compact procedural height/material sampler. Chunk requests are resolved lazily and cached once meshed.
 
-### Terrain backends
+### Terrain Backends
 
 `VoxelWorld` is a façade over a swappable terrain backend:
 
 - `CpuTerrainBackend`: computes chunk surface grids and voxel grids on CPU
-- `MetalTerrainBackend`: dedicated GPU backend slot using the current compute path as a placeholder for a future native Metal-oriented implementation
+- `MetalTerrainBackend`: dedicated GPU backend slot that currently uses the project’s compute path as a placeholder for a future native Metal-oriented implementation
 
 Both backends expose the same chunk-surface and chunk-voxel interfaces, so renderer-side scheduling does not depend on the generation path.
 
-### Meshing paths
+### Meshing Paths
 
-Two meshing strategies exist:
+Two meshing strategies are available:
 
-- **CPU meshing** using Numba-accelerated kernels
-- **GPU meshing** using compute shaders for voxel-face counting, prefix/scan, and vertex emission
+- CPU meshing using Numba-accelerated kernels
+- GPU meshing using compute shaders for voxel-face counting, prefix/scan, and vertex emission
 
 The GPU path builds mesh data asynchronously and finalizes chunk meshes into renderer-managed vertex storage.
 
-### Render path
+### Render Path
 
 The render loop uses `wgpu-py` and a custom WGSL pipeline:
 
-1. Update camera and visible chunk set
-2. Stream/generate missing chunks
+1. Update the camera and visible chunk set
+2. Stream or generate missing chunks
 3. Build or finalize chunk meshes
-4. Upload camera uniform
+4. Upload the camera uniform
 5. Build visibility records for resident meshes
 6. Run GPU visibility culling
 7. Emit indirect draw commands
-8. Submit render pass
+8. Submit the render pass
 9. Overlay profiling HUDs
 
-## Renderer architecture
+## Rendering Architecture
 
-### Chunk streaming
+### Chunk Streaming
 
 The renderer tracks visible chunk coordinates around the camera and schedules chunk preparation with bounded request budgets. Missing chunks are prioritized with a forward-cone heuristic so camera-facing terrain arrives first.
 
-### Chunk cache
+### Chunk Cache
 
 Chunk meshes are stored in an ordered cache keyed by `(chunk_x, chunk_z)`. Cached meshes include:
 
@@ -100,9 +107,9 @@ Chunk meshes are stored in an ordered cache keyed by `(chunk_x, chunk_z)`. Cache
 - allocation metadata
 - creation timestamp
 
-### Mesh storage allocator
+### Mesh Storage Allocator
 
-Chunk mesh output is stored in persistent GPU slabs and suballocated into aligned regions rather than always allocating one standalone GPU buffer per chunk. This reduces allocation churn and makes chunk mesh residency more stable under heavy streaming.
+Chunk mesh output is stored in persistent GPU slabs and suballocated into aligned regions rather than always allocating one standalone GPU buffer per chunk. This reduces allocation churn and keeps chunk residency steadier under heavy streaming.
 
 Tracked allocator state includes:
 
@@ -112,28 +119,28 @@ Tracked allocator state includes:
 - largest free range
 - live allocation count
 
-### GPU visibility culling
+### GPU Visibility Culling
 
 Resident chunk meshes carry bounding spheres derived from chunk center and max height. These bounds are uploaded into a visibility-record buffer, and a compute pass tests them against the camera frustum. Surviving meshes write indirect draw commands; rejected meshes write zero-vertex commands.
 
 This keeps visibility classification on GPU and reduces CPU-side draw filtering overhead when many chunk meshes are resident.
 
-### Indirect draw path
+### Indirect Draw Path
 
-The renderer supports indirect draw command buffers, allowing GPU-generated visibility results to flow directly into submission. This reduces CPU work when scene residency grows.
+The renderer supports indirect draw command buffers, allowing GPU-generated visibility results to flow directly into submission. That keeps CPU overhead lower as the scene grows denser.
 
-### Profiling overlays
+### Profiling Overlays
 
 Two HUDs are built into the engine:
 
-- **Profiler HUD**: frame stats, CPU hotspots, backend labels, allocator state
-- **Frame breakdown HUD**: world update, visibility lookup, chunk streaming, camera upload, render encode, command finish, queue submit, wall-frame timing, draw calls, visible vertices, pending chunk requests, and chunk memory
+- Profiler HUD: frame stats, CPU hotspots, backend labels, allocator state
+- Frame breakdown HUD: world update, visibility lookup, chunk streaming, camera upload, render encode, command finish, queue submit, wall-frame timing, draw calls, visible vertices, pending chunk requests, and chunk memory
 
-## Procedural generation
+## Procedural Generation
 
 Terrain sampling is based on layered 2D value noise with broad, ridge, and detail components. Surface material is derived from sampled height bands and local detail thresholds.
 
-Current material palette includes:
+Current material palette:
 
 - bedrock
 - stone
@@ -144,7 +151,7 @@ Current material palette includes:
 
 For voxel expansion, the surface layer is converted into full chunk voxel occupancy/material grids, then meshed either on CPU or GPU.
 
-## Shader pipeline
+## Shader Pipeline
 
 The project includes several WGSL stages:
 
@@ -157,7 +164,7 @@ The project includes several WGSL stages:
 
 The main terrain render shader performs camera-relative projection in shader code and shades fragments using a directional light.
 
-## Benchmarks and validation
+## Benchmarks and Validation
 
 `benchmark_chunk_generation.py` includes tooling for:
 
@@ -169,35 +176,20 @@ The main terrain render shader performs camera-relative projection in shader cod
 - terrain backend validation
 - GPU timestamp-assisted render timing where supported
 
-This makes the repo useful both as a renderer demo and as a profiling / optimization sandbox.
+This makes the repo useful both as a renderer demo and as a profiling/optimization sandbox.
 
-## Repo layout
+## Repo Layout
 
-### `main.py`
-Minimal entry point that creates `TerrainRenderer` and starts the render loop.
+- `main.py`: minimal entry point that creates `TerrainRenderer` and starts the render loop
+- `renderer.py`: main engine loop, input, camera, chunk streaming, cache management, GPU meshing orchestration, visibility culling, indirect rendering, slab allocation, and profiling HUDs
+- `voxel_world.py`: world façade exposing deterministic terrain queries and backend routing
+- `cpu_terrain_backend.py`: CPU implementation of surface-grid and voxel-grid generation, with batched request/poll interfaces
+- `metal_terrain_backend.py`: GPU terrain backend slot using compute-driven chunk generation through `wgpu-py`
+- `terrain_kernels.py`: Numba-accelerated terrain kernels for noise sampling, surface generation, voxel expansion, and CPU mesh construction
+- `terrain_backend.py`: backend protocol and shared result dataclasses
+- `benchmark_chunk_generation.py`: microbenchmark and validation harness for terrain, meshing, and render throughput studies
 
-### `renderer.py`
-Main engine loop, input, camera, chunk streaming, cache management, GPU meshing orchestration, visibility culling, indirect rendering, slab allocation, and profiling HUDs.
-
-### `voxel_world.py`
-World façade exposing deterministic terrain queries and backend routing.
-
-### `cpu_terrain_backend.py`
-CPU implementation of surface-grid and voxel-grid generation, with batched request / poll interfaces.
-
-### `metal_terrain_backend.py`
-GPU terrain backend slot using compute-driven chunk generation through `wgpu-py`.
-
-### `terrain_kernels.py`
-Numba-accelerated terrain kernels for noise sampling, surface generation, voxel expansion, and CPU mesh construction.
-
-### `terrain_backend.py`
-Backend protocol and shared result dataclasses.
-
-### `benchmark_chunk_generation.py`
-Microbenchmark and validation harness for terrain, meshing, and render throughput studies.
-
-## Build and run
+## Build and Run
 
 ```bash
 pip install -r requirements.txt
@@ -206,43 +198,18 @@ python3 main.py
 
 ## Dependencies
 
-* `wgpu`
-* `rendercanvas`
-* `glfw`
-* `numpy`
-* `numba`
+- `wgpu`
+- `rendercanvas`
+- `glfw`
+- `numpy`
+- `numba`
 
 ## Controls
 
-* `WASD` or arrow keys — move horizontally
-* `X` — move up
-* `Z` — move down
-* `Right Shift` — sprint
-* Left mouse drag — look around
-* `F3` — toggle profiling HUD
-* `R` — regenerate world with a new seed
-
-## Why this repo exists
-
-This project is mainly a sandbox for pushing a voxel engine until the bottleneck moves.
-
-Useful questions here are not only:
-
-* How fast is terrain generation?
-* How many chunks per second can the backend sustain?
-
-But also:
-
-* When does chunk generation stop being the bottleneck?
-* When do draw calls dominate?
-* How much does GPU meshing shift the ceiling?
-* How expensive is visibility?
-* How much chunk residency can the renderer carry before frame time collapses?
-* When does the engine become primarily render-bound?
-
-## Notes
-
-* Default engine mode is configured in code and currently targets the GPU path
-* GPU terrain is isolated behind a backend interface and falls back to CPU if setup fails
-* GPU meshing falls back to CPU meshing if required compute pipelines cannot be created
-* The project is designed for iteration and profiling, so instrumentation is part of the runtime design rather than an external afterthought
+- `WASD` or arrow keys: move horizontally
+- `X`: move up
+- `Z`: move down
+- `Right Shift`: sprint
+- Left mouse drag: look around
+- `F3`: toggle profiling HUD
+- `R`: regenerate the world with a new seed
