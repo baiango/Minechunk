@@ -2892,11 +2892,17 @@ class TerrainRenderer:
             self._release_chunk_mesh_storage(existing)
         self.chunk_cache[key] = mesh
         self._retain_chunk_mesh_storage(mesh)
-        self._visible_chunk_cache_dirty = True
+        if self._visible_chunk_cache_dirty:
+            pass
+        elif self._coord_in_visible_window(key):
+            self._upsert_visible_chunk_cache(mesh)
         while len(self.chunk_cache) > self.max_cached_chunks:
             old_key, old_mesh = self.chunk_cache.popitem(last=False)
             self._release_chunk_mesh_storage(old_mesh)
-            self._visible_chunk_cache_dirty = True
+            if self._visible_chunk_cache_dirty:
+                continue
+            if self._coord_in_visible_window(old_key):
+                self._remove_visible_chunk_from_cache(old_key)
 
     def _chunk_mesh_age(self, mesh: ChunkMesh) -> float:
         return max(0.0, time.perf_counter() - mesh.created_at)
@@ -3383,7 +3389,7 @@ class TerrainRenderer:
             return
         self._visible_chunk_origin = current_origin
         self._visible_chunk_coords = self._chunk_coords_in_view()
-        self._visible_chunk_cache_dirty = True
+        self._invalidate_visible_chunk_cache()
 
     def _warn_if_visible_exceeds_cache(self) -> None:
         visible_count = len(self._visible_chunk_coords)
@@ -3444,6 +3450,55 @@ class TerrainRenderer:
     @profile
     def _invalidate_visible_chunk_cache(self) -> None:
         self._visible_chunk_cache_dirty = True
+
+    def _coord_in_visible_window(self, key: tuple[int, int]) -> bool:
+        if not self._visible_chunk_coords:
+            return False
+        origin = self._visible_chunk_origin
+        if origin is None:
+            return False
+        return (
+            abs(int(key[0]) - int(origin[0])) <= self.chunk_radius
+            and abs(int(key[1]) - int(origin[1])) <= self.chunk_radius
+        )
+
+    def _remove_visible_chunk_from_cache(self, key: tuple[int, int]) -> None:
+        chunk_x = int(key[0])
+        chunk_z = int(key[1])
+        visible_chunks = self._visible_chunks_cache
+        for index, (cached_x, cached_z, _) in enumerate(visible_chunks):
+            if cached_x == chunk_x and cached_z == chunk_z:
+                del visible_chunks[index]
+                break
+        visible_meshes = self._visible_meshes_cache
+        for index, cached_mesh in enumerate(visible_meshes):
+            if cached_mesh.chunk_x == chunk_x and cached_mesh.chunk_z == chunk_z:
+                del visible_meshes[index]
+                break
+
+    def _upsert_visible_chunk_cache(self, mesh: ChunkMesh) -> None:
+        key = (int(mesh.chunk_x), int(mesh.chunk_z))
+        visible_chunks = self._visible_chunks_cache
+        for index, (cached_x, cached_z, _) in enumerate(visible_chunks):
+            if cached_x == key[0] and cached_z == key[1]:
+                visible_chunks[index] = (key[0], key[1], mesh)
+                break
+        else:
+            visible_chunks.append((key[0], key[1], mesh))
+
+        visible_meshes = self._visible_meshes_cache
+        mesh_index = None
+        for index, cached_mesh in enumerate(visible_meshes):
+            if cached_mesh.chunk_x == key[0] and cached_mesh.chunk_z == key[1]:
+                mesh_index = index
+                break
+        if mesh.vertex_count > 0:
+            if mesh_index is None:
+                visible_meshes.append(mesh)
+            else:
+                visible_meshes[mesh_index] = mesh
+        elif mesh_index is not None:
+            del visible_meshes[mesh_index]
 
     def _rebuild_visible_chunk_cache(self) -> None:
         if not self._visible_chunk_coords:
@@ -4406,11 +4461,7 @@ class TerrainRenderer:
 
     def _refresh_visible_chunk_set(self) -> float:
         visibility_start = time.perf_counter()
-        current_origin = (int(self.camera.position[0] // CHUNK_SIZE), int(self.camera.position[2] // CHUNK_SIZE))
-        if self._visible_chunk_origin != current_origin or not self._visible_chunk_coords:
-            self._visible_chunk_origin = current_origin
-            self._visible_chunk_coords = self._chunk_coords_in_view()
-            self._visible_chunk_cache_dirty = True
+        self._refresh_visible_chunk_coords()
         self._warn_if_visible_exceeds_cache()
         return (time.perf_counter() - visibility_start) * 1000.0
 
