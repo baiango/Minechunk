@@ -1588,8 +1588,6 @@ class ChunkRenderBatch:
     signature: tuple[tuple[int, int], ...]
     vertex_count: int
     vertex_buffer: wgpu.GPUBuffer
-    bounds: tuple[float, float, float, float] | None = None
-    chunk_count: int = 0
 
 
 @dataclass
@@ -1701,9 +1699,6 @@ class TerrainRenderer:
         self._visible_displayed_coords: set[tuple[int, int]] = set()
         self._visible_missing_coords: set[tuple[int, int]] = set()
         self._visible_missing_queue: deque[tuple[int, int]] = deque()
-        self._visible_chunks_cache: list[tuple[int, int, ChunkMesh]] = []
-        self._visible_meshes_cache: list[ChunkMesh] = []
-        self._visible_chunk_cache_dirty = True
         self._pending_chunk_coords: set[tuple[int, int]] = set()
         self._transient_render_buffers: list[list[wgpu.GPUBuffer]] = []
         self._tile_render_batches: dict[tuple[int, int], ChunkRenderBatch] = {}
@@ -2900,13 +2895,11 @@ class TerrainRenderer:
         if key in self._visible_chunk_coord_set:
             self._visible_displayed_coords.add(key)
             self._visible_missing_coords.discard(key)
-            self._visible_chunk_cache_dirty = True
         while len(self.chunk_cache) > self.max_cached_chunks:
             old_key, old_mesh = self.chunk_cache.popitem(last=False)
             self._release_chunk_mesh_storage(old_mesh)
             if old_key in self._visible_chunk_coord_set:
                 self._visible_displayed_coords.discard(old_key)
-                self._visible_chunk_cache_dirty = True
                 if old_key not in self._pending_chunk_coords:
                     self._visible_missing_coords.add(old_key)
                     self._visible_missing_queue.append(old_key)
@@ -3135,33 +3128,28 @@ class TerrainRenderer:
                 or existing.vertex_count != batch_vertex_count
             ):
                 old_buffer = existing.vertex_buffer if existing is not None else None
-                merged_bounds = self._merge_chunk_bounds(mature_meshes)
                 merged_buffer = self._merge_tile_meshes(mature_meshes, encoder)
                 self._tile_render_batches[tile_key] = ChunkRenderBatch(
                     signature=signature,
                     vertex_count=batch_vertex_count,
                     vertex_buffer=merged_buffer,
-                    bounds=merged_bounds,
-                    chunk_count=len(mature_meshes),
                 )
                 if old_buffer is not None:
                     self._transient_render_buffers.append([old_buffer])
 
             batch = self._tile_render_batches[tile_key]
-            batch_bounds = batch.bounds if batch.bounds is not None else self._merge_chunk_bounds(mature_meshes)
-            batch_chunk_count = batch.chunk_count if batch.chunk_count > 0 else len(mature_meshes)
             draw_batches.append(
                 ChunkDrawBatch(
                     vertex_buffer=batch.vertex_buffer,
                     binding_offset=0,
                     vertex_count=batch.vertex_count,
                     first_vertex=0,
-                    bounds=batch_bounds,
-                    chunk_count=batch_chunk_count,
+                    bounds=self._merge_chunk_bounds(mature_meshes),
+                    chunk_count=len(mature_meshes),
                 )
             )
-            merged_chunk_count += batch_chunk_count
-            visible_chunk_count += batch_chunk_count
+            merged_chunk_count += len(mature_meshes)
+            visible_chunk_count += len(mature_meshes)
             for mesh in immature_meshes:
                 draw_batches.append(
                     ChunkDrawBatch(
@@ -3221,132 +3209,25 @@ class TerrainRenderer:
         if old_buffer is not None:
             self._schedule_gpu_buffer_cleanup([old_buffer], frames=6)
 
-    @profile
-
-    def _build_grouped_tile_draw_commands(
-        self,
-        meshes: list[ChunkMesh],
-        encoder,
-        *,
-        age_gate: bool,
-    ) -> tuple[OrderedDict[tuple[int, int], tuple[wgpu.GPUBuffer, int, list[tuple[tuple[float, float, float, float], int, int, int]]]], int, int, int, int]:
-        tile_groups: dict[tuple[int, int], list[ChunkMesh]] = {}
-        tile_groups_get = tile_groups.get
-        tile_key_fn = self._tile_key
-        for mesh in meshes:
-            if mesh.vertex_count <= 0:
-                continue
-            tile_key = tile_key_fn(mesh.chunk_x, mesh.chunk_z)
-            group = tile_groups_get(tile_key)
-            if group is None:
-                tile_groups[tile_key] = [mesh]
-            else:
-                group.append(mesh)
-
-        tile_render_batches = self._tile_render_batches
-        transient_render_buffers = self._transient_render_buffers
-        current_tile_keys = set(tile_groups.keys())
-        stale_keys = [tile_key for tile_key in tile_render_batches if tile_key not in current_tile_keys]
-        for tile_key in stale_keys:
-            batch = tile_render_batches.pop(tile_key)
-            transient_render_buffers.append([batch.vertex_buffer])
-
-        command_groups: OrderedDict[tuple[int, int], tuple[wgpu.GPUBuffer, int, list[tuple[tuple[float, float, float, float], int, int, int]]]] = OrderedDict()
-        command_groups_get = command_groups.get
-        merged_chunk_count = 0
-        visible_chunk_count = 0
-        visible_vertex_count = 0
-        mature_cutoff = time.perf_counter() - MERGED_TILE_MIN_AGE_SECONDS if age_gate else None
-
-        def add_command(vertex_buffer: wgpu.GPUBuffer, binding_offset: int, bounds: tuple[float, float, float, float], vertex_count: int, first_vertex: int, chunk_count: int) -> None:
-            nonlocal visible_vertex_count
-            key = (id(vertex_buffer), binding_offset)
-            group = command_groups_get(key)
-            if group is None:
-                commands: list[tuple[tuple[float, float, float, float], int, int, int]] = [(bounds, vertex_count, first_vertex, chunk_count)]
-                command_groups[key] = (vertex_buffer, binding_offset, commands)
-            else:
-                group[2].append((bounds, vertex_count, first_vertex, chunk_count))
-            visible_vertex_count += vertex_count
-
-        for tile_key in sorted(tile_groups):
-            tile_meshes = tile_groups[tile_key]
-            tile_meshes.sort(key=lambda mesh: (mesh.chunk_z, mesh.chunk_x))
-            if mature_cutoff is None:
-                mature_meshes = tile_meshes
-                immature_meshes: list[ChunkMesh] = []
-            else:
-                mature_meshes = []
-                immature_meshes = []
-                for mesh in tile_meshes:
-                    if mesh.created_at <= mature_cutoff:
-                        mature_meshes.append(mesh)
-                    else:
-                        immature_meshes.append(mesh)
-
-            if len(tile_meshes) == 1:
-                mesh = tile_meshes[0]
-                add_command(mesh.vertex_buffer, mesh.binding_offset, mesh.bounds, mesh.vertex_count, mesh.first_vertex, 1)
-                visible_chunk_count += 1
-                continue
-
-            existing = tile_render_batches.get(tile_key)
-            if len(mature_meshes) < 2:
-                if existing is not None:
-                    tile_render_batches.pop(tile_key, None)
-                    transient_render_buffers.append([existing.vertex_buffer])
-                for mesh in immature_meshes:
-                    add_command(mesh.vertex_buffer, mesh.binding_offset, mesh.bounds, mesh.vertex_count, mesh.first_vertex, 1)
-                    visible_chunk_count += 1
-                for mesh in mature_meshes:
-                    add_command(mesh.vertex_buffer, mesh.binding_offset, mesh.bounds, mesh.vertex_count, mesh.first_vertex, 1)
-                    visible_chunk_count += 1
-                continue
-
-            signature = tuple((mesh.chunk_x, mesh.chunk_z) for mesh in mature_meshes)
-            batch_vertex_count = sum(mesh.vertex_count for mesh in mature_meshes)
-            if existing is None or existing.signature != signature or existing.vertex_count != batch_vertex_count:
-                old_buffer = existing.vertex_buffer if existing is not None else None
-                merged_bounds = self._merge_chunk_bounds(mature_meshes)
-                merged_buffer = self._merge_tile_meshes(mature_meshes, encoder)
-                tile_render_batches[tile_key] = ChunkRenderBatch(
-                    signature=signature,
-                    vertex_count=batch_vertex_count,
-                    vertex_buffer=merged_buffer,
-                    bounds=merged_bounds,
-                    chunk_count=len(mature_meshes),
-                )
-                if old_buffer is not None:
-                    transient_render_buffers.append([old_buffer])
-
-            batch = tile_render_batches[tile_key]
-            batch_bounds = batch.bounds if batch.bounds is not None else self._merge_chunk_bounds(mature_meshes)
-            batch_chunk_count = batch.chunk_count if batch.chunk_count > 0 else len(mature_meshes)
-            add_command(batch.vertex_buffer, 0, batch_bounds, batch.vertex_count, 0, batch_chunk_count)
-            merged_chunk_count += batch_chunk_count
-            visible_chunk_count += batch_chunk_count
-            for mesh in immature_meshes:
-                add_command(mesh.vertex_buffer, mesh.binding_offset, mesh.bounds, mesh.vertex_count, mesh.first_vertex, 1)
-                visible_chunk_count += 1
-
-        while len(transient_render_buffers) > 3:
-            old_buffers = transient_render_buffers.pop(0)
-            self._schedule_gpu_buffer_cleanup(old_buffers, frames=6)
-
-        command_count = sum(len(commands) for _, _, commands in command_groups.values())
-        return command_groups, command_count, merged_chunk_count, visible_chunk_count, visible_vertex_count
-
     def _build_gpu_visibility_records(
         self,
         encoder,
     ) -> tuple[list[tuple[wgpu.GPUBuffer, int, int, int]], int, int, int, int]:
-        visible_meshes = self._visible_meshes()
-        command_groups, command_count, merged_chunk_count, visible_chunk_count, visible_vertex_count = self._build_grouped_tile_draw_commands(
+        visible_meshes = [mesh for _, _, mesh in self._visible_chunks() if mesh.vertex_count > 0]
+        draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count = self._build_tile_draw_batches(
             visible_meshes,
             encoder,
             age_gate=True,
         )
 
+        groups: OrderedDict[tuple[int, int], tuple[wgpu.GPUBuffer, int, list[ChunkDrawBatch]]] = OrderedDict()
+        for batch in draw_batches:
+            key = (id(batch.vertex_buffer), batch.binding_offset)
+            if key not in groups:
+                groups[key] = (batch.vertex_buffer, batch.binding_offset, [])
+            groups[key][2].append(batch)
+
+        command_count = len(draw_batches)
         self._ensure_mesh_visibility_scratch(command_count)
         metadata_buffer = self._mesh_visibility_record_buffer
         metadata_array = self._mesh_visibility_record_array
@@ -3356,14 +3237,14 @@ class TerrainRenderer:
 
         render_batches: list[tuple[wgpu.GPUBuffer, int, int, int]] = []
         command_index = 0
-        for vertex_buffer, binding_offset, commands in command_groups.values():
+        for vertex_buffer, binding_offset, batches in groups.values():
             batch_start = command_index
-            for bounds, vertex_count, first_vertex, _chunk_count in commands:
-                metadata_array[command_index]["bounds"] = bounds
+            for batch in batches:
+                metadata_array[command_index]["bounds"] = batch.bounds
                 metadata_array[command_index]["draw"] = (
-                    vertex_count,
+                    batch.vertex_count,
                     1,
-                    first_vertex,
+                    batch.first_vertex,
                     0,
                 )
                 command_index += 1
@@ -3380,13 +3261,21 @@ class TerrainRenderer:
         encoder,
     ) -> tuple[list[tuple[wgpu.GPUBuffer, int, int, int]], float, int, int, int, int]:
         encode_start = time.perf_counter()
-        visible_meshes = self._visible_meshes()
-        command_groups, command_count, merged_chunk_count, visible_chunk_count, visible_vertex_count = self._build_grouped_tile_draw_commands(
+        visible_meshes = [mesh for _, _, mesh in self._visible_chunks() if mesh.vertex_count > 0]
+        draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count = self._build_tile_draw_batches(
             visible_meshes,
             encoder,
             age_gate=True,
         )
 
+        groups: OrderedDict[tuple[int, int], tuple[wgpu.GPUBuffer, int, list[ChunkDrawBatch]]] = OrderedDict()
+        for batch in draw_batches:
+            key = (id(batch.vertex_buffer), batch.binding_offset)
+            if key not in groups:
+                groups[key] = (batch.vertex_buffer, batch.binding_offset, [])
+            groups[key][2].append(batch)
+
+        command_count = len(draw_batches)
         self._ensure_mesh_draw_indirect_scratch(command_count)
         indirect_buffer = self._mesh_draw_indirect_buffer
         indirect_array = self._mesh_draw_indirect_array
@@ -3394,12 +3283,12 @@ class TerrainRenderer:
 
         render_batches: list[tuple[wgpu.GPUBuffer, int, int, int]] = []
         command_index = 0
-        for vertex_buffer, binding_offset, commands in command_groups.values():
+        for vertex_buffer, binding_offset, batches in groups.values():
             batch_start = command_index
-            for _bounds, vertex_count, first_vertex, _chunk_count in commands:
-                indirect_array[command_index, 0] = np.uint32(vertex_count)
+            for batch in batches:
+                indirect_array[command_index, 0] = np.uint32(batch.vertex_count)
                 indirect_array[command_index, 1] = np.uint32(1)
-                indirect_array[command_index, 2] = np.uint32(first_vertex)
+                indirect_array[command_index, 2] = np.uint32(batch.first_vertex)
                 indirect_array[command_index, 3] = np.uint32(0)
                 command_index += 1
             render_batches.append((vertex_buffer, binding_offset, batch_start, command_index - batch_start))
@@ -3485,7 +3374,6 @@ class TerrainRenderer:
             return
         self._visible_chunk_origin = current_origin
         self._visible_chunk_coords = self._chunk_coords_in_view()
-        self._visible_chunk_cache_dirty = True
 
     def _warn_if_visible_exceeds_cache(self) -> None:
         visible_count = len(self._visible_chunk_coords)
@@ -3543,35 +3431,17 @@ class TerrainRenderer:
         lateral_score = abs(dx * right_x + dz * right_z)
         return lateral_score <= forward_score * CHUNK_FORWARD_CONE_LATERAL_RATIO
 
-    def _rebuild_visible_chunk_cache(self) -> None:
-        visible_chunks: list[tuple[int, int, ChunkMesh]] = []
-        visible_meshes: list[ChunkMesh] = []
+    def _visible_chunks(self) -> list[tuple[int, int, ChunkMesh]]:
+        visible: list[tuple[int, int, ChunkMesh]] = []
         if not self._visible_chunk_coords:
             self._refresh_visible_chunk_coords()
-        chunk_cache = self.chunk_cache
-        move_to_end = chunk_cache.move_to_end
         for chunk_x, chunk_z in self._visible_chunk_coords:
-            key = (chunk_x, chunk_z)
-            mesh = chunk_cache.get(key)
+            mesh = self.chunk_cache.get((chunk_x, chunk_z))
             if mesh is None:
                 continue
-            move_to_end(key)
-            visible_chunks.append((chunk_x, chunk_z, mesh))
-            if mesh.vertex_count > 0:
-                visible_meshes.append(mesh)
-        self._visible_chunks_cache = visible_chunks
-        self._visible_meshes_cache = visible_meshes
-        self._visible_chunk_cache_dirty = False
-
-    def _visible_chunks(self) -> list[tuple[int, int, ChunkMesh]]:
-        if self._visible_chunk_cache_dirty:
-            self._rebuild_visible_chunk_cache()
-        return self._visible_chunks_cache
-
-    def _visible_meshes(self) -> list[ChunkMesh]:
-        if self._visible_chunk_cache_dirty:
-            self._rebuild_visible_chunk_cache()
-        return self._visible_meshes_cache
+            self.chunk_cache.move_to_end((chunk_x, chunk_z))
+            visible.append((chunk_x, chunk_z, mesh))
+        return visible
 
     def _tile_key(self, chunk_x: int, chunk_z: int) -> tuple[int, int]:
         return chunk_x // MERGED_TILE_SIZE_CHUNKS, chunk_z // MERGED_TILE_SIZE_CHUNKS
@@ -3896,7 +3766,7 @@ class TerrainRenderer:
 
     def _enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
         self,
-        chunk_coords: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+        chunk_coords: list[tuple[int, int]],
         blocks_buffer,
         materials_buffer,
         sample_size: int,
@@ -3912,31 +3782,31 @@ class TerrainRenderer:
 
         chunk_count = len(chunk_coords)
         columns_per_side = sample_size - 2
-        self._ensure_voxel_mesh_batch_scratch(sample_size, height_limit, chunk_count)
+        self._ensure_voxel_mesh_batch_scratch(sample_size, height_limit, 1)
         dummy_vertex_buffer = self._voxel_mesh_scratch_batch_vertex_buffer
-        scratch_coords = self._voxel_mesh_scratch_coords_array
-        scratch_counts = self._voxel_mesh_scratch_chunk_totals_array
         assert dummy_vertex_buffer is not None
-        assert scratch_coords is not None
-        assert scratch_counts is not None
 
         dedicated = self._create_dedicated_voxel_mesh_batch_buffers(sample_size, height_limit, chunk_count)
-        coords_view = scratch_coords[:chunk_count]
-        coords_view[:] = np.asarray(chunk_coords, dtype=np.int32)
-        zero_counts = scratch_counts[:chunk_count]
-        zero_counts.fill(0)
-        params_bytes = struct.pack(
-            "<4I",
-            int(sample_size),
-            int(height_limit),
-            int(chunk_count),
-            int(CHUNK_SIZE),
-        )
+        coords_array = np.empty((chunk_count, 2), dtype=np.int32)
+        for index, (chunk_x, chunk_z) in enumerate(chunk_coords):
+            coords_array[index, 0] = int(chunk_x)
+            coords_array[index, 1] = int(chunk_z)
+        zero_counts = np.zeros(chunk_count, dtype=np.uint32)
 
-        self.device.queue.write_buffer(dedicated["coords"], 0, memoryview(coords_view))
+        self.device.queue.write_buffer(dedicated["coords"], 0, memoryview(coords_array))
         self.device.queue.write_buffer(dedicated["chunk_totals"], 0, memoryview(zero_counts))
         self.device.queue.write_buffer(dedicated["chunk_offsets"], 0, memoryview(zero_counts))
-        self.device.queue.write_buffer(dedicated["params"], 0, params_bytes)
+        self.device.queue.write_buffer(
+            dedicated["params"],
+            0,
+            struct.pack(
+                "<4I",
+                int(sample_size),
+                int(height_limit),
+                int(chunk_count),
+                int(CHUNK_SIZE),
+            ),
+        )
 
         shared_entries = [
             {"binding": 0, "resource": {"buffer": blocks_buffer}},
@@ -3962,10 +3832,9 @@ class TerrainRenderer:
         self.device.queue.submit([encoder.finish()])
 
         metadata_promise = dedicated["readback"].map_async(wgpu.MapMode.READ, 0, chunk_count * 4)
-        chunk_coords_list = chunk_coords if isinstance(chunk_coords, list) else list(chunk_coords)
         self._pending_gpu_mesh_batches.append(
             PendingChunkMeshBatch(
-                chunk_coords=chunk_coords_list,
+                chunk_coords=list(chunk_coords),
                 chunk_count=chunk_count,
                 sample_size=int(sample_size),
                 height_limit=int(height_limit),
@@ -4370,8 +4239,7 @@ class TerrainRenderer:
         if not surface_batch.chunks:
             return []
 
-        chunk_coords = surface_batch.chunks if isinstance(surface_batch.chunks, list) else list(surface_batch.chunks)
-        chunk_count = len(chunk_coords)
+        chunk_count = len(surface_batch.chunks)
         sample_size = CHUNK_SAMPLE_SIZE
         height_limit = WORLD_HEIGHT
         if defer_finalize:
@@ -4388,14 +4256,17 @@ class TerrainRenderer:
         assert materials_buffer is not None
         assert params_buffer is not None
 
-        params_bytes = struct.pack(
-            "<4I",
-            int(sample_size),
-            int(height_limit),
-            int(chunk_count),
-            int(CHUNK_SIZE),
+        self.device.queue.write_buffer(
+            params_buffer,
+            0,
+            struct.pack(
+                "<4I",
+                int(sample_size),
+                int(height_limit),
+                int(chunk_count),
+                int(CHUNK_SIZE),
+            ),
         )
-        self.device.queue.write_buffer(params_buffer, 0, params_bytes)
         expand_bind_group = self.device.create_bind_group(
             layout=self.voxel_surface_expand_bind_group_layout,
             entries=[
@@ -4417,7 +4288,7 @@ class TerrainRenderer:
 
         if defer_finalize:
             self._enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
-                chunk_coords,
+                list(surface_batch.chunks),
                 blocks_buffer,
                 materials_buffer,
                 sample_size,
@@ -4426,7 +4297,7 @@ class TerrainRenderer:
             return []
 
         return self._gpu_make_chunk_mesh_batch_from_gpu_buffers(
-            chunk_coords,
+            list(surface_batch.chunks),
             blocks_buffer,
             materials_buffer,
             sample_size,
@@ -4508,7 +4379,6 @@ class TerrainRenderer:
         self._visible_displayed_coords = displayed
         self._visible_missing_coords = missing
         self._visible_missing_queue = deque(self._visible_chunk_coords)
-        self._visible_chunk_cache_dirty = True
 
     def _refresh_visible_chunk_set(self) -> float:
         visibility_start = time.perf_counter()
