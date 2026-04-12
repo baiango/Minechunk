@@ -53,6 +53,16 @@ That is the interesting part of a voxel engine. When the world keeps up, the ren
 - Profiling HUD and frame breakdown overlay
 - Benchmark harness for terrain throughput, validation, and render scaling
 
+## Target Constraints
+
+The product direction is intentionally constrained:
+
+- The renderer should favor direct chunk residency over aggressive caching.
+- The terrain pipeline must remain raw-chunk based.
+- Greedy meshing is out of scope.
+- LOD systems are out of scope.
+- Geometry simplification should not replace the chunk-based representation.
+
 ## Runtime Model
 
 ### World Representation
