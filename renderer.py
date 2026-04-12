@@ -24,6 +24,12 @@ from terrain_kernels import build_chunk_vertex_array_from_voxels
 from voxel_world import CHUNK_SIZE, WORLD_HEIGHT, VoxelWorld
 from terrain_backend import ChunkSurfaceGpuBatch, ChunkVoxelResult
 
+try:
+    profile  # type: ignore[name-defined]
+except NameError:  # pragma: no cover - only used outside kernprof
+    def profile(func):
+        return func
+
 
 CHUNK_SAMPLE_SIZE = CHUNK_SIZE + 2
 MAX_FACES_PER_CELL = 5
@@ -3025,6 +3031,7 @@ class TerrainRenderer:
         self._schedule_gpu_buffer_cleanup([metadata_buffer, params_buffer], frames=3)
         return merged_buffer
 
+    @profile
     def _build_tile_draw_batches(
         self,
         meshes: list[ChunkMesh],
@@ -3185,6 +3192,7 @@ class TerrainRenderer:
         if old_buffer is not None:
             self._schedule_gpu_buffer_cleanup([old_buffer], frames=6)
 
+    @profile
     def _build_gpu_visibility_records(
         self,
         encoder,
@@ -3362,6 +3370,7 @@ class TerrainRenderer:
             file=sys.stderr,
         )
 
+    @profile
     def _chunk_prep_priority(
         self,
         chunk_x: int,
@@ -3386,6 +3395,7 @@ class TerrainRenderer:
             return (cone_flag, distance_score, lateral_score, -forward_score, abs(dz), abs(dx))
         return (cone_flag, distance_score, lateral_score, -forward_score, abs(dz), abs(dx))
 
+    @profile
     def _chunk_in_forward_cone(
         self,
         chunk_x: int,
@@ -3405,6 +3415,7 @@ class TerrainRenderer:
         lateral_score = abs(dx * right_x + dz * right_z)
         return lateral_score <= forward_score * CHUNK_FORWARD_CONE_LATERAL_RATIO
 
+    @profile
     def _visible_chunks(self) -> list[tuple[int, int, ChunkMesh]]:
         visible: list[tuple[int, int, ChunkMesh]] = []
         if not self._visible_chunk_coords:

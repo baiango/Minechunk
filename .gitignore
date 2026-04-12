@@ -2,3 +2,4 @@
 .DS_Store
 scalene-profile.json
 scalene-profile.html
+*.lprof
