@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import cProfile
 import ctypes
+import heapq
 import os
 import math
 import subprocess
@@ -4601,8 +4602,8 @@ class TerrainRenderer:
 
         missing_count = 0
         displayed_chunk_coords: set[tuple[int, int]] = set()
-        front_candidates: list[tuple[tuple[float, int, int], tuple[int, int]]] = []
-        other_candidates: list[tuple[tuple[int, float, float, float, int, int], tuple[int, int]]] = []
+        front_candidates: list[tuple[tuple[float, int, int], tuple[float, int, int], tuple[int, int]]] = []
+        other_candidates: list[tuple[tuple[int, float, float, float, int, int], tuple[int, float, float, float, int, int], tuple[int, int]]] = []
 
         for coord in self._visible_chunk_coords:
             mesh = chunk_cache.get(coord)
@@ -4624,28 +4625,24 @@ class TerrainRenderer:
 
             if forward_score > 0.0 and lateral_score <= forward_score * lateral_ratio:
                 key = (distance_sq, abs_dz, abs_dx)
-                entry = (key, coord)
+                inv_key = (-distance_sq, -abs_dz, -abs_dx)
+                entry = (inv_key, key, coord)
                 if len(front_candidates) < candidate_cap:
-                    front_candidates.append(entry)
-                else:
-                    worst_index = max(range(len(front_candidates)), key=lambda index: front_candidates[index][0])
-                    if key < front_candidates[worst_index][0]:
-                        front_candidates[worst_index] = entry
+                    heapq.heappush(front_candidates, entry)
+                elif inv_key > front_candidates[0][0]:
+                    heapq.heapreplace(front_candidates, entry)
                 continue
 
             key = (1, distance_sq, lateral_score, -forward_score, abs_dz, abs_dx)
-            entry = (key, coord)
+            inv_key = (-1, -distance_sq, -lateral_score, forward_score, -abs_dz, -abs_dx)
+            entry = (inv_key, key, coord)
             if len(other_candidates) < candidate_cap:
-                other_candidates.append(entry)
-            else:
-                worst_index = max(range(len(other_candidates)), key=lambda index: other_candidates[index][0])
-                if key < other_candidates[worst_index][0]:
-                    other_candidates[worst_index] = entry
+                heapq.heappush(other_candidates, entry)
+            elif inv_key > other_candidates[0][0]:
+                heapq.heapreplace(other_candidates, entry)
 
-        front_candidates.sort(key=lambda item: item[0])
-        other_candidates.sort(key=lambda item: item[0])
-        front_cone_coords = [coord for _, coord in front_candidates]
-        other_coords = [coord for _, coord in other_candidates]
+        front_cone_coords = [coord for _, _, coord in sorted(front_candidates, key=lambda item: item[1])]
+        other_coords = [coord for _, _, coord in sorted(other_candidates, key=lambda item: item[1])]
 
         prep_budget = int(self._chunk_prep_tokens)
         if prep_budget <= 0 and missing_count > 0:
