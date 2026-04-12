@@ -4585,57 +4585,77 @@ class TerrainRenderer:
                 for result in batch:
                     chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
                     self._accept_chunk_voxel_result(result)
+
         self._chunk_prep_tokens = min(CHUNK_PREP_TOKEN_CAP, self._chunk_prep_tokens + CHUNK_PREP_RATE * dt)
-        missing_coords = [
-            coord
-            for coord in self._visible_chunk_coords
-            if coord not in self.chunk_cache and coord not in self._pending_chunk_coords
-        ]
-        front_cone_coords: list[tuple[int, int]] = []
-        other_coords: list[tuple[int, int]] = []
-        for coord in missing_coords:
-            if self._chunk_in_forward_cone(
-                coord[0],
-                coord[1],
-                current_origin[0],
-                current_origin[1],
-                forward[0],
-                forward[2],
-                right[0],
-                right[2],
-            ):
-                front_cone_coords.append(coord)
+
+        candidate_cap = max(1, min(self.mesh_batch_size, CHUNK_PREP_REQUEST_BUDGET_CAP))
+        camera_chunk_x = current_origin[0]
+        camera_chunk_z = current_origin[1]
+        forward_x = forward[0]
+        forward_z = forward[2]
+        right_x = right[0]
+        right_z = right[2]
+        lateral_ratio = CHUNK_FORWARD_CONE_LATERAL_RATIO
+        chunk_cache = self.chunk_cache
+        pending_chunk_coords = self._pending_chunk_coords
+
+        missing_count = 0
+        displayed_chunk_coords: set[tuple[int, int]] = set()
+        front_candidates: list[tuple[tuple[float, int, int], tuple[int, int]]] = []
+        other_candidates: list[tuple[tuple[int, float, float, float, int, int], tuple[int, int]]] = []
+
+        for coord in self._visible_chunk_coords:
+            mesh = chunk_cache.get(coord)
+            if mesh is not None:
+                displayed_chunk_coords.add(coord)
+                continue
+            if coord in pending_chunk_coords:
+                continue
+
+            missing_count += 1
+            chunk_x, chunk_z = coord
+            dx = chunk_x - camera_chunk_x
+            dz = chunk_z - camera_chunk_z
+            abs_dx = abs(dx)
+            abs_dz = abs(dz)
+            distance_sq = float(dx * dx + dz * dz)
+            forward_score = dx * forward_x + dz * forward_z
+            lateral_score = abs(dx * right_x + dz * right_z)
+
+            if forward_score > 0.0 and lateral_score <= forward_score * lateral_ratio:
+                key = (distance_sq, abs_dz, abs_dx)
+                entry = (key, coord)
+                if len(front_candidates) < candidate_cap:
+                    front_candidates.append(entry)
+                else:
+                    worst_index = max(range(len(front_candidates)), key=lambda index: front_candidates[index][0])
+                    if key < front_candidates[worst_index][0]:
+                        front_candidates[worst_index] = entry
+                continue
+
+            key = (1, distance_sq, lateral_score, -forward_score, abs_dz, abs_dx)
+            entry = (key, coord)
+            if len(other_candidates) < candidate_cap:
+                other_candidates.append(entry)
             else:
-                other_coords.append(coord)
-        front_cone_coords.sort(
-            key=lambda coord: (
-                ((coord[0] - current_origin[0]) ** 2 + (coord[1] - current_origin[1]) ** 2),
-                abs(coord[1] - current_origin[1]),
-                abs(coord[0] - current_origin[0]),
-            )
-        )
-        other_coords.sort(
-            key=lambda coord: self._chunk_prep_priority(
-                coord[0],
-                coord[1],
-                current_origin[0],
-                current_origin[1],
-                forward[0],
-                forward[2],
-                right[0],
-                right[2],
-            )
-        )
+                worst_index = max(range(len(other_candidates)), key=lambda index: other_candidates[index][0])
+                if key < other_candidates[worst_index][0]:
+                    other_candidates[worst_index] = entry
+
+        front_candidates.sort(key=lambda item: item[0])
+        other_candidates.sort(key=lambda item: item[0])
+        front_cone_coords = [coord for _, coord in front_candidates]
+        other_coords = [coord for _, coord in other_candidates]
+
         prep_budget = int(self._chunk_prep_tokens)
-        if prep_budget <= 0 and missing_coords:
+        if prep_budget <= 0 and missing_count > 0:
             prep_budget = 1
-        prep_budget = min(prep_budget, len(missing_coords))
-        prep_budget = min(prep_budget, max(1, min(self.mesh_batch_size, CHUNK_PREP_REQUEST_BUDGET_CAP)))
+        prep_budget = min(prep_budget, missing_count)
+        prep_budget = min(prep_budget, candidate_cap)
         request_coords = front_cone_coords[:prep_budget]
         if not request_coords:
             request_coords = other_coords[:prep_budget]
         if request_coords:
-            # Split the cone into small sorted batches so near chunks stay first without stalling one huge job.
             batch_size = max(1, min(self.mesh_batch_size, CHUNK_PREP_REQUEST_BATCH_SIZE))
             request_batches = [
                 request_coords[index : index + batch_size]
@@ -4644,13 +4664,9 @@ class TerrainRenderer:
             for batch in reversed(request_batches):
                 self.world.request_chunk_voxel_batch(batch)
             for coord in request_coords:
-                self._pending_chunk_coords.add(coord)
+                pending_chunk_coords.add(coord)
             self._chunk_prep_tokens -= float(len(request_coords))
-        displayed_chunk_coords = {
-            coord
-            for coord in self._visible_chunk_coords
-            if coord in self.chunk_cache
-        }
+
         self._last_new_displayed_chunks = len(displayed_chunk_coords - self._last_displayed_chunk_coords)
         self._last_displayed_chunk_coords = displayed_chunk_coords
         chunk_stream_ms = (time.perf_counter() - prep_start) * 1000.0
