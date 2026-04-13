@@ -335,6 +335,7 @@ class MetalTerrainBackend:
         expand_chunk_surface_to_voxel_grid(blocks, voxel_materials, heights, materials, self.chunk_size, self.height_limit)
         return blocks, voxel_materials
 
+    @profile
     def _create_chunk_batch(self, chunks: list[tuple[int, int]]) -> "_ChunkGpuBatch":
         coords = np.ascontiguousarray(np.asarray(chunks, dtype=np.int32).reshape(-1, 2))
         coords_buffer = self.device.create_buffer(
@@ -371,6 +372,7 @@ class MetalTerrainBackend:
             bind_group=bind_group,
         )
 
+    @profile
     def _submit_next_batch(self) -> None:
         if self._in_flight_batch is not None or not self._pending_jobs:
             return
@@ -436,6 +438,7 @@ class MetalTerrainBackend:
         self._submit_next_batch()
         return ready
 
+    @profile
     def poll_ready_chunk_surface_gpu_batches(self) -> list[ChunkSurfaceGpuBatch]:
         ready: list[ChunkSurfaceGpuBatch] = []
         if self._in_flight_batch is not None:

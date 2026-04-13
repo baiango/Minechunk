@@ -362,7 +362,6 @@ class VoxelWorld:
     def poll_ready_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         return self._backend.poll_ready_chunk_surface_batches()
 
-    @profile
     def poll_ready_chunk_surface_gpu_batches(self) -> list[ChunkSurfaceGpuBatch]:
         method = getattr(self._backend, "poll_ready_chunk_surface_gpu_batches", None)
         if method is None:
