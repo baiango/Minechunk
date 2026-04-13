@@ -38,12 +38,6 @@ MAX_VERTICES_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE * MAX_FACES_PER_CELL * VERTICES
 VERTEX_STRIDE = 48
 LIGHT_DIRECTION = (0.35, 0.90, 0.25)
 DEPTH_FORMAT = "depth24plus"
-CHUNK_PREP_RATE = 1000.0
-CHUNK_PREP_TOKEN_CAP = 500.0
-CHUNK_FORWARD_CONE_LATERAL_RATIO = 0.5
-CHUNK_PREP_REQUEST_BUDGET_CAP = 16
-CHUNK_PREP_REQUEST_BATCH_SIZE = 16
-CHUNK_PREP_REORDER_YAW_DELTA = math.radians(10.0)
 ENGINE_MODE_CPU = "cpu"
 ENGINE_MODE_GPU = "gpu"
 ENGINE_MODE = ENGINE_MODE_CPU
@@ -61,6 +55,48 @@ MESH_VISIBILITY_RECORD_DTYPE = np.dtype([("bounds", np.float32, 4), ("draw", np.
 VOXEL_SURFACE_EXPAND_BIND_GROUP_CACHE_LIMIT = 2048
 _CHUNK_HALF = CHUNK_SIZE * 0.5
 _CHUNK_RADIUS_CACHE: dict[int, tuple[float, float]] = {}
+
+
+@dataclass(frozen=True)
+class ChunkPrepPreset:
+    terrain_batch_size: int
+    mesh_batch_size: int
+    rate: float
+    token_cap: float
+    request_budget_cap: int
+    request_batch_size: int
+    pending_surface_gpu_batch_target_multiplier: int
+
+
+CHUNK_PREP_PRESETS: dict[str, ChunkPrepPreset] = {
+    "conservative": ChunkPrepPreset(
+        terrain_batch_size=8,
+        mesh_batch_size=8,
+        rate=220.0,
+        token_cap=80.0,
+        request_budget_cap=4,
+        request_batch_size=4,
+        pending_surface_gpu_batch_target_multiplier=4,
+    ),
+    "balanced": ChunkPrepPreset(
+        terrain_batch_size=16,
+        mesh_batch_size=16,
+        rate=400.0,
+        token_cap=160.0,
+        request_budget_cap=8,
+        request_batch_size=8,
+        pending_surface_gpu_batch_target_multiplier=6,
+    ),
+    "aggressive": ChunkPrepPreset(
+        terrain_batch_size=32,
+        mesh_batch_size=32,
+        rate=1000.0,
+        token_cap=500.0,
+        request_budget_cap=16,
+        request_batch_size=16,
+        pending_surface_gpu_batch_target_multiplier=10,
+    ),
+}
 
 
 def _chunk_height_center_and_radius(max_height: int) -> tuple[float, float]:
@@ -1728,17 +1764,32 @@ class TerrainRenderer:
         seed: int = 1337,
         use_gpu_terrain: bool | None = None,
         use_gpu_meshing: bool | None = None,
-        terrain_batch_size: int = 32,
+        terrain_batch_size: int | None = None,
         mesh_batch_size: int | None = None,
+        chunk_prep_preset: str = "balanced",
     ) -> None:
         default_use_gpu = ENGINE_MODE.lower() == ENGINE_MODE_GPU
+        preset_name = str(chunk_prep_preset).lower().strip()
+        preset = CHUNK_PREP_PRESETS.get(preset_name)
+        if preset is None:
+            valid_presets = ", ".join(sorted(CHUNK_PREP_PRESETS))
+            raise ValueError(f"Unknown chunk prep preset {chunk_prep_preset!r}. Expected one of: {valid_presets}.")
+        self.chunk_prep_preset = preset_name
+        self._chunk_prep_rate = float(preset.rate)
+        self._chunk_prep_token_cap = float(preset.token_cap)
+        self._chunk_prep_request_budget_cap = int(preset.request_budget_cap)
+        self._chunk_prep_request_batch_size = int(preset.request_batch_size)
+        self._pending_surface_gpu_batch_target_multiplier = int(preset.pending_surface_gpu_batch_target_multiplier)
+
         self.use_gpu_terrain = default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)
+        if terrain_batch_size is None:
+            terrain_batch_size = preset.terrain_batch_size
         self.terrain_batch_size = max(1, int(terrain_batch_size))
         if mesh_batch_size is None:
-            self.mesh_batch_size = max(1, min(int(self.terrain_batch_size), DEFAULT_MESH_BATCH_SIZE))
+            self.mesh_batch_size = max(1, min(int(preset.mesh_batch_size), int(self.terrain_batch_size), DEFAULT_MESH_BATCH_SIZE))
         else:
             self.mesh_batch_size = max(1, int(mesh_batch_size))
-        if CHUNK_PREP_REQUEST_BUDGET_CAP > CHUNK_PREP_REQUEST_BATCH_SIZE:
+        if self._chunk_prep_request_budget_cap > self._chunk_prep_request_batch_size:
             print(
                 "Warning: chunk request budget exceeds chunk request batch size; "
                 "near chunks may wait behind farther chunks inside a batch.",
@@ -1803,7 +1854,6 @@ class TerrainRenderer:
         self._visible_missing_coords: set[tuple[int, int]] = set()
         self._chunk_request_queue: deque[tuple[int, int]] = deque()
         self._chunk_request_queue_origin: tuple[int, int] | None = None
-        self._chunk_request_queue_yaw = 0.0
         self._chunk_request_queue_dirty = True
         self._pending_chunk_coords: set[tuple[int, int]] = set()
         self._transient_render_buffers: list[list[wgpu.GPUBuffer]] = []
@@ -1843,7 +1893,9 @@ class TerrainRenderer:
         self._pending_surface_gpu_batches: deque[ChunkSurfaceGpuBatch] = deque()
         self._pending_surface_gpu_batches_chunk_total = 0
         self._pending_surface_gpu_batch_age_seconds = 1.0 / 60.0
-        self._pending_surface_gpu_batch_target_chunks = max(self.mesh_batch_size, self.terrain_batch_size) * 10
+        self._pending_surface_gpu_batch_target_chunks = (
+            max(self.mesh_batch_size, self.terrain_batch_size) * self._pending_surface_gpu_batch_target_multiplier
+        )
         self._async_voxel_mesh_batch_pool_limit = 48
         self._gpu_mesh_async_inflight_limit = max(32, self.mesh_batch_size * 6)
         self._gpu_mesh_async_finalize_budget = max(1, self.mesh_batch_size * 2)
@@ -2374,6 +2426,7 @@ class TerrainRenderer:
             "FRAME P50 --.-MS  P95 --.-MS  P99 --.-MS",
             f"RENDER API  {self.render_api_label}",
             f"ENGINE MODE {self.engine_mode_label}",
+            f"CHUNK PREP  {self.chunk_prep_preset.upper()}",
             f"TERRAIN    {self.world.terrain_backend_label()}",
             f"MESH       {self.mesh_backend_label}",
             f"CHUNK DIMS {CHUNK_SIZE}x{WORLD_HEIGHT}x{CHUNK_SIZE}",
@@ -2382,13 +2435,14 @@ class TerrainRenderer:
             f"PRESENT    FPS {SWAPCHAIN_MAX_FPS}  VSYNC {'ON' if SWAPCHAIN_USE_VSYNC else 'OFF'}",
             "MESH SLABS --  USED --.- MIB  FREE --.- MIB",
             "MESH BIGGEST GAP --.- MIB  ALLOCS --",
-            f"CHUNK REQUEST BATCH SIZE {CHUNK_PREP_REQUEST_BATCH_SIZE}",
+            f"CHUNK REQUEST BATCH SIZE {self._chunk_prep_request_batch_size}",
             "COLLECTING SAMPLES",
         ]
         self.profile_hud_vertex_bytes, self.profile_hud_vertex_count = self._build_profile_hud_vertices(self.profile_hud_lines)
         self.frame_breakdown_lines = [
             f"FRAME BREAKDOWN @ DIMENSION {self.render_dimension_chunks}x{self.render_dimension_chunks} CHUNKS",
             f"ENGINE MODE: {self.engine_mode_label}",
+            f"CHUNK PREP PRESET: {self.chunk_prep_preset.upper()}",
             "CPU FRAME ISSUE: --.- MS",
             "  WORLD UPDATE: --.- MS",
             "  VISIBILITY LOOKUP: --.- MS",
@@ -2403,7 +2457,7 @@ class TerrainRenderer:
             f"BACKEND POLL SIZE: {self.terrain_batch_size}",
             f"MESH DRAIN SIZE: {self.mesh_batch_size}",
             f"PRESENT PACING: FPS {SWAPCHAIN_MAX_FPS}  VSYNC {'ON' if SWAPCHAIN_USE_VSYNC else 'OFF'}",
-            f"CHUNK REQUEST BATCH SIZE: {CHUNK_PREP_REQUEST_BATCH_SIZE}",
+            f"CHUNK REQUEST BATCH SIZE: {self._chunk_prep_request_batch_size}",
             "MESH SLABS: --  USED --.- MIB  FREE --.- MIB",
             "MESH BIGGEST GAP: --.- MIB  ALLOCS --",
             "TOTAL DRAW VERTICES: --",
@@ -2579,13 +2633,14 @@ class TerrainRenderer:
         lines = [
             f"FRAME BREAKDOWN @ DIMENSION {self.render_dimension_chunks}x{self.render_dimension_chunks} CHUNKS",
             f"ENGINE MODE: {self.engine_mode_label}",
+            f"CHUNK PREP PRESET: {self.chunk_prep_preset.upper()}",
             f"MOVE SPEED: {self._current_move_speed:5.1f} B/S",
             f"TERRAIN BACKEND: {self.world.terrain_backend_label()}",
             f"MESH BACKEND: {self.mesh_backend_label}",
             f"CHUNK DIMS: {CHUNK_SIZE}x{WORLD_HEIGHT}x{CHUNK_SIZE}",
             f"BACKEND POLL SIZE: {self.terrain_batch_size}",
             f"MESH DRAIN SIZE: {self.mesh_batch_size}",
-            f"CHUNK REQUEST BATCH SIZE: {CHUNK_PREP_REQUEST_BATCH_SIZE}",
+            f"CHUNK REQUEST BATCH SIZE: {self._chunk_prep_request_batch_size}",
             f"MESH SLABS: {slab_count}  USED {slab_used_bytes / (1024.0 * 1024.0):4.1f} MIB  FREE {slab_free_bytes / (1024.0 * 1024.0):4.1f} MIB",
             f"MESH BIGGEST GAP: {slab_largest_free_bytes / (1024.0 * 1024.0):4.1f} MIB  ALLOCS {slab_alloc_count}",
             f"CPU FRAME ISSUE: {avg_issue_encode:5.1f} MS",
@@ -3632,43 +3687,11 @@ class TerrainRenderer:
         chunk_z: int,
         camera_chunk_x: int,
         camera_chunk_z: int,
-        forward_x: float,
-        forward_z: float,
-        right_x: float,
-        right_z: float,
-    ) -> tuple[float, float, int, int]:
+    ) -> tuple[float, int, int]:
         dx = chunk_x - camera_chunk_x
         dz = chunk_z - camera_chunk_z
-        forward_score = dx * forward_x + dz * forward_z
-        lateral_score = abs(dx * right_x + dz * right_z)
         distance_sq = float(dx * dx + dz * dz)
-        distance_score = distance_sq
-        cone_distance_threshold = 1.0 / (1.0 + CHUNK_FORWARD_CONE_LATERAL_RATIO * CHUNK_FORWARD_CONE_LATERAL_RATIO)
-        in_forward_cone = forward_score > 0.0 and forward_score * forward_score >= cone_distance_threshold * distance_sq
-        cone_flag = 0 if in_forward_cone else 1
-        if in_forward_cone:
-            return (cone_flag, distance_score, lateral_score, -forward_score, abs(dz), abs(dx))
-        return (cone_flag, distance_score, lateral_score, -forward_score, abs(dz), abs(dx))
-
-    @profile
-    def _chunk_in_forward_cone(
-        self,
-        chunk_x: int,
-        chunk_z: int,
-        camera_chunk_x: int,
-        camera_chunk_z: int,
-        forward_x: float,
-        forward_z: float,
-        right_x: float,
-        right_z: float,
-    ) -> bool:
-        dx = chunk_x - camera_chunk_x
-        dz = chunk_z - camera_chunk_z
-        forward_score = dx * forward_x + dz * forward_z
-        if forward_score <= 0.0:
-            return False
-        lateral_score = abs(dx * right_x + dz * right_z)
-        return lateral_score <= forward_score * CHUNK_FORWARD_CONE_LATERAL_RATIO
+        return (distance_sq, abs(dz), abs(dx))
 
     def _visible_chunks(self) -> list[tuple[int, int, ChunkMesh]]:
         visible: list[tuple[int, int, ChunkMesh]] = []
@@ -5187,15 +5210,11 @@ class TerrainRenderer:
         if not missing_coords:
             self._chunk_request_queue.clear()
             self._chunk_request_queue_origin = (camera_chunk_x, camera_chunk_z)
-            self._chunk_request_queue_yaw = self.camera.yaw
             self._chunk_request_queue_dirty = False
             return
 
-        forward = flat_forward_vector(self.camera.yaw)
-        right = right_vector(self.camera.yaw)
         max_ring = max(0, int(self.chunk_radius))
-        front_rings: list[list[tuple[int, int]]] = [[] for _ in range(max_ring + 1)]
-        other_rings: list[list[tuple[int, int]]] = [[] for _ in range(max_ring + 1)]
+        rings: list[list[tuple[int, int]]] = [[] for _ in range(max_ring + 1)]
 
         for coord in self._visible_chunk_coords:
             if coord not in missing_coords:
@@ -5205,28 +5224,14 @@ class TerrainRenderer:
             ring = max(abs(dx), abs(dz))
             if ring > max_ring:
                 ring = max_ring
-            if self._chunk_in_forward_cone(
-                coord[0],
-                coord[1],
-                camera_chunk_x,
-                camera_chunk_z,
-                forward[0],
-                forward[2],
-                right[0],
-                right[2],
-            ):
-                front_rings[ring].append(coord)
-            else:
-                other_rings[ring].append(coord)
+            rings[ring].append(coord)
 
         ordered: list[tuple[int, int]] = []
         for ring in range(max_ring + 1):
-            ordered.extend(front_rings[ring])
-            ordered.extend(other_rings[ring])
+            ordered.extend(rings[ring])
 
         self._chunk_request_queue = deque(ordered)
         self._chunk_request_queue_origin = (camera_chunk_x, camera_chunk_z)
-        self._chunk_request_queue_yaw = self.camera.yaw
         self._chunk_request_queue_dirty = False
 
     def _refresh_visible_chunk_set(self) -> float:
@@ -5253,8 +5258,6 @@ class TerrainRenderer:
             visibility_lookup_ms = self._refresh_visible_chunk_set()
 
         prep_start = time.perf_counter()
-        forward = flat_forward_vector(self.camera.yaw)
-        right = right_vector(self.camera.yaw)
         using_gpu_terrain = self.world.terrain_backend_label() == "GPU"
         if self.use_gpu_meshing:
             ready_surface_batches = self.world.poll_ready_chunk_surface_gpu_batches()
@@ -5284,10 +5287,6 @@ class TerrainRenderer:
                         int(result.chunk_z),
                         current_origin[0],
                         current_origin[1],
-                        forward[0],
-                        forward[2],
-                        right[0],
-                        right[2],
                     )
                 )
                 for result in ready_results:
@@ -5320,10 +5319,6 @@ class TerrainRenderer:
                     int(result.chunk_z),
                     current_origin[0],
                     current_origin[1],
-                    forward[0],
-                    forward[2],
-                    right[0],
-                    right[2],
                 )
             )
             for result in reversed(ready_results):
@@ -5338,12 +5333,12 @@ class TerrainRenderer:
                     chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
                     self._accept_chunk_voxel_result(result)
 
-        self._chunk_prep_tokens = min(CHUNK_PREP_TOKEN_CAP, self._chunk_prep_tokens + CHUNK_PREP_RATE * dt)
+        self._chunk_prep_tokens = min(self._chunk_prep_token_cap, self._chunk_prep_tokens + self._chunk_prep_rate * dt)
 
         candidate_cap = max(
             1,
-            max(
-                CHUNK_PREP_REQUEST_BUDGET_CAP,
+            min(
+                self._chunk_prep_request_budget_cap,
                 self.mesh_batch_size * 2,
                 32,
             ),
@@ -5384,8 +5379,8 @@ class TerrainRenderer:
         if request_coords:
             batch_size = max(
                 1,
-                max(
-                    CHUNK_PREP_REQUEST_BATCH_SIZE,
+                min(
+                    self._chunk_prep_request_batch_size,
                     self.mesh_batch_size * 2,
                     32,
                 ),
