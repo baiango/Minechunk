@@ -587,4 +587,4 @@ class WgpuTerrainBackend:
         return ready
 
     def terrain_backend_label(self) -> str:
-        return "GPU"
+        return "Wgpu"

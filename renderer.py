@@ -39,9 +39,8 @@ VERTEX_STRIDE = 48
 LIGHT_DIRECTION = (0.35, 0.90, 0.25)
 DEPTH_FORMAT = "depth24plus"
 ENGINE_MODE_CPU = "cpu"
-ENGINE_MODE_GPU = "gpu"
-ENGINE_MODE = ENGINE_MODE_GPU
-CHUNK_PREP_REQUEST_BUDGET_CAP = 8 if ENGINE_MODE == ENGINE_MODE_GPU else 2
+ENGINE_MODE_WGPU = "wgpu"
+ENGINE_MODE_METAL = "metal"
 DEFAULT_RENDER_DISTANCE_BLOCKS = CHUNK_SIZE * 32
 MERGED_TILE_SIZE_CHUNKS = 4
 MERGED_TILE_MIN_AGE_SECONDS = 2.0
@@ -58,6 +57,15 @@ _CHUNK_HALF = CHUNK_SIZE * 0.5
 _CHUNK_RADIUS_CACHE: dict[int, tuple[float, float]] = {}
 
 
+def _engine_mode_uses_gpu_path() -> bool:
+    return engine_mode != ENGINE_MODE_CPU
+
+
+engine_mode = ENGINE_MODE_METAL
+default_use_gpu = engine_mode != ENGINE_MODE_CPU
+chunk_prep_request_budget_cap = 2 if _engine_mode_uses_gpu_path() == False else 8
+
+
 def _chunk_height_center_and_radius(max_height: int) -> tuple[float, float]:
     cached = _CHUNK_RADIUS_CACHE.get(int(max_height))
     if cached is not None:
@@ -68,6 +76,7 @@ def _chunk_height_center_and_radius(max_height: int) -> tuple[float, float]:
     cached = (half_height, radius)
     _CHUNK_RADIUS_CACHE[int(max_height)] = cached
     return cached
+
 
 # Indirect draws use first_vertex, which is counted in whole vertices, not bytes.
 # Persistent slab suballocation can start at byte offsets that are aligned for storage
@@ -1726,7 +1735,7 @@ class TerrainRenderer:
         terrain_batch_size: int = 32,
         mesh_batch_size: int | None = None,
     ) -> None:
-        default_use_gpu = ENGINE_MODE.lower() == ENGINE_MODE_GPU
+        default_use_gpu = _engine_mode_uses_gpu_path()
         self.use_gpu_terrain = default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
         if mesh_batch_size is None:
@@ -1735,7 +1744,7 @@ class TerrainRenderer:
             self.mesh_batch_size = max(1, int(mesh_batch_size))
         self._pending_surface_gpu_batch_target_multiplier = 10
         self.base_title = "Minechunk"
-        self.engine_mode_label = ENGINE_MODE.upper()
+        self.engine_mode_label = engine_mode
         self.canvas = RenderCanvas(
             title=self.base_title,
             size=(1280, 800),
@@ -1771,8 +1780,14 @@ class TerrainRenderer:
             seed,
             gpu_device=self.device,
             prefer_gpu_terrain=self.use_gpu_terrain,
+            prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
         )
+        if self.use_gpu_terrain and self.world.terrain_backend_label() == "Metal":
+            print(
+                "Info: Metal terrain backend active; renderer will bridge terrain results back through CPU arrays before wgpu meshing/rendering.",
+                file=sys.stderr,
+            )
 
         self.camera = Camera(position=[0.0, 200.0, 0.0], yaw=math.pi, pitch=-1.20)
         self.keys_down: set[str] = set()
@@ -1824,7 +1839,7 @@ class TerrainRenderer:
         self._cache_capacity_warned = False
         self._current_move_speed = self.camera.move_speed
         self.use_gpu_meshing = default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)
-        self.mesh_backend_label = "GPU" if self.use_gpu_meshing else "CPU"
+        self.mesh_backend_label = "Wgpu" if self.use_gpu_meshing else "CPU"
         self.voxel_mesh_scan_validate_every = 0
         self._voxel_mesh_scan_batches_processed = 0
         self._pending_voxel_mesh_results: deque = deque()
@@ -2364,7 +2379,6 @@ class TerrainRenderer:
         self.profile_hud_vertex_count = 0
         self.frame_breakdown_lines = [
             f"FRAME BREAKDOWN @ DIMENSION {self.render_dimension_chunks}x{self.render_dimension_chunks} CHUNKS",
-            f"ENGINE MODE: {self.engine_mode_label}",
             "CPU FRAME ISSUE: --.- MS",
             "  WORLD UPDATE: --.- MS",
             "  VISIBILITY LOOKUP: --.- MS",
@@ -2554,7 +2568,6 @@ class TerrainRenderer:
 
         lines = [
             f"FRAME BREAKDOWN @ DIMENSION {self.render_dimension_chunks}x{self.render_dimension_chunks} CHUNKS",
-            f"ENGINE MODE: {self.engine_mode_label}",
             f"MOVE SPEED: {self._current_move_speed:5.1f} B/S",
             f"TERRAIN BACKEND: {self.world.terrain_backend_label()}",
             f"MESH BACKEND: {self.mesh_backend_label}",
@@ -2994,8 +3007,14 @@ class TerrainRenderer:
             int(time.time()) & 0x7FFFFFFF,
             gpu_device=self.device,
             prefer_gpu_terrain=self.use_gpu_terrain,
+            prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
         )
+        if self.use_gpu_terrain and self.world.terrain_backend_label() == "Metal":
+            print(
+                "Info: Metal terrain backend active; renderer will bridge terrain results back through CPU arrays before wgpu meshing/rendering.",
+                file=sys.stderr,
+            )
         self.camera.position[:] = [0.0, 200.0, 0.0]
         self.camera.yaw = math.pi
         self.camera.pitch = -1.20
@@ -5178,9 +5197,11 @@ class TerrainRenderer:
             visibility_lookup_ms = self._refresh_visible_chunk_set()
 
         prep_start = time.perf_counter()
-        using_gpu_terrain = self.world.terrain_backend_label() == "GPU"
+        terrain_backend_label = self.world.terrain_backend_label()
+        using_wgpu_terrain = terrain_backend_label == "Wgpu"
+        using_metal_terrain = terrain_backend_label == "Metal"
         if self.use_gpu_meshing:
-            ready_surface_batches = self.world.poll_ready_chunk_surface_gpu_batches()
+            ready_surface_batches = self.world.poll_ready_chunk_surface_gpu_batches() if using_wgpu_terrain else []
             if ready_surface_batches:
                 chunk_stream_added = sum(len(batch.chunks) for batch in ready_surface_batches)
                 chunk_stream_drained = 0
@@ -5195,7 +5216,7 @@ class TerrainRenderer:
                 chunk_stream_drained = 0
                 chunk_stream_bytes = 0.0
                 self._drain_pending_surface_gpu_batches_to_meshing()
-            elif not using_gpu_terrain:
+            elif not using_wgpu_terrain:
                 ready_results = self.world.poll_ready_chunk_voxel_batches()
                 chunk_stream_bytes = 0.0
                 chunk_stream_added = len(ready_results)
@@ -5221,7 +5242,12 @@ class TerrainRenderer:
                     drain_budget -= len(batch)
                     for result in batch:
                         chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
-                    for mesh in self._cpu_make_chunk_mesh_batch_from_voxels(batch):
+                    meshes = (
+                        self._gpu_make_chunk_mesh_batch_from_voxels(batch)
+                        if using_metal_terrain
+                        else self._cpu_make_chunk_mesh_batch_from_voxels(batch)
+                    )
+                    for mesh in meshes:
                         self._store_chunk_mesh(mesh)
             else:
                 chunk_stream_added = 0
@@ -5257,7 +5283,7 @@ class TerrainRenderer:
         missing_count = len(missing_coords)
         prep_budget = min(
             missing_count,
-            max(1, min(CHUNK_PREP_REQUEST_BUDGET_CAP, self.mesh_batch_size * 2, 32)),
+            max(1, min(chunk_prep_request_budget_cap, self.mesh_batch_size * 2, 32)),
         )
 
         camera_chunk_x = current_origin[0]

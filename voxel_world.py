@@ -6,7 +6,19 @@ import struct
 import numpy as np
 
 from cpu_terrain_backend import CpuTerrainBackend
-from wgpu_terrain_backend import WgpuTerrainBackend
+try:
+    from metal_terrain_backend import MetalTerrainBackend
+except Exception as exc:  # pragma: no cover - optional on non-mac / CPU-only fallback
+    MetalTerrainBackend = None  # type: ignore[assignment]
+    METAL_TERRAIN_IMPORT_ERROR = exc
+else:
+    METAL_TERRAIN_IMPORT_ERROR = None
+
+try:
+    from wgpu_terrain_backend import WgpuTerrainBackend
+except Exception:  # pragma: no cover - optional during Metal-only deployments
+    WgpuTerrainBackend = None  # type: ignore[assignment]
+
 from terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
 
 from terrain_kernels import (
@@ -21,6 +33,97 @@ from terrain_kernels import (
 
 WORLD_HEIGHT = 128
 CHUNK_SIZE = 32
+
+
+def _create_preferred_gpu_backend(
+    gpu_device,
+    seed: int,
+    chunk_size: int,
+    height_limit: int,
+    chunks_per_poll: int,
+    *,
+    prefer_metal_backend: bool = False,
+):
+    errors: list[str] = []
+
+    if prefer_metal_backend:
+        if MetalTerrainBackend is not None:
+            metal_candidates = []
+            if gpu_device is not None:
+                metal_candidates.append((gpu_device, "provided device"))
+            metal_candidates.append((None, "system default device"))
+
+            tried_none = False
+            for metal_device, label in metal_candidates:
+                if metal_device is None:
+                    if tried_none:
+                        continue
+                    tried_none = True
+                try:
+                    return MetalTerrainBackend(
+                        metal_device,
+                        seed,
+                        chunk_size,
+                        height_limit,
+                        chunks_per_poll=chunks_per_poll,
+                    )
+                except Exception as exc:
+                    errors.append(f"Metal terrain backend could not be created via {label} ({exc!s})")
+        elif METAL_TERRAIN_IMPORT_ERROR is not None:
+            errors.append(
+                "Metal terrain backend is unavailable; falling back to wgpu terrain backend "
+                f"({METAL_TERRAIN_IMPORT_ERROR!s})"
+            )
+
+        if errors:
+            print(
+                "Warning: Metal terrain backend could not be used; falling back to wgpu terrain. "
+                + "; ".join(errors),
+                file=sys.stderr,
+            )
+
+    if MetalTerrainBackend is not None:
+        metal_candidates = []
+        if gpu_device is not None:
+            metal_candidates.append((gpu_device, "provided device"))
+        metal_candidates.append((None, "system default device"))
+
+        tried_none = False
+        for metal_device, label in metal_candidates:
+            if metal_device is None:
+                if tried_none:
+                    continue
+                tried_none = True
+            try:
+                return MetalTerrainBackend(
+                    metal_device,
+                    seed,
+                    chunk_size,
+                    height_limit,
+                    chunks_per_poll=chunks_per_poll,
+                )
+            except Exception as exc:
+                errors.append(f"Metal terrain backend could not be created via {label} ({exc!s})")
+
+    if WgpuTerrainBackend is not None and gpu_device is not None:
+        try:
+            return WgpuTerrainBackend(
+                gpu_device,
+                seed,
+                chunk_size,
+                height_limit,
+                chunks_per_poll=chunks_per_poll,
+            )
+        except Exception as exc:
+            errors.append(f"wgpu terrain backend could not be created ({exc!s})")
+
+    if not errors:
+        if gpu_device is None:
+            errors.append("GPU terrain was requested, but no compatible GPU device or backend was available")
+        else:
+            errors.append("GPU terrain was requested, but no compatible backend accepted the provided device")
+
+    raise RuntimeError("; ".join(errors))
 
 
 GPU_TERRAIN_SHADER = """
@@ -297,19 +400,26 @@ class VoxelWorld:
         *,
         gpu_device=None,
         prefer_gpu_terrain: bool = False,
+        prefer_metal_backend: bool = False,
         terrain_batch_size: int = 128,
     ) -> None:
         self.seed = int(seed)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
-        self._backend = CpuTerrainBackend(self.seed, self.height, self.chunk_size, chunks_per_poll=self.terrain_batch_size)
-        if prefer_gpu_terrain and gpu_device is not None:
+        self._backend = CpuTerrainBackend(
+            self.seed,
+            self.height,
+            self.chunk_size,
+            chunks_per_poll=self.terrain_batch_size,
+        )
+        if prefer_gpu_terrain:
             try:
-                self._backend = WgpuTerrainBackend(
+                self._backend = _create_preferred_gpu_backend(
                     gpu_device,
                     self.seed,
                     self.chunk_size,
                     self.height,
-                    chunks_per_poll=self.terrain_batch_size,
+                    self.terrain_batch_size,
+                    prefer_metal_backend=prefer_metal_backend,
                 )
             except Exception as exc:
                 print(
@@ -322,11 +432,6 @@ class VoxelWorld:
                     self.chunk_size,
                     chunks_per_poll=self.terrain_batch_size,
                 )
-        elif prefer_gpu_terrain and gpu_device is None:
-            print(
-                "Warning: GPU terrain was requested, but no compatible device was provided; using CPU terrain.",
-                file=sys.stderr,
-            )
 
     def block_at(self, x: int, y: int, z: int) -> int:
         if not (0 <= y < self.height):
