@@ -3904,6 +3904,10 @@ class TerrainRenderer:
         resources: AsyncVoxelMeshBatchResources,
         sample_size: int,
         height_limit: int,
+        *,
+        params_already_uploaded: bool = False,
+        encoder = None,
+        submit: bool = True,
     ) -> None:
         if (
             self.voxel_mesh_count_pipeline is None
@@ -3935,17 +3939,19 @@ class TerrainRenderer:
 
         self.device.queue.write_buffer(resources.coords_buffer, 0, memoryview(coords_view))
         self.device.queue.write_buffer(resources.chunk_totals_buffer, 0, memoryview(zero_view))
-        self.device.queue.write_buffer(resources.chunk_offsets_buffer, 0, memoryview(zero_view))
-        self.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
+        if not params_already_uploaded:
+            self.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
 
-        encoder = self.device.create_command_encoder()
+        if encoder is None:
+            encoder = self.device.create_command_encoder()
         compute_pass = encoder.begin_compute_pass()
         compute_pass.set_pipeline(self.voxel_mesh_count_pipeline)
         compute_pass.set_bind_group(0, count_bind_group)
         compute_pass.dispatch_workgroups(columns_per_side, columns_per_side, chunk_count)
         compute_pass.end()
         encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, chunk_count * 4)
-        self.device.queue.submit([encoder.finish()])
+        if submit:
+            self.device.queue.submit([encoder.finish()])
 
         metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 4)
         self._pending_gpu_mesh_batches.append(
@@ -4246,9 +4252,7 @@ class TerrainRenderer:
         )
 
         chunk_totals[:chunk_count].fill(0)
-        chunk_offsets[:chunk_count].fill(0)
         self.device.queue.write_buffer(chunk_totals_buffer, 0, memoryview(chunk_totals[:chunk_count]))
-        self.device.queue.write_buffer(chunk_offsets_buffer, 0, memoryview(chunk_offsets[:chunk_count]))
 
         shared_entries = [
             {"binding": 0, "resource": {"buffer": blocks_buffer}},
@@ -4408,7 +4412,6 @@ class TerrainRenderer:
         workgroups = (sample_size + 7) // 8
         compute_pass.dispatch_workgroups(workgroups, workgroups, chunk_count * height_limit)
         compute_pass.end()
-        self.device.queue.submit([encoder.finish()])
 
         if defer_finalize:
             assert async_resources is not None
@@ -4417,8 +4420,13 @@ class TerrainRenderer:
                 async_resources,
                 sample_size,
                 height_limit,
+                params_already_uploaded=True,
+                encoder=encoder,
+                submit=True,
             )
             return []
+
+        self.device.queue.submit([encoder.finish()])
 
         return self._gpu_make_chunk_mesh_batch_from_gpu_buffers(
             chunk_coords,
