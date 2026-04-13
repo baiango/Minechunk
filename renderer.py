@@ -41,8 +41,8 @@ DEPTH_FORMAT = "depth24plus"
 CHUNK_PREP_RATE = 1000.0
 CHUNK_PREP_TOKEN_CAP = 500.0
 CHUNK_FORWARD_CONE_LATERAL_RATIO = 0.5
-CHUNK_PREP_REQUEST_BUDGET_CAP = 8
-CHUNK_PREP_REQUEST_BATCH_SIZE = 8
+CHUNK_PREP_REQUEST_BUDGET_CAP = 16
+CHUNK_PREP_REQUEST_BATCH_SIZE = 16
 CHUNK_PREP_REORDER_YAW_DELTA = math.radians(10.0)
 ENGINE_MODE_CPU = "cpu"
 ENGINE_MODE_GPU = "gpu"
@@ -4352,6 +4352,7 @@ class TerrainRenderer:
             )
         return meshes
 
+    @profile
     def _gpu_make_chunk_mesh_batch_from_surface_gpu_batch(
         self,
         surface_batch: ChunkSurfaceGpuBatch,

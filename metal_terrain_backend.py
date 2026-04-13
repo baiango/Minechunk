@@ -184,6 +184,9 @@ fn fill_chunk_surface_batch_main(@builtin(global_invocation_id) gid: vec3u) {
 @dataclass
 class _ChunkGpuBatch:
     chunks: list[tuple[int, int]]
+    chunk_count: int
+    max_chunks: int
+    coords_array: np.ndarray
     coords_buffer: object
     params_buffer: object
     heights_buffer: object
@@ -192,7 +195,7 @@ class _ChunkGpuBatch:
 
 
 class MetalTerrainBackend:
-    def __init__(self, device, seed: int, chunk_size: int, height_limit: int, chunks_per_poll: int = 32) -> None:
+    def __init__(self, device, seed: int, chunk_size: int, height_limit: int, chunks_per_poll: int = 64) -> None:
         if wgpu is None:
             raise RuntimeError("wgpu is unavailable.")
         self.device = device
@@ -225,10 +228,16 @@ class MetalTerrainBackend:
             size=self.cell_count * 4,
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
         )
-        self._batch_coords_buffer = None
-        self._batch_params_buffer = None
-        self._batch_heights_buffer = None
-        self._batch_materials_buffer = None
+        self._batch_params_payload = struct.pack(
+            "<4I",
+            int(self.sample_size),
+            int(self.chunk_size),
+            int(self.height_limit),
+            int(self.seed) & 0xFFFFFFFF,
+        )
+        self._batch_pool_size = 3
+        self._available_batch_slots: deque[_ChunkGpuBatch] = deque()
+        self._batch_slots_pending_reuse: deque[_ChunkGpuBatch] = deque()
         self._bind_group_layout = device.create_bind_group_layout(
             entries=[
                 {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
@@ -273,6 +282,8 @@ class MetalTerrainBackend:
             layout=device.create_pipeline_layout(bind_group_layouts=[self._bind_group_layout]),
             compute={"module": shader_module, "entry_point": "fill_chunk_surface_grids_main"},
         )
+        for _ in range(self._batch_pool_size):
+            self._available_batch_slots.append(self._allocate_chunk_batch_resources(self.chunks_per_poll))
 
     def _write_params(self, *, sample_origin_x: float, sample_origin_z: float, height_limit: int, chunk_x: int, chunk_z: int, sample_size: int, seed: int) -> None:
         payload = struct.pack(
@@ -341,11 +352,11 @@ class MetalTerrainBackend:
         expand_chunk_surface_to_voxel_grid(blocks, voxel_materials, heights, materials, self.chunk_size, self.height_limit)
         return blocks, voxel_materials
 
-    @profile
-    def _create_chunk_batch(self, chunks: list[tuple[int, int]]) -> "_ChunkGpuBatch":
-        coords = np.ascontiguousarray(np.asarray(chunks, dtype=np.int32).reshape(-1, 2))
+    def _allocate_chunk_batch_resources(self, max_chunks: int) -> "_ChunkGpuBatch":
+        max_chunks = max(1, int(max_chunks))
+        coords_array = np.empty((max_chunks, 2), dtype=np.int32)
         coords_buffer = self.device.create_buffer(
-            size=max(1, coords.nbytes),
+            size=max(1, coords_array.nbytes),
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
         )
         params_buffer = self.device.create_buffer(
@@ -353,11 +364,11 @@ class MetalTerrainBackend:
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         heights_buffer = self.device.create_buffer(
-            size=max(1, len(chunks) * self.cell_count * 4),
+            size=max(1, max_chunks * self.cell_count * 4),
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
         )
         materials_buffer = self.device.create_buffer(
-            size=max(1, len(chunks) * self.cell_count * 4),
+            size=max(1, max_chunks * self.cell_count * 4),
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
         )
         bind_group = self.device.create_bind_group(
@@ -370,7 +381,10 @@ class MetalTerrainBackend:
             ],
         )
         return _ChunkGpuBatch(
-            chunks=list(chunks),
+            chunks=[],
+            chunk_count=0,
+            max_chunks=max_chunks,
+            coords_array=coords_array,
             coords_buffer=coords_buffer,
             params_buffer=params_buffer,
             heights_buffer=heights_buffer,
@@ -378,56 +392,82 @@ class MetalTerrainBackend:
             bind_group=bind_group,
         )
 
+    def _reclaim_batch_slots(self) -> None:
+        while self._batch_slots_pending_reuse:
+            batch = self._batch_slots_pending_reuse.popleft()
+            batch.chunk_count = 0
+            batch.chunks.clear()
+            self._available_batch_slots.append(batch)
+
+    @profile
+    def _create_chunk_batch(self, chunks: list[tuple[int, int]]) -> "_ChunkGpuBatch":
+        chunk_count = len(chunks)
+        if self._available_batch_slots:
+            batch = self._available_batch_slots.popleft()
+        else:
+            batch = self._allocate_chunk_batch_resources(max(self.chunks_per_poll, chunk_count))
+        if chunk_count > batch.max_chunks:
+            batch = self._allocate_chunk_batch_resources(chunk_count)
+        batch.chunk_count = chunk_count
+        batch.chunks = list(chunks)
+        if chunk_count > 0:
+            batch.coords_array[:chunk_count] = np.asarray(chunks, dtype=np.int32).reshape(-1, 2)
+        return batch
+
     @profile
     def _submit_next_batch(self) -> None:
         if self._in_flight_batch is not None or not self._pending_jobs:
             return
 
-        batch_coords = self._pending_jobs.popleft()
-        if not batch_coords:
+        merged: list[tuple[int, int]] = []
+        while self._pending_jobs and len(merged) < self.chunks_per_poll:
+            job = self._pending_jobs.popleft()
+            take = min(self.chunks_per_poll - len(merged), len(job))
+            if take:
+                merged.extend(job[:take])
+            if take < len(job):
+                self._pending_jobs.appendleft(job[take:])
+                break
+
+        if not merged:
             return
 
-        tasks = self._create_chunk_batch(batch_coords[: self.chunks_per_poll])
-        if len(batch_coords) > self.chunks_per_poll:
-            self._pending_jobs.appendleft(batch_coords[self.chunks_per_poll :])
+        tasks = self._create_chunk_batch(merged)
         self._in_flight_batch = tasks
 
         encoder = self.device.create_command_encoder()
-        coords_payload = np.ascontiguousarray(np.asarray(tasks.chunks, dtype=np.int32).reshape(-1, 2)).tobytes()
-        self.device.queue.write_buffer(tasks.coords_buffer, 0, coords_payload)
-        batch_payload = struct.pack(
-            "<4I",
-            int(self.sample_size),
-            int(self.chunk_size),
-            int(self.height_limit),
-            int(self.seed) & 0xFFFFFFFF,
-        )
-        self.device.queue.write_buffer(tasks.params_buffer, 0, batch_payload)
+        coords_view = memoryview(tasks.coords_array[:tasks.chunk_count])
+        self.device.queue.write_buffer(tasks.coords_buffer, 0, coords_view)
+        self.device.queue.write_buffer(tasks.params_buffer, 0, self._batch_params_payload)
+
         compute_pass = encoder.begin_compute_pass()
         compute_pass.set_pipeline(self._batch_pipeline)
         compute_pass.set_bind_group(0, tasks.bind_group)
         workgroups = (self.sample_size + 7) // 8
-        compute_pass.dispatch_workgroups(workgroups, workgroups, len(tasks.chunks))
+        compute_pass.dispatch_workgroups(workgroups, workgroups, tasks.chunk_count)
         compute_pass.end()
+
         self.device.queue.submit([encoder.finish()])
 
     def poll_ready_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         ready: list[ChunkSurfaceResult] = []
+        self._reclaim_batch_slots()
         if self._in_flight_batch is not None:
-            chunk_count = len(self._in_flight_batch.chunks)
+            completed_batch = self._in_flight_batch
+            chunk_count = completed_batch.chunk_count
             cell_count = self.cell_count
             total_cells = chunk_count * cell_count
             heights_data = np.frombuffer(
-                self.device.queue.read_buffer(self._in_flight_batch.heights_buffer, 0, total_cells * 4),
+                self.device.queue.read_buffer(completed_batch.heights_buffer, 0, total_cells * 4),
                 dtype=np.uint32,
                 count=total_cells,
             )
             materials_data = np.frombuffer(
-                self.device.queue.read_buffer(self._in_flight_batch.materials_buffer, 0, total_cells * 4),
+                self.device.queue.read_buffer(completed_batch.materials_buffer, 0, total_cells * 4),
                 dtype=np.uint32,
                 count=total_cells,
             )
-            for index, (chunk_x, chunk_z) in enumerate(self._in_flight_batch.chunks):
+            for index, (chunk_x, chunk_z) in enumerate(completed_batch.chunks):
                 start = index * cell_count
                 end = start + cell_count
                 ready.append(
@@ -440,6 +480,7 @@ class MetalTerrainBackend:
                     )
                 )
             self._in_flight_batch = None
+            self._batch_slots_pending_reuse.append(completed_batch)
 
         self._submit_next_batch()
         return ready
@@ -447,17 +488,20 @@ class MetalTerrainBackend:
     @profile
     def poll_ready_chunk_surface_gpu_batches(self) -> list[ChunkSurfaceGpuBatch]:
         ready: list[ChunkSurfaceGpuBatch] = []
+        self._reclaim_batch_slots()
         if self._in_flight_batch is not None:
+            completed_batch = self._in_flight_batch
             ready.append(
                 ChunkSurfaceGpuBatch(
-                    chunks=list(self._in_flight_batch.chunks),
-                    heights_buffer=self._in_flight_batch.heights_buffer,
-                    materials_buffer=self._in_flight_batch.materials_buffer,
+                    chunks=list(completed_batch.chunks),
+                    heights_buffer=completed_batch.heights_buffer,
+                    materials_buffer=completed_batch.materials_buffer,
                     cell_count=self.cell_count,
                     source="gpu",
                 )
             )
             self._in_flight_batch = None
+            self._batch_slots_pending_reuse.append(completed_batch)
 
         self._submit_next_batch()
         return ready
