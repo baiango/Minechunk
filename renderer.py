@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import cProfile
 import ctypes
 import os
 import math
@@ -10,7 +9,6 @@ import time
 import sys
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from pstats import Stats
 
 import numpy as np
 import wgpu
@@ -1803,7 +1801,6 @@ class TerrainRenderer:
         self._async_voxel_mesh_batch_pool: deque[AsyncVoxelMeshBatchResources] = deque()
         self._voxel_surface_expand_bind_group_cache: OrderedDict[tuple[int, int, int, int, int], object] = OrderedDict()
         self.profiling_enabled = False
-        self.profiler: cProfile.Profile | None = None
         self.profile_window_start = 0.0
         self.profile_next_report = 0.0
         self.profile_window_cpu_ms = 0.0
@@ -2310,7 +2307,6 @@ class TerrainRenderer:
 
     def _enable_profiling(self) -> None:
         self.profiling_enabled = True
-        self.profiler = cProfile.Profile()
         now = time.perf_counter()
         self.profile_window_start = now
         self.profile_next_report = now + PROFILE_REPORT_INTERVAL
@@ -2366,7 +2362,6 @@ class TerrainRenderer:
 
     def _disable_profiling(self) -> None:
         self.profiling_enabled = False
-        self.profiler = None
         self.profile_window_start = 0.0
         self.profile_next_report = 0.0
         self.profile_window_cpu_ms = 0.0
@@ -2383,15 +2378,13 @@ class TerrainRenderer:
             samples.clear()
 
     def _profile_begin_frame(self) -> float | None:
-        if not self.profiling_enabled or self.profiler is None:
+        if not self.profiling_enabled:
             return None
-        self.profiler.enable()
         return time.perf_counter()
 
     def _profile_end_frame(self, started_at: float | None, frame_dt: float) -> None:
-        if started_at is None or self.profiler is None:
+        if started_at is None:
             return
-        self.profiler.disable()
         ended_at = time.perf_counter()
         self.profile_window_cpu_ms += (ended_at - started_at) * 1000.0
         self.profile_window_frames += 1
@@ -2400,13 +2393,9 @@ class TerrainRenderer:
             self._refresh_profile_summary(ended_at)
 
     def _refresh_profile_summary(self, now: float) -> None:
-        if self.profiler is None:
-            return
         avg_cpu_ms = self.profile_window_cpu_ms / max(1, self.profile_window_frames)
         avg_fps = self._profile_average_fps()
         frame_p50_ms, frame_p95_ms, frame_p99_ms = self._profile_frame_time_percentiles()
-        stats = Stats(self.profiler)
-        entries = sorted(stats.stats.items(), key=lambda item: item[1][2], reverse=True)
 
         slab_count, slab_total_bytes, slab_used_bytes, slab_free_bytes, slab_largest_free_bytes, slab_alloc_count = self._mesh_output_allocator_stats()
         lines = [
@@ -2418,17 +2407,8 @@ class TerrainRenderer:
             f"MESH SLABS {slab_count:2d}  USED {slab_used_bytes / (1024.0 * 1024.0):4.1f} MIB  FREE {slab_free_bytes / (1024.0 * 1024.0):4.1f} MIB",
             f"MESH BIGGEST GAP {slab_largest_free_bytes / (1024.0 * 1024.0):4.1f} MIB  ALLOCS {slab_alloc_count:3d}",
         ]
-        hotspot_label = self._profile_hotspot_label(entries)
-        if hotspot_label:
-            lines.append(hotspot_label.upper())
-        for index, (key, stat) in enumerate(entries[:30], start=1):
-            funcname = key[2].upper().replace("<", "").replace(">", "")
-            funcname = funcname[:24]
-            lines.append(f"{index} {funcname:<24} {stat[2] * 1000.0:5.1f}MS")
         self.profile_hud_lines = lines
         self.profile_hud_vertex_bytes, self.profile_hud_vertex_count = self._build_profile_hud_vertices(lines)
-
-        self.profiler = cProfile.Profile()
         self.profile_window_start = now
         self.profile_next_report = now + PROFILE_REPORT_INTERVAL
         self.profile_window_cpu_ms = 0.0
@@ -2575,35 +2555,6 @@ class TerrainRenderer:
         ]
         self.frame_breakdown_lines = lines
         self.frame_breakdown_vertex_bytes, self.frame_breakdown_vertex_count = self._build_frame_breakdown_hud_vertices(lines)
-
-    def _profile_hotspot_label(self, entries) -> str:
-        if not entries:
-            return ""
-
-        hot_funcs = [entry[0][2] for entry in entries[:6]]
-        if any(name in {"_submit_render", "get_current_texture", "_get_current_texture"} for name in hot_funcs):
-            return "render submit bottleneck"
-        if any(
-            name in {
-                "surface_profile_at",
-                "chunk_surface_grids",
-                "chunk_voxel_grid",
-                "fill_chunk_surface_grids",
-                "fill_chunk_voxel_grid",
-                "count_chunk_voxel_vertices",
-                "build_chunk_vertex_array",
-                "build_chunk_vertex_array_from_voxels",
-                "_build_chunk_vertex_bytes",
-                "_gpu_make_chunk_mesh_from_voxels",
-            }
-            or "build_chunk_vertex" in name
-            or "vertex_buffer" in name
-            for name in hot_funcs
-        ):
-            return "chunk vertex bottleneck"
-        if any(name in {"_prepare_chunks", "_ensure_chunk_mesh", "_make_chunk_mesh"} for name in hot_funcs):
-            return "chunk meshing bottleneck"
-        return ""
 
     def _describe_render_api(self) -> str:
         info = getattr(self.adapter, "info", None)
@@ -5589,4 +5540,3 @@ class TerrainRenderer:
             raise
         self._profile_end_frame(profile_started_at, wall_frame_ms / 1000.0)
         self.canvas.request_draw(self.draw_frame)
-
