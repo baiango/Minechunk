@@ -1571,7 +1571,6 @@ class MeshOutputSlab:
     buffer: wgpu.GPUBuffer
     size_bytes: int
     free_ranges: list[tuple[int, int]]
-    append_offset: int = 0
 
 
 @dataclass
@@ -1729,7 +1728,6 @@ class TerrainRenderer:
         self._mesh_buffer_refs: dict[int, int] = {}
         self._mesh_output_slabs: OrderedDict[int, MeshOutputSlab] = OrderedDict()
         self._mesh_allocations: dict[int, MeshBufferAllocation] = {}
-        self._mesh_output_append_slab_id: int | None = None
         self._next_mesh_output_slab_id = 1
         self._next_mesh_allocation_id = 1
         self._mesh_output_binding_alignment = max(
@@ -2451,10 +2449,6 @@ class TerrainRenderer:
         largest_free_bytes = 0
         for slab in self._mesh_output_slabs.values():
             total_bytes += int(slab.size_bytes)
-            tail_free_bytes = max(0, int(slab.size_bytes) - int(slab.append_offset))
-            free_bytes += tail_free_bytes
-            if tail_free_bytes > largest_free_bytes:
-                largest_free_bytes = tail_free_bytes
             for _, size in slab.free_ranges:
                 size = int(size)
                 free_bytes += size
@@ -2632,48 +2626,13 @@ class TerrainRenderer:
                 usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
             ),
             size_bytes=int(size_bytes),
-            free_ranges=[],
-            append_offset=0,
+            free_ranges=[(0, int(size_bytes))],
         )
         self._next_mesh_output_slab_id += 1
         self._mesh_output_slabs[slab.slab_id] = slab
-        self._mesh_output_append_slab_id = slab.slab_id
         return slab
 
-    def _register_mesh_output_allocation(
-        self,
-        slab: MeshOutputSlab,
-        offset_bytes: int,
-        size_bytes: int,
-    ) -> MeshBufferAllocation:
-        allocation = MeshBufferAllocation(
-            allocation_id=self._next_mesh_allocation_id,
-            buffer=slab.buffer,
-            offset_bytes=int(offset_bytes),
-            size_bytes=int(size_bytes),
-            slab_id=slab.slab_id,
-            refcount=0,
-        )
-        self._next_mesh_allocation_id += 1
-        self._mesh_allocations[allocation.allocation_id] = allocation
-        self._mesh_output_slabs.move_to_end(slab.slab_id)
-        self._mesh_output_append_slab_id = slab.slab_id
-        return allocation
-
-    def _allocate_from_mesh_output_slab_bump(
-        self,
-        slab: MeshOutputSlab,
-        request_bytes: int,
-    ) -> MeshBufferAllocation | None:
-        needed_bytes = max(1, int(request_bytes))
-        aligned_offset = self._align_up(int(slab.append_offset), self._mesh_output_binding_alignment)
-        alloc_end = aligned_offset + needed_bytes
-        if alloc_end > int(slab.size_bytes):
-            return None
-        slab.append_offset = alloc_end
-        return self._register_mesh_output_allocation(slab, aligned_offset, needed_bytes)
-
-    def _allocate_from_mesh_output_slab_free_ranges(
+    def _allocate_from_mesh_output_slab(
         self,
         slab: MeshOutputSlab,
         request_bytes: int,
@@ -2695,40 +2654,30 @@ class TerrainRenderer:
             if tail_size > 0:
                 new_ranges.append((alloc_end, tail_size))
             slab.free_ranges[index:index + 1] = new_ranges
-            return self._register_mesh_output_allocation(slab, aligned_offset, needed_bytes)
-        return None
 
-    def _allocate_from_mesh_output_slab(
-        self,
-        slab: MeshOutputSlab,
-        request_bytes: int,
-    ) -> MeshBufferAllocation | None:
-        allocation = self._allocate_from_mesh_output_slab_bump(slab, request_bytes)
-        if allocation is not None:
+            allocation = MeshBufferAllocation(
+                allocation_id=self._next_mesh_allocation_id,
+                buffer=slab.buffer,
+                offset_bytes=aligned_offset,
+                size_bytes=needed_bytes,
+                slab_id=slab.slab_id,
+                refcount=0,
+            )
+            self._next_mesh_allocation_id += 1
+            self._mesh_allocations[allocation.allocation_id] = allocation
             return allocation
-        return self._allocate_from_mesh_output_slab_free_ranges(slab, request_bytes)
+        return None
 
     def _allocate_mesh_output_range(self, request_bytes: int) -> MeshBufferAllocation:
         needed_bytes = max(1, int(request_bytes))
         needed_bytes = self._align_up(needed_bytes, self._mesh_output_binding_alignment)
-
-        append_slab = None
-        if self._mesh_output_append_slab_id is not None:
-            append_slab = self._mesh_output_slabs.get(self._mesh_output_append_slab_id)
-        if append_slab is not None:
-            allocation = self._allocate_from_mesh_output_slab_bump(append_slab, needed_bytes)
-            if allocation is not None:
-                return allocation
-
-        for slab_id, slab in list(self._mesh_output_slabs.items()):
-            if append_slab is not None and slab_id == append_slab.slab_id:
-                continue
-            allocation = self._allocate_from_mesh_output_slab_free_ranges(slab, needed_bytes)
+        for slab in self._mesh_output_slabs.values():
+            allocation = self._allocate_from_mesh_output_slab(slab, needed_bytes)
             if allocation is not None:
                 return allocation
 
         slab = self._create_mesh_output_slab(self._mesh_output_slab_size_for_request(needed_bytes))
-        allocation = self._allocate_from_mesh_output_slab_bump(slab, needed_bytes)
+        allocation = self._allocate_from_mesh_output_slab(slab, needed_bytes)
         if allocation is None:
             raise RuntimeError("Failed to suballocate mesh output slab.")
         return allocation
@@ -2751,28 +2700,12 @@ class TerrainRenderer:
                 merged.append([offset, size])
         return [(offset, size) for offset, size in merged]
 
-    def _trim_mesh_output_slab_tail(self, slab: MeshOutputSlab) -> None:
-        tail_offset = int(slab.append_offset)
-        if tail_offset <= 0 or not slab.free_ranges:
-            return
-        while slab.free_ranges:
-            range_offset, range_size = slab.free_ranges[-1]
-            range_end = int(range_offset) + int(range_size)
-            if range_end != tail_offset:
-                break
-            tail_offset = int(range_offset)
-            slab.free_ranges.pop()
-        slab.append_offset = tail_offset
-
     def _free_mesh_output_range(self, slab_id: int, offset_bytes: int, size_bytes: int) -> None:
         slab = self._mesh_output_slabs.get(int(slab_id))
         if slab is None:
             return
         slab.free_ranges.append((int(offset_bytes), int(size_bytes)))
         slab.free_ranges = self._coalesce_mesh_output_free_ranges(slab.free_ranges)
-        self._trim_mesh_output_slab_tail(slab)
-        if self._mesh_output_append_slab_id is None or int(slab.append_offset) < int(slab.size_bytes):
-            self._mesh_output_append_slab_id = slab.slab_id
 
     def _retain_chunk_mesh_storage(self, mesh: ChunkMesh) -> None:
         if mesh.allocation_id is None:
@@ -4014,7 +3947,6 @@ class TerrainRenderer:
     ) -> None:
         if (
             self.voxel_mesh_count_pipeline is None
-            or self.voxel_mesh_scan_pipeline is None
             or self.voxel_mesh_emit_pipeline is None
         ):
             raise RuntimeError("GPU meshing pipeline is unavailable.")
@@ -4039,34 +3971,22 @@ class TerrainRenderer:
             int(CHUNK_SIZE),
         )
 
-        resources.coords_array[:chunk_count] = chunk_coords_list
         if not params_already_uploaded:
             self.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
-        self.device.queue.write_buffer(resources.coords_buffer, 0, memoryview(resources.coords_array[:chunk_count]))
         self.device.queue.write_buffer(resources.chunk_totals_buffer, 0, memoryview(zero_view))
 
         if encoder is None:
             encoder = self.device.create_command_encoder()
-
         compute_pass = encoder.begin_compute_pass()
         compute_pass.set_pipeline(self.voxel_mesh_count_pipeline)
         compute_pass.set_bind_group(0, count_bind_group)
         compute_pass.dispatch_workgroups(columns_per_side, columns_per_side, chunk_count)
         compute_pass.end()
-
-        compute_pass = encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self.voxel_mesh_scan_pipeline)
-        compute_pass.set_bind_group(0, count_bind_group)
-        compute_pass.dispatch_workgroups(1, 1, chunk_count)
-        compute_pass.end()
-
-        totals_nbytes = chunk_count * 4
-        encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, totals_nbytes)
-        encoder.copy_buffer_to_buffer(resources.chunk_offsets_buffer, 0, resources.readback_buffer, totals_nbytes, totals_nbytes)
+        encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, chunk_count * 4)
         if submit:
             self.device.queue.submit([encoder.finish()])
 
-        metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 8)
+        metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 4)
         self._pending_gpu_mesh_batches.append(
             PendingChunkMeshBatch(
                 chunk_coords=chunk_coords_list,
@@ -4394,12 +4314,10 @@ class TerrainRenderer:
             materials_buffer = dedicated["materials"]
             self.device.queue.write_buffer(blocks_buffer, 0, memoryview(blocks[:chunk_count]))
             self.device.queue.write_buffer(materials_buffer, 0, memoryview(materials[:chunk_count]))
-            resources = self._create_async_voxel_mesh_batch_resources(sample_size, height_limit, chunk_count)
-            self.device.queue.write_buffer(resources.blocks_buffer, 0, memoryview(blocks[:chunk_count]))
-            self.device.queue.write_buffer(resources.materials_buffer, 0, memoryview(materials[:chunk_count]))
             self._enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
                 chunk_coords_list,
-                resources,
+                blocks_buffer,
+                materials_buffer,
                 sample_size,
                 height_limit,
             )
