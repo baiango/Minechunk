@@ -7,6 +7,7 @@ import subprocess
 import struct
 import time
 import sys
+from pathlib import Path
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 
@@ -1185,9 +1186,12 @@ _HUD_FONT_FALLBACK: dict[str, tuple[str, ...]] = {
 
 
 def _find_hud_font_path() -> str | None:
+    bundled_font = Path(__file__).resolve().with_name("res") / "Roboto-VariableFont_wdth,wght.ttf"
+    if os.path.exists(bundled_font):
+        return str(bundled_font)
     try:
         font_path = subprocess.check_output(
-            ["fc-match", "-f", "%{file}\n", "Menlo:style=Regular"],
+            ["fc-match", "-f", "%{file}\n", "Roboto:style=Regular"],
             text=True,
         ).strip()
         if font_path and os.path.exists(font_path):
@@ -1195,8 +1199,10 @@ def _find_hud_font_path() -> str | None:
     except Exception:
         pass
     for candidate in (
-        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Supplemental/Roboto Regular.ttf",
+        "/Library/Fonts/Roboto Regular.ttf",
         "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
     ):
         if os.path.exists(candidate):
             return candidate
