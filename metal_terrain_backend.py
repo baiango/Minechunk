@@ -194,6 +194,10 @@ class _ChunkGpuBatch:
     bind_group: object
 
 
+class _LeasedChunkSurfaceGpuBatch(ChunkSurfaceGpuBatch):
+    pass
+
+
 class MetalTerrainBackend:
     def __init__(self, device, seed: int, chunk_size: int, height_limit: int, chunks_per_poll: int = 128) -> None:
         if wgpu is None:
@@ -239,6 +243,7 @@ class MetalTerrainBackend:
         self._max_in_flight_batches = self._batch_pool_size
         self._available_batch_slots: deque[_ChunkGpuBatch] = deque()
         self._batch_slots_pending_reuse: deque[_ChunkGpuBatch] = deque()
+        self._leased_surface_batches: dict[int, _ChunkGpuBatch] = {}
         self._bind_group_layout = device.create_bind_group_layout(
             entries=[
                 {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
@@ -400,6 +405,12 @@ class MetalTerrainBackend:
             batch.chunks.clear()
             self._available_batch_slots.append(batch)
 
+    def _release_gpu_surface_batch(self, lease_id: int) -> None:
+        batch = self._leased_surface_batches.pop(int(lease_id), None)
+        if batch is None:
+            return
+        self._batch_slots_pending_reuse.append(batch)
+
     @profile
     def _create_chunk_batch(self, chunks: list[tuple[int, int]]) -> "_ChunkGpuBatch":
         chunk_count = len(chunks)
@@ -501,16 +512,21 @@ class MetalTerrainBackend:
         self._reclaim_batch_slots()
         while self._in_flight_batches:
             completed_batch = self._in_flight_batches.popleft()
-            ready.append(
-                ChunkSurfaceGpuBatch(
-                    chunks=list(completed_batch.chunks),
-                    heights_buffer=completed_batch.heights_buffer,
-                    materials_buffer=completed_batch.materials_buffer,
-                    cell_count=self.cell_count,
-                    source="gpu",
-                )
+            lease_id = id(completed_batch)
+            self._leased_surface_batches[lease_id] = completed_batch
+
+            def _release(lease_id: int = lease_id, backend: "MetalTerrainBackend" = self) -> None:
+                backend._release_gpu_surface_batch(lease_id)
+
+            surface_batch = _LeasedChunkSurfaceGpuBatch(
+                chunks=list(completed_batch.chunks),
+                heights_buffer=completed_batch.heights_buffer,
+                materials_buffer=completed_batch.materials_buffer,
+                cell_count=self.cell_count,
+                source="gpu_leased",
             )
-            self._batch_slots_pending_reuse.append(completed_batch)
+            setattr(surface_batch, "_release_callback", _release)
+            ready.append(surface_batch)
 
         self._submit_next_batch()
         return ready

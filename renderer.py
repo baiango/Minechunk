@@ -1777,6 +1777,7 @@ class TerrainRenderer:
         self._pending_gpu_mesh_batches: deque[PendingChunkMeshBatch] = deque()
         self._gpu_mesh_deferred_buffer_cleanup: deque[tuple[int, list[wgpu.GPUBuffer]]] = deque()
         self._gpu_mesh_deferred_batch_resource_releases: deque[tuple[int, AsyncVoxelMeshBatchResources]] = deque()
+        self._gpu_mesh_deferred_surface_batch_releases: deque[tuple[int, list[object]]] = deque()
         self._async_voxel_mesh_batch_pool: deque[AsyncVoxelMeshBatchResources] = deque()
         self._async_voxel_mesh_batch_pool_limit = 8
         self._gpu_mesh_async_finalize_budget = max(1, self.mesh_batch_size)
@@ -4028,6 +4029,22 @@ class TerrainRenderer:
                     next_resource_queue.append((frames_left, resources))
             self._gpu_mesh_deferred_batch_resource_releases = next_resource_queue
 
+        if self._gpu_mesh_deferred_surface_batch_releases:
+            next_surface_release_queue: deque[tuple[int, list[object]]] = deque()
+            while self._gpu_mesh_deferred_surface_batch_releases:
+                frames_left, callbacks = self._gpu_mesh_deferred_surface_batch_releases.popleft()
+                frames_left -= 1
+                if frames_left <= 0:
+                    for callback in callbacks:
+                        if callable(callback):
+                            try:
+                                callback()
+                            except Exception:
+                                pass
+                else:
+                    next_surface_release_queue.append((frames_left, callbacks))
+            self._gpu_mesh_deferred_surface_batch_releases = next_surface_release_queue
+
     def _get_voxel_surface_expand_bind_group(
         self,
         surface_batch: ChunkSurfaceGpuBatch,
@@ -4035,7 +4052,6 @@ class TerrainRenderer:
         materials_buffer,
         params_buffer,
     ) -> object:
-        is_owned_surface_batch = str(getattr(surface_batch, "source", "")).startswith("gpu_owned")
         cache_key = (
             id(surface_batch.heights_buffer),
             id(surface_batch.materials_buffer),
@@ -4043,11 +4059,10 @@ class TerrainRenderer:
             id(materials_buffer),
             id(params_buffer),
         )
-        if not is_owned_surface_batch:
-            bind_group = self._voxel_surface_expand_bind_group_cache.get(cache_key)
-            if bind_group is not None:
-                self._voxel_surface_expand_bind_group_cache.move_to_end(cache_key)
-                return bind_group
+        bind_group = self._voxel_surface_expand_bind_group_cache.get(cache_key)
+        if bind_group is not None:
+            self._voxel_surface_expand_bind_group_cache.move_to_end(cache_key)
+            return bind_group
 
         bind_group = self.device.create_bind_group(
             layout=self.voxel_surface_expand_bind_group_layout,
@@ -4059,51 +4074,31 @@ class TerrainRenderer:
                 {"binding": 4, "resource": {"buffer": params_buffer, "offset": 0, "size": 16}},
             ],
         )
-        if is_owned_surface_batch:
-            return bind_group
         self._voxel_surface_expand_bind_group_cache[cache_key] = bind_group
         while len(self._voxel_surface_expand_bind_group_cache) > 64:
             self._voxel_surface_expand_bind_group_cache.popitem(last=False)
         return bind_group
 
-    def _clone_surface_gpu_batches_for_meshing(
+    def _schedule_surface_gpu_batch_release(
         self,
-        surface_batches: list[ChunkSurfaceGpuBatch],
-    ) -> list[ChunkSurfaceGpuBatch]:
-        owned_batches: list[ChunkSurfaceGpuBatch] = []
-        if not surface_batches:
-            return owned_batches
+        callbacks: list[object],
+        frames: int = 2,
+    ) -> None:
+        active_callbacks = [callback for callback in callbacks if callable(callback)]
+        if active_callbacks:
+            self._gpu_mesh_deferred_surface_batch_releases.append((max(1, int(frames)), active_callbacks))
 
-        encoder = self.device.create_command_encoder()
-        copied_any = False
-        for surface_batch in surface_batches:
-            chunk_count = len(surface_batch.chunks)
-            if chunk_count <= 0:
-                continue
-            copy_nbytes = int(chunk_count) * int(surface_batch.cell_count) * 4
-            owned_heights_buffer = self.device.create_buffer(
-                size=max(4, copy_nbytes),
-                usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
-            )
-            owned_materials_buffer = self.device.create_buffer(
-                size=max(4, copy_nbytes),
-                usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
-            )
-            encoder.copy_buffer_to_buffer(surface_batch.heights_buffer, 0, owned_heights_buffer, 0, copy_nbytes)
-            encoder.copy_buffer_to_buffer(surface_batch.materials_buffer, 0, owned_materials_buffer, 0, copy_nbytes)
-            copied_any = True
-            owned_batches.append(
-                ChunkSurfaceGpuBatch(
-                    chunks=list(surface_batch.chunks),
-                    heights_buffer=owned_heights_buffer,
-                    materials_buffer=owned_materials_buffer,
-                    cell_count=int(surface_batch.cell_count),
-                    source="gpu_owned",
-                )
-            )
-        if copied_any:
-            self.device.queue.submit([encoder.finish()])
-        return owned_batches
+    def _release_surface_gpu_batch_immediately(self, surface_batch: ChunkSurfaceGpuBatch) -> None:
+        callback = getattr(surface_batch, "_release_callback", None)
+        if not callable(callback):
+            return
+        try:
+            callback()
+        finally:
+            try:
+                setattr(surface_batch, "_release_callback", None)
+            except Exception:
+                pass
 
     def _pending_surface_gpu_batches_chunk_count(self) -> int:
         return sum(len(batch.chunks) for batch in self._pending_surface_gpu_batches)
@@ -4114,12 +4109,9 @@ class TerrainRenderer:
     ) -> None:
         if not surface_batches:
             return
-        owned_batches = self._clone_surface_gpu_batches_for_meshing(surface_batches)
-        if not owned_batches:
-            return
         if not self._pending_surface_gpu_batches:
             self._pending_surface_gpu_batches_first_enqueued_at = time.perf_counter()
-        self._pending_surface_gpu_batches.extend(owned_batches)
+        self._pending_surface_gpu_batches.extend(surface_batches)
 
     def _drain_pending_surface_gpu_batches_to_meshing(self) -> None:
         if not self._pending_surface_gpu_batches:
@@ -4238,7 +4230,7 @@ class TerrainRenderer:
         height_limit = WORLD_HEIGHT
         workgroups = (sample_size + 7) // 8
         columns_per_side = sample_size - 2
-        prepared_batches: list[tuple[list[tuple[int, int]], int, AsyncVoxelMeshBatchResources, object]] = []
+        prepared_batches: list[tuple[list[tuple[int, int]], int, AsyncVoxelMeshBatchResources, ChunkSurfaceGpuBatch, object]] = []
 
         for surface_batch in surface_batches:
             if not surface_batch.chunks:
@@ -4265,7 +4257,7 @@ class TerrainRenderer:
                 resources.materials_buffer,
                 resources.params_buffer,
             )
-            prepared_batches.append((chunk_coords, chunk_count, resources, expand_bind_group))
+            prepared_batches.append((chunk_coords, chunk_count, resources, surface_batch, expand_bind_group))
 
         if not prepared_batches:
             return
@@ -4273,14 +4265,14 @@ class TerrainRenderer:
         encoder = self.device.create_command_encoder()
         expand_pass = encoder.begin_compute_pass()
         expand_pass.set_pipeline(self.voxel_surface_expand_pipeline)
-        for _, chunk_count, _, expand_bind_group in prepared_batches:
+        for _, chunk_count, _, _, expand_bind_group in prepared_batches:
             expand_pass.set_bind_group(0, expand_bind_group)
             expand_pass.dispatch_workgroups(workgroups, workgroups, chunk_count * height_limit)
         expand_pass.end()
 
         count_pass = encoder.begin_compute_pass()
         count_pass.set_pipeline(self.voxel_mesh_count_pipeline)
-        for _, chunk_count, resources, _ in prepared_batches:
+        for _, chunk_count, resources, _, _ in prepared_batches:
             count_bind_group = resources.count_bind_group
             assert count_bind_group is not None
             count_pass.set_bind_group(0, count_bind_group)
@@ -4293,7 +4285,7 @@ class TerrainRenderer:
         shared_offsets: list[int] = []
 
         if len(prepared_batches) > 1:
-            total_readback_nbytes = sum(chunk_count * 4 for _, chunk_count, _, _ in prepared_batches)
+            total_readback_nbytes = sum(chunk_count * 4 for _, chunk_count, _, _, _ in prepared_batches)
             readback_buffer = self.device.create_buffer(
                 size=max(4, int(total_readback_nbytes)),
                 usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
@@ -4304,32 +4296,38 @@ class TerrainRenderer:
                 remaining_batches=len(prepared_batches),
             )
             readback_offset = 0
-            for _, chunk_count, resources, _ in prepared_batches:
+            for _, chunk_count, resources, _, _ in prepared_batches:
                 totals_nbytes = chunk_count * 4
                 shared_offsets.append(readback_offset)
                 encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, readback_buffer, readback_offset, totals_nbytes)
                 readback_offset += totals_nbytes
         else:
-            for _, chunk_count, resources, _ in prepared_batches:
+            for _, chunk_count, resources, _, _ in prepared_batches:
                 totals_nbytes = chunk_count * 4
                 shared_offsets.append(0)
                 encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, totals_nbytes)
 
         self.device.queue.submit([encoder.finish()])
 
+        release_callbacks = [getattr(surface_batch, "_release_callback", None) for _, _, _, surface_batch, _ in prepared_batches]
+        self._schedule_surface_gpu_batch_release(release_callbacks, frames=2)
+        for _, _, _, surface_batch, _ in prepared_batches:
+            if hasattr(surface_batch, "_release_callback"):
+                try:
+                    setattr(surface_batch, "_release_callback", None)
+                except Exception:
+                    pass
+
         if readback_buffer is not None and readback_owner is not None:
             shared_metadata_promise = readback_buffer.map_async(wgpu.MapMode.READ, 0, readback_owner.total_nbytes)
 
-        for shared_offset, (chunk_coords, chunk_count, resources, surface_batch) in zip(shared_offsets, prepared_batches):
+        for shared_offset, (chunk_coords, chunk_count, resources, _surface_batch, _expand_bind_group) in zip(shared_offsets, prepared_batches):
             if readback_buffer is not None:
                 metadata_promise = shared_metadata_promise
                 pending_readback_buffer = readback_buffer
             else:
                 metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 4)
                 pending_readback_buffer = resources.readback_buffer
-            owned_surface_buffers = []
-            if str(getattr(surface_batch, "source", "")).startswith("gpu_owned"):
-                owned_surface_buffers = [surface_batch.heights_buffer, surface_batch.materials_buffer]
             self._pending_gpu_mesh_batches.append(
                 PendingChunkMeshBatch(
                     chunk_coords=chunk_coords,
@@ -4347,7 +4345,6 @@ class TerrainRenderer:
                     readback_buffer=pending_readback_buffer,
                     readback_offset=int(shared_offset),
                     readback_owner=readback_owner,
-                    owned_surface_buffers=owned_surface_buffers,
                     resources=resources,
                     metadata_promise=metadata_promise,
                     submitted_at=time.perf_counter(),
@@ -4482,12 +4479,6 @@ class TerrainRenderer:
                         )
                     )
 
-                if pending.owned_surface_buffers:
-                    for buffer in pending.owned_surface_buffers:
-                        try:
-                            buffer.destroy()
-                        except Exception:
-                            pass
                 if pending.resources is not None:
                     self._schedule_async_voxel_mesh_batch_resource_release(pending.resources, frames=2)
                 else:
