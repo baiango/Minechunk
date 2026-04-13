@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from ctypes.util import find_library
 
 import numpy as np
 import wgpu
@@ -1209,13 +1210,60 @@ def _find_hud_font_path() -> str | None:
     return None
 
 
+def _find_freetype_library_path() -> str | None:
+    candidates: list[str] = []
+
+    found = find_library("freetype")
+    if found:
+        candidates.append(found)
+
+    if sys.platform == "darwin":
+        candidates.extend(
+            [
+                "/opt/homebrew/opt/freetype/lib/libfreetype.dylib",
+                "/usr/local/opt/freetype/lib/libfreetype.dylib",
+                "/opt/homebrew/lib/libfreetype.dylib",
+                "/usr/local/lib/libfreetype.dylib",
+                "/usr/lib/libfreetype.dylib",
+            ]
+        )
+    elif sys.platform.startswith("linux"):
+        candidates.extend(
+            [
+                "/usr/lib/x86_64-linux-gnu/libfreetype.so.6",
+                "/usr/lib64/libfreetype.so.6",
+                "/usr/lib/libfreetype.so.6",
+                "/lib/x86_64-linux-gnu/libfreetype.so.6",
+                "/lib64/libfreetype.so.6",
+                "/lib/libfreetype.so.6",
+            ]
+        )
+    elif sys.platform.startswith("win"):
+        candidates.extend(
+            [
+                "libfreetype-6.dll",
+                "freetype.dll",
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    for candidate in candidates:
+        if candidate:
+            return candidate
+
+    return None
+
+
 def _build_hud_font_from_freetype() -> dict[str, tuple[str, ...]]:
     font_path = _find_hud_font_path()
     if not font_path:
         raise RuntimeError("No usable HUD font file found")
 
-    library_path = "/opt/homebrew/opt/freetype/lib/libfreetype.dylib"
-    if not os.path.exists(library_path):
+    library_path = _find_freetype_library_path()
+    if not library_path or not os.path.exists(library_path):
         raise RuntimeError("FreeType library not available")
 
     freetype = ctypes.CDLL(library_path)
