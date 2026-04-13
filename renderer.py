@@ -1762,6 +1762,7 @@ class TerrainRenderer:
         self._async_voxel_mesh_batch_pool: deque[AsyncVoxelMeshBatchResources] = deque()
         self._async_voxel_mesh_batch_pool_limit = 8
         self._gpu_mesh_async_finalize_budget = max(1, self.mesh_batch_size)
+        self._voxel_surface_expand_bind_group_cache: OrderedDict[tuple[int, int, int, int, int], object] = OrderedDict()
         self.profiling_enabled = False
         self.profiler: cProfile.Profile | None = None
         self.profile_window_start = 0.0
@@ -2853,6 +2854,7 @@ class TerrainRenderer:
         self._chunk_request_queue_origin = None
         self._chunk_request_queue_dirty = True
         self._pending_voxel_mesh_results.clear()
+        self._voxel_surface_expand_bind_group_cache.clear()
         while self._pending_gpu_mesh_batches:
             pending = self._pending_gpu_mesh_batches.popleft()
             if pending.readback_buffer.map_state != "unmapped":
@@ -3898,6 +3900,40 @@ class TerrainRenderer:
                     next_resource_queue.append((frames_left, resources))
             self._gpu_mesh_deferred_batch_resource_releases = next_resource_queue
 
+    def _get_voxel_surface_expand_bind_group(
+        self,
+        surface_batch: ChunkSurfaceGpuBatch,
+        blocks_buffer,
+        materials_buffer,
+        params_buffer,
+    ) -> object:
+        cache_key = (
+            id(surface_batch.heights_buffer),
+            id(surface_batch.materials_buffer),
+            id(blocks_buffer),
+            id(materials_buffer),
+            id(params_buffer),
+        )
+        bind_group = self._voxel_surface_expand_bind_group_cache.get(cache_key)
+        if bind_group is not None:
+            self._voxel_surface_expand_bind_group_cache.move_to_end(cache_key)
+            return bind_group
+
+        bind_group = self.device.create_bind_group(
+            layout=self.voxel_surface_expand_bind_group_layout,
+            entries=[
+                {"binding": 0, "resource": {"buffer": surface_batch.heights_buffer}},
+                {"binding": 1, "resource": {"buffer": surface_batch.materials_buffer}},
+                {"binding": 2, "resource": {"buffer": blocks_buffer}},
+                {"binding": 3, "resource": {"buffer": materials_buffer}},
+                {"binding": 4, "resource": {"buffer": params_buffer, "offset": 0, "size": 16}},
+            ],
+        )
+        self._voxel_surface_expand_bind_group_cache[cache_key] = bind_group
+        while len(self._voxel_surface_expand_bind_group_cache) > 64:
+            self._voxel_surface_expand_bind_group_cache.popitem(last=False)
+        return bind_group
+
     def _enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
         self,
         chunk_coords: list[tuple[int, int]],
@@ -3925,8 +3961,6 @@ class TerrainRenderer:
         count_bind_group = resources.count_bind_group
         assert count_bind_group is not None
 
-        coords_view = resources.coords_array[:chunk_count]
-        coords_view[:] = np.asarray(chunk_coords_list, dtype=np.int32)
         zero_view = resources.zero_counts_array[:chunk_count]
         zero_view.fill(0)
         params_bytes = struct.pack(
@@ -3937,10 +3971,9 @@ class TerrainRenderer:
             int(CHUNK_SIZE),
         )
 
-        self.device.queue.write_buffer(resources.coords_buffer, 0, memoryview(coords_view))
-        self.device.queue.write_buffer(resources.chunk_totals_buffer, 0, memoryview(zero_view))
         if not params_already_uploaded:
             self.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
+        self.device.queue.write_buffer(resources.chunk_totals_buffer, 0, memoryview(zero_view))
 
         if encoder is None:
             encoder = self.device.create_command_encoder()
@@ -3975,12 +4008,104 @@ class TerrainRenderer:
             )
         )
 
+    def _gpu_make_chunk_mesh_batches_from_surface_gpu_batches(
+        self,
+        surface_batches: list[ChunkSurfaceGpuBatch],
+    ) -> None:
+        if self.voxel_surface_expand_pipeline is None:
+            raise RuntimeError("GPU surface expansion pipeline is unavailable.")
+        if self.voxel_mesh_count_pipeline is None:
+            raise RuntimeError("GPU meshing pipeline is unavailable.")
+        if not surface_batches:
+            return
+
+        sample_size = CHUNK_SAMPLE_SIZE
+        height_limit = WORLD_HEIGHT
+        workgroups = (sample_size + 7) // 8
+        columns_per_side = sample_size - 2
+        prepared_batches: list[tuple[list[tuple[int, int]], int, AsyncVoxelMeshBatchResources, object, object]] = []
+
+        for surface_batch in surface_batches:
+            if not surface_batch.chunks:
+                continue
+            chunk_coords = surface_batch.chunks if isinstance(surface_batch.chunks, list) else list(surface_batch.chunks)
+            chunk_count = len(chunk_coords)
+            resources = self._acquire_async_voxel_mesh_batch_resources(sample_size, height_limit, chunk_count)
+            params_bytes = struct.pack(
+                "<4I",
+                int(sample_size),
+                int(height_limit),
+                int(chunk_count),
+                int(CHUNK_SIZE),
+            )
+            zero_view = resources.zero_counts_array[:chunk_count]
+            zero_view.fill(0)
+            self.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
+            self.device.queue.write_buffer(resources.chunk_totals_buffer, 0, memoryview(zero_view))
+            expand_bind_group = self._get_voxel_surface_expand_bind_group(
+                surface_batch,
+                resources.blocks_buffer,
+                resources.materials_buffer,
+                resources.params_buffer,
+            )
+            count_bind_group = resources.count_bind_group
+            assert count_bind_group is not None
+            prepared_batches.append((chunk_coords, chunk_count, resources, expand_bind_group, count_bind_group))
+
+        if not prepared_batches:
+            return
+
+        encoder = self.device.create_command_encoder()
+        expand_pass = encoder.begin_compute_pass()
+        expand_pass.set_pipeline(self.voxel_surface_expand_pipeline)
+        for _, chunk_count, resources, expand_bind_group, _ in prepared_batches:
+            expand_pass.set_bind_group(0, expand_bind_group)
+            expand_pass.dispatch_workgroups(workgroups, workgroups, chunk_count * height_limit)
+        expand_pass.end()
+
+        count_pass = encoder.begin_compute_pass()
+        count_pass.set_pipeline(self.voxel_mesh_count_pipeline)
+        for _, chunk_count, resources, _, count_bind_group in prepared_batches:
+            count_pass.set_bind_group(0, count_bind_group)
+            count_pass.dispatch_workgroups(columns_per_side, columns_per_side, chunk_count)
+        count_pass.end()
+
+        for _, chunk_count, resources, _, _ in prepared_batches:
+            encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, chunk_count * 4)
+
+        self.device.queue.submit([encoder.finish()])
+
+        for chunk_coords, chunk_count, resources, _, _ in prepared_batches:
+            metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 4)
+            self._pending_gpu_mesh_batches.append(
+                PendingChunkMeshBatch(
+                    chunk_coords=chunk_coords,
+                    chunk_count=chunk_count,
+                    sample_size=int(sample_size),
+                    height_limit=int(height_limit),
+                    columns_per_side=int(columns_per_side),
+                    blocks_buffer=resources.blocks_buffer,
+                    materials_buffer=resources.materials_buffer,
+                    coords_buffer=resources.coords_buffer,
+                    column_totals_buffer=resources.column_totals_buffer,
+                    chunk_totals_buffer=resources.chunk_totals_buffer,
+                    chunk_offsets_buffer=resources.chunk_offsets_buffer,
+                    params_buffer=resources.params_buffer,
+                    readback_buffer=resources.readback_buffer,
+                    resources=resources,
+                    metadata_promise=metadata_promise,
+                    submitted_at=time.perf_counter(),
+                )
+            )
+
     def _finalize_pending_gpu_mesh_batches(self, budget: int | None = None) -> int:
         if not self._pending_gpu_mesh_batches:
             return 0
         budget = max(1, int(self._gpu_mesh_async_finalize_budget if budget is None else budget))
         completed = 0
         remaining: deque[PendingChunkMeshBatch] = deque()
+        ready_batches: list[tuple[PendingChunkMeshBatch, np.ndarray, np.ndarray, MeshBufferAllocation, object]] = []
+
         while self._pending_gpu_mesh_batches:
             pending = self._pending_gpu_mesh_batches.popleft()
             if pending.readback_buffer.map_state != "mapped" or completed >= budget:
@@ -3998,6 +4123,9 @@ class TerrainRenderer:
             if pending.chunk_count > 0:
                 np.cumsum(chunk_totals, dtype=np.uint32, out=chunk_offsets)
                 chunk_offsets -= chunk_totals
+
+            coords_array = np.asarray(pending.chunk_coords, dtype=np.int32).reshape(-1, 2)
+            self.device.queue.write_buffer(pending.coords_buffer, 0, memoryview(coords_array))
             self.device.queue.write_buffer(pending.chunk_offsets_buffer, 0, memoryview(chunk_offsets))
 
             total_vertices = int(chunk_totals.sum(dtype=np.uint64))
@@ -4023,46 +4151,52 @@ class TerrainRenderer:
                     {"binding": 8, "resource": {"buffer": pending.params_buffer, "offset": 0, "size": 16}},
                 ],
             )
+            ready_batches.append((pending, chunk_totals, chunk_offsets, batch_allocation, emit_bind_group))
+            completed += 1
+
+        if ready_batches:
             encoder = self.device.create_command_encoder()
             compute_pass = encoder.begin_compute_pass()
             compute_pass.set_pipeline(self.voxel_mesh_emit_pipeline)
-            compute_pass.set_bind_group(0, emit_bind_group)
-            compute_pass.dispatch_workgroups(pending.columns_per_side, pending.columns_per_side, pending.chunk_count)
+            for pending, _, _, _, emit_bind_group in ready_batches:
+                compute_pass.set_bind_group(0, emit_bind_group)
+                compute_pass.dispatch_workgroups(pending.columns_per_side, pending.columns_per_side, pending.chunk_count)
             compute_pass.end()
             self.device.queue.submit([encoder.finish()])
 
             created_at = time.perf_counter()
-            for chunk_index, (chunk_x, chunk_z) in enumerate(pending.chunk_coords):
-                self._store_chunk_mesh(
-                    ChunkMesh(
-                        chunk_x=int(chunk_x),
-                        chunk_z=int(chunk_z),
-                        vertex_count=int(chunk_totals[chunk_index]),
-                        vertex_buffer=batch_allocation.buffer,
-                        vertex_offset=batch_allocation.offset_bytes + int(chunk_offsets[chunk_index]) * VERTEX_STRIDE,
-                        max_height=pending.height_limit,
-                        created_at=created_at,
-                        allocation_id=batch_allocation.allocation_id,
+            for pending, chunk_totals, chunk_offsets, batch_allocation, _ in ready_batches:
+                for chunk_index, (chunk_x, chunk_z) in enumerate(pending.chunk_coords):
+                    self._store_chunk_mesh(
+                        ChunkMesh(
+                            chunk_x=int(chunk_x),
+                            chunk_z=int(chunk_z),
+                            vertex_count=int(chunk_totals[chunk_index]),
+                            vertex_buffer=batch_allocation.buffer,
+                            vertex_offset=batch_allocation.offset_bytes + int(chunk_offsets[chunk_index]) * VERTEX_STRIDE,
+                            max_height=pending.height_limit,
+                            created_at=created_at,
+                            allocation_id=batch_allocation.allocation_id,
+                        )
                     )
-                )
 
-            if pending.resources is not None:
-                self._schedule_async_voxel_mesh_batch_resource_release(pending.resources, frames=2)
-            else:
-                self._schedule_gpu_buffer_cleanup(
-                    [
-                        pending.blocks_buffer,
-                        pending.materials_buffer,
-                        pending.coords_buffer,
-                        pending.column_totals_buffer,
-                        pending.chunk_totals_buffer,
-                        pending.chunk_offsets_buffer,
-                        pending.params_buffer,
-                        pending.readback_buffer,
-                    ],
-                    frames=2,
-                )
-            completed += 1
+                if pending.resources is not None:
+                    self._schedule_async_voxel_mesh_batch_resource_release(pending.resources, frames=2)
+                else:
+                    self._schedule_gpu_buffer_cleanup(
+                        [
+                            pending.blocks_buffer,
+                            pending.materials_buffer,
+                            pending.coords_buffer,
+                            pending.column_totals_buffer,
+                            pending.chunk_totals_buffer,
+                            pending.chunk_offsets_buffer,
+                            pending.params_buffer,
+                            pending.readback_buffer,
+                        ],
+                        frames=2,
+                    )
+
         self._pending_gpu_mesh_batches = remaining
         return completed
 
@@ -4252,7 +4386,9 @@ class TerrainRenderer:
         )
 
         chunk_totals[:chunk_count].fill(0)
+        chunk_offsets[:chunk_count].fill(0)
         self.device.queue.write_buffer(chunk_totals_buffer, 0, memoryview(chunk_totals[:chunk_count]))
+        self.device.queue.write_buffer(chunk_offsets_buffer, 0, memoryview(chunk_offsets[:chunk_count]))
 
         shared_entries = [
             {"binding": 0, "resource": {"buffer": blocks_buffer}},
@@ -4368,6 +4504,10 @@ class TerrainRenderer:
         if not surface_batch.chunks:
             return []
 
+        if defer_finalize:
+            self._gpu_make_chunk_mesh_batches_from_surface_gpu_batches([surface_batch])
+            return []
+
         chunk_coords = surface_batch.chunks if isinstance(surface_batch.chunks, list) else list(surface_batch.chunks)
         chunk_count = len(chunk_coords)
         sample_size = CHUNK_SAMPLE_SIZE
@@ -4379,31 +4519,20 @@ class TerrainRenderer:
             int(chunk_count),
             int(CHUNK_SIZE),
         )
-        async_resources: AsyncVoxelMeshBatchResources | None = None
-        if defer_finalize:
-            async_resources = self._acquire_async_voxel_mesh_batch_resources(sample_size, height_limit, chunk_count)
-            blocks_buffer = async_resources.blocks_buffer
-            materials_buffer = async_resources.materials_buffer
-            params_buffer = async_resources.params_buffer
-        else:
-            self._ensure_voxel_mesh_batch_scratch(sample_size, height_limit, chunk_count)
-            blocks_buffer = self._voxel_mesh_scratch_blocks_buffer
-            materials_buffer = self._voxel_mesh_scratch_materials_buffer
-            params_buffer = self._voxel_mesh_scratch_params_buffer
+        self._ensure_voxel_mesh_batch_scratch(sample_size, height_limit, chunk_count)
+        blocks_buffer = self._voxel_mesh_scratch_blocks_buffer
+        materials_buffer = self._voxel_mesh_scratch_materials_buffer
+        params_buffer = self._voxel_mesh_scratch_params_buffer
         assert blocks_buffer is not None
         assert materials_buffer is not None
         assert params_buffer is not None
 
         self.device.queue.write_buffer(params_buffer, 0, params_bytes)
-        expand_bind_group = self.device.create_bind_group(
-            layout=self.voxel_surface_expand_bind_group_layout,
-            entries=[
-                {"binding": 0, "resource": {"buffer": surface_batch.heights_buffer}},
-                {"binding": 1, "resource": {"buffer": surface_batch.materials_buffer}},
-                {"binding": 2, "resource": {"buffer": blocks_buffer}},
-                {"binding": 3, "resource": {"buffer": materials_buffer}},
-                {"binding": 4, "resource": {"buffer": params_buffer, "offset": 0, "size": 16}},
-            ],
+        expand_bind_group = self._get_voxel_surface_expand_bind_group(
+            surface_batch,
+            blocks_buffer,
+            materials_buffer,
+            params_buffer,
         )
         encoder = self.device.create_command_encoder()
         compute_pass = encoder.begin_compute_pass()
@@ -4412,20 +4541,6 @@ class TerrainRenderer:
         workgroups = (sample_size + 7) // 8
         compute_pass.dispatch_workgroups(workgroups, workgroups, chunk_count * height_limit)
         compute_pass.end()
-
-        if defer_finalize:
-            assert async_resources is not None
-            self._enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
-                chunk_coords,
-                async_resources,
-                sample_size,
-                height_limit,
-                params_already_uploaded=True,
-                encoder=encoder,
-                submit=True,
-            )
-            return []
-
         self.device.queue.submit([encoder.finish()])
 
         return self._gpu_make_chunk_mesh_batch_from_gpu_buffers(
@@ -4595,7 +4710,7 @@ class TerrainRenderer:
                 for batch in ready_surface_batches:
                     chunk_stream_drained += len(batch.chunks)
                     chunk_stream_bytes += float(batch.cell_count * 8 * len(batch.chunks))
-                    self._gpu_make_chunk_mesh_batch_from_surface_gpu_batch(batch, defer_finalize=True)
+                self._gpu_make_chunk_mesh_batches_from_surface_gpu_batches(ready_surface_batches)
             elif not using_gpu_terrain:
                 ready_results = self.world.poll_ready_chunk_voxel_batches()
                 chunk_stream_bytes = 0.0
