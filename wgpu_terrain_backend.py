@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 """
-This module is the dedicated GPU backend slot.
+This module is the dedicated wgpu backend slot.
 
 The current implementation uses the project’s existing GPU compute path
 as a placeholder. It is kept separate from the CPU backend so a future
-native Metal implementation can be swapped in without touching the
+backend-specific implementation can be swapped in without touching the
 renderer or world façade.
 """
 
@@ -198,7 +198,7 @@ class _LeasedChunkSurfaceGpuBatch(ChunkSurfaceGpuBatch):
     pass
 
 
-class MetalTerrainBackend:
+class WgpuTerrainBackend:
     def __init__(self, device, seed: int, chunk_size: int, height_limit: int, chunks_per_poll: int = 128) -> None:
         if wgpu is None:
             raise RuntimeError("wgpu is unavailable.")
@@ -525,7 +525,7 @@ class MetalTerrainBackend:
             lease_id = id(completed_batch)
             self._leased_surface_batches[lease_id] = completed_batch
 
-            def _release(lease_id: int = lease_id, backend: "MetalTerrainBackend" = self) -> None:
+            def _release(lease_id: int = lease_id, backend: "WgpuTerrainBackend" = self) -> None:
                 backend._release_gpu_surface_batch(lease_id)
 
             surface_batch = _LeasedChunkSurfaceGpuBatch(

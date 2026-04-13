@@ -6,7 +6,7 @@ import struct
 import numpy as np
 
 from cpu_terrain_backend import CpuTerrainBackend
-from metal_terrain_backend import MetalTerrainBackend
+from wgpu_terrain_backend import WgpuTerrainBackend
 from terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
 
 from terrain_kernels import (
@@ -304,7 +304,7 @@ class VoxelWorld:
         self._backend = CpuTerrainBackend(self.seed, self.height, self.chunk_size, chunks_per_poll=self.terrain_batch_size)
         if prefer_gpu_terrain and gpu_device is not None:
             try:
-                self._backend = MetalTerrainBackend(
+                self._backend = WgpuTerrainBackend(
                     gpu_device,
                     self.seed,
                     self.chunk_size,
