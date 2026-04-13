@@ -3779,14 +3779,14 @@ class TerrainRenderer:
             ),
             chunk_offsets_buffer=self.device.create_buffer(
                 size=max(1, chunk_totals_bytes),
-                usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
+                usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
             ),
             params_buffer=self.device.create_buffer(
                 size=16,
                 usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
             ),
             readback_buffer=self.device.create_buffer(
-                size=max(8, chunk_totals_bytes),
+                size=max(8, chunk_totals_bytes * 2),
                 usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
             ),
             coords_array=np.empty((chunk_capacity, 2), dtype=np.int32),
@@ -4015,7 +4015,7 @@ class TerrainRenderer:
     ) -> None:
         if self.voxel_surface_expand_pipeline is None:
             raise RuntimeError("GPU surface expansion pipeline is unavailable.")
-        if self.voxel_mesh_count_pipeline is None:
+        if self.voxel_mesh_count_pipeline is None or self.voxel_mesh_scan_pipeline is None:
             raise RuntimeError("GPU meshing pipeline is unavailable.")
         if not surface_batches:
             return
@@ -4041,7 +4041,9 @@ class TerrainRenderer:
             )
             zero_view = resources.zero_counts_array[:chunk_count]
             zero_view.fill(0)
+            resources.coords_array[:chunk_count] = chunk_coords
             self.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
+            self.device.queue.write_buffer(resources.coords_buffer, 0, memoryview(resources.coords_array[:chunk_count]))
             self.device.queue.write_buffer(resources.chunk_totals_buffer, 0, memoryview(zero_view))
             expand_bind_group = self._get_voxel_surface_expand_bind_group(
                 surface_batch,
@@ -4059,25 +4061,34 @@ class TerrainRenderer:
         encoder = self.device.create_command_encoder()
         expand_pass = encoder.begin_compute_pass()
         expand_pass.set_pipeline(self.voxel_surface_expand_pipeline)
-        for _, chunk_count, resources, expand_bind_group, _ in prepared_batches:
+        for _, chunk_count, _, expand_bind_group, _ in prepared_batches:
             expand_pass.set_bind_group(0, expand_bind_group)
             expand_pass.dispatch_workgroups(workgroups, workgroups, chunk_count * height_limit)
         expand_pass.end()
 
         count_pass = encoder.begin_compute_pass()
         count_pass.set_pipeline(self.voxel_mesh_count_pipeline)
-        for _, chunk_count, resources, _, count_bind_group in prepared_batches:
+        for _, chunk_count, _, _, count_bind_group in prepared_batches:
             count_pass.set_bind_group(0, count_bind_group)
             count_pass.dispatch_workgroups(columns_per_side, columns_per_side, chunk_count)
         count_pass.end()
 
+        scan_pass = encoder.begin_compute_pass()
+        scan_pass.set_pipeline(self.voxel_mesh_scan_pipeline)
+        for _, chunk_count, _, _, count_bind_group in prepared_batches:
+            scan_pass.set_bind_group(0, count_bind_group)
+            scan_pass.dispatch_workgroups(1, 1, chunk_count)
+        scan_pass.end()
+
         for _, chunk_count, resources, _, _ in prepared_batches:
-            encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, chunk_count * 4)
+            totals_nbytes = chunk_count * 4
+            encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, totals_nbytes)
+            encoder.copy_buffer_to_buffer(resources.chunk_offsets_buffer, 0, resources.readback_buffer, totals_nbytes, totals_nbytes)
 
         self.device.queue.submit([encoder.finish()])
 
         for chunk_coords, chunk_count, resources, _, _ in prepared_batches:
-            metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 4)
+            metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 8)
             self._pending_gpu_mesh_batches.append(
                 PendingChunkMeshBatch(
                     chunk_coords=chunk_coords,
@@ -4115,20 +4126,13 @@ class TerrainRenderer:
                 continue
 
             totals_nbytes = pending.chunk_count * 4
+            metadata_nbytes = totals_nbytes * 2
             try:
-                metadata_view = pending.readback_buffer.read_mapped(0, totals_nbytes, copy=False)
+                metadata_view = pending.readback_buffer.read_mapped(0, metadata_nbytes, copy=False)
                 chunk_totals = np.frombuffer(metadata_view, dtype=np.uint32, count=pending.chunk_count).copy()
+                chunk_offsets = np.frombuffer(metadata_view, dtype=np.uint32, count=pending.chunk_count, offset=totals_nbytes).copy()
             finally:
                 pending.readback_buffer.unmap()
-
-            chunk_offsets = np.empty(pending.chunk_count, dtype=np.uint32)
-            if pending.chunk_count > 0:
-                np.cumsum(chunk_totals, dtype=np.uint32, out=chunk_offsets)
-                chunk_offsets -= chunk_totals
-
-            coords_array = np.asarray(pending.chunk_coords, dtype=np.int32).reshape(-1, 2)
-            self.device.queue.write_buffer(pending.coords_buffer, 0, memoryview(coords_array))
-            self.device.queue.write_buffer(pending.chunk_offsets_buffer, 0, memoryview(chunk_offsets))
 
             total_vertices = int(chunk_totals.sum(dtype=np.uint64))
             total_vertex_bytes = total_vertices * VERTEX_STRIDE
