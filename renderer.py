@@ -46,7 +46,7 @@ CHUNK_PREP_REQUEST_BATCH_SIZE = 16
 CHUNK_PREP_REORDER_YAW_DELTA = math.radians(10.0)
 ENGINE_MODE_CPU = "cpu"
 ENGINE_MODE_GPU = "gpu"
-ENGINE_MODE = ENGINE_MODE_GPU
+ENGINE_MODE = ENGINE_MODE_CPU
 DEFAULT_RENDER_DISTANCE_BLOCKS = CHUNK_SIZE * 32
 MERGED_TILE_SIZE_CHUNKS = 4
 MERGED_TILE_MIN_AGE_SECONDS = 2.0
@@ -3104,6 +3104,9 @@ class TerrainRenderer:
         if queue_dirty:
             self._chunk_request_queue_dirty = True
 
+    def _store_chunk_mesh(self, mesh: ChunkMesh) -> None:
+        self._store_chunk_meshes([mesh])
+
     def _make_chunk_mesh_fast(
         self,
         *,
@@ -4841,15 +4844,12 @@ class TerrainRenderer:
             chunk_coords_list.append((chunk_x, chunk_z))
 
         if defer_finalize:
-            dedicated = self._create_dedicated_voxel_mesh_batch_buffers(sample_size, height_limit, chunk_count)
-            blocks_buffer = dedicated["blocks"]
-            materials_buffer = dedicated["materials"]
-            self.device.queue.write_buffer(blocks_buffer, 0, memoryview(blocks[:chunk_count]))
-            self.device.queue.write_buffer(materials_buffer, 0, memoryview(materials[:chunk_count]))
+            resources = self._acquire_async_voxel_mesh_batch_resources(sample_size, height_limit, chunk_count)
+            self.device.queue.write_buffer(resources.blocks_buffer, 0, memoryview(blocks[:chunk_count]))
+            self.device.queue.write_buffer(resources.materials_buffer, 0, memoryview(materials[:chunk_count]))
             self._enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
                 chunk_coords_list,
-                blocks_buffer,
-                materials_buffer,
+                resources,
                 sample_size,
                 height_limit,
             )
