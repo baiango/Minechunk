@@ -9,7 +9,7 @@ import struct
 import time
 import sys
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pstats import Stats
 
 import numpy as np
@@ -1619,6 +1619,7 @@ class AsyncVoxelMeshBatchResources:
     coords_array: np.ndarray
     zero_counts_array: np.ndarray
     count_bind_group: object | None = None
+    emit_bind_group_cache: dict[int, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -1733,9 +1734,9 @@ class TerrainRenderer:
         self._next_mesh_output_slab_id = 1
         self._mesh_output_append_slab_id: int | None = None
         self._next_mesh_allocation_id = 1
-        self._mesh_output_binding_alignment = max(
+        self._mesh_output_binding_alignment = math.lcm(
             VERTEX_STRIDE,
-            int(self._device_limit("min_storage_buffer_offset_alignment", 256)),
+            max(1, int(self._device_limit("min_storage_buffer_offset_alignment", 256))),
         )
         self._mesh_output_min_slab_bytes = max(
             MESH_OUTPUT_SLAB_MIN_BYTES,
@@ -3943,6 +3944,43 @@ class TerrainRenderer:
     ) -> None:
         self._gpu_mesh_deferred_batch_resource_releases.append((max(1, int(frames)), resources))
 
+    def _get_cached_async_voxel_mesh_emit_bind_group(
+        self,
+        resources: AsyncVoxelMeshBatchResources,
+        batch_allocation: MeshBufferAllocation,
+    ) -> object | None:
+        slab_id = batch_allocation.slab_id
+        if slab_id is None:
+            return None
+        slab = self._mesh_output_slabs.get(int(slab_id))
+        if slab is None:
+            return None
+        cached = resources.emit_bind_group_cache.get(int(slab_id))
+        if cached is not None:
+            return cached
+        bind_group = self.device.create_bind_group(
+            layout=self.voxel_mesh_emit_bind_group_layout,
+            entries=[
+                {"binding": 0, "resource": {"buffer": resources.blocks_buffer}},
+                {"binding": 1, "resource": {"buffer": resources.materials_buffer}},
+                {"binding": 2, "resource": {"buffer": resources.coords_buffer}},
+                {"binding": 3, "resource": {"buffer": resources.column_totals_buffer}},
+                {"binding": 4, "resource": {"buffer": resources.chunk_totals_buffer}},
+                {"binding": 5, "resource": {"buffer": resources.chunk_offsets_buffer}},
+                {
+                    "binding": 6,
+                    "resource": {
+                        "buffer": slab.buffer,
+                        "offset": 0,
+                        "size": max(1, int(slab.size_bytes)),
+                    },
+                },
+                {"binding": 8, "resource": {"buffer": resources.params_buffer, "offset": 0, "size": 16}},
+            ],
+        )
+        resources.emit_bind_group_cache[int(slab_id)] = bind_group
+        return bind_group
+
     def _schedule_gpu_buffer_cleanup(self, buffers: list[wgpu.GPUBuffer], frames: int = 2) -> None:
         if buffers:
             self._gpu_mesh_deferred_buffer_cleanup.append((max(1, int(frames)), list(buffers)))
@@ -4202,31 +4240,48 @@ class TerrainRenderer:
             if pending.chunk_count > 0:
                 np.cumsum(chunk_totals, dtype=np.uint32, out=chunk_offsets)
                 chunk_offsets -= chunk_totals
-                self.device.queue.write_buffer(pending.chunk_offsets_buffer, 0, memoryview(chunk_offsets))
 
             total_vertices = int(chunk_totals.sum(dtype=np.uint64))
             total_vertex_bytes = total_vertices * VERTEX_STRIDE
             batch_allocation = self._allocate_mesh_output_range(total_vertex_bytes)
-            emit_bind_group = self.device.create_bind_group(
-                layout=self.voxel_mesh_emit_bind_group_layout,
-                entries=[
-                    {"binding": 0, "resource": {"buffer": pending.blocks_buffer}},
-                    {"binding": 1, "resource": {"buffer": pending.materials_buffer}},
-                    {"binding": 2, "resource": {"buffer": pending.coords_buffer}},
-                    {"binding": 3, "resource": {"buffer": pending.column_totals_buffer}},
-                    {"binding": 4, "resource": {"buffer": pending.chunk_totals_buffer}},
-                    {"binding": 5, "resource": {"buffer": pending.chunk_offsets_buffer}},
-                    {
-                        "binding": 6,
-                        "resource": {
-                            "buffer": batch_allocation.buffer,
-                            "offset": batch_allocation.offset_bytes,
-                            "size": max(1, batch_allocation.size_bytes),
+
+            emit_chunk_offsets = chunk_offsets
+            emit_bind_group = None
+            resources = pending.resources
+            if (
+                resources is not None
+                and batch_allocation.offset_bytes % VERTEX_STRIDE == 0
+            ):
+                emit_bind_group = self._get_cached_async_voxel_mesh_emit_bind_group(resources, batch_allocation)
+                if emit_bind_group is not None:
+                    base_vertex = batch_allocation.offset_bytes // VERTEX_STRIDE
+                    if base_vertex != 0 and pending.chunk_count > 0:
+                        emit_chunk_offsets = chunk_offsets.copy()
+                        emit_chunk_offsets += np.uint32(base_vertex)
+
+            self.device.queue.write_buffer(pending.chunk_offsets_buffer, 0, memoryview(emit_chunk_offsets))
+
+            if emit_bind_group is None:
+                emit_bind_group = self.device.create_bind_group(
+                    layout=self.voxel_mesh_emit_bind_group_layout,
+                    entries=[
+                        {"binding": 0, "resource": {"buffer": pending.blocks_buffer}},
+                        {"binding": 1, "resource": {"buffer": pending.materials_buffer}},
+                        {"binding": 2, "resource": {"buffer": pending.coords_buffer}},
+                        {"binding": 3, "resource": {"buffer": pending.column_totals_buffer}},
+                        {"binding": 4, "resource": {"buffer": pending.chunk_totals_buffer}},
+                        {"binding": 5, "resource": {"buffer": pending.chunk_offsets_buffer}},
+                        {
+                            "binding": 6,
+                            "resource": {
+                                "buffer": batch_allocation.buffer,
+                                "offset": batch_allocation.offset_bytes,
+                                "size": max(1, batch_allocation.size_bytes),
+                            },
                         },
-                    },
-                    {"binding": 8, "resource": {"buffer": pending.params_buffer, "offset": 0, "size": 16}},
-                ],
-            )
+                        {"binding": 8, "resource": {"buffer": pending.params_buffer, "offset": 0, "size": 16}},
+                    ],
+                )
             ready_batches.append((pending, chunk_totals, chunk_offsets, batch_allocation, emit_bind_group))
             completed += 1
 
