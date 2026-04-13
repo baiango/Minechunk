@@ -239,8 +239,9 @@ class MetalTerrainBackend:
             int(self.height_limit),
             int(self.seed) & 0xFFFFFFFF,
         )
-        self._batch_pool_size = 3
-        self._max_in_flight_batches = self._batch_pool_size
+        self._submit_target_chunks = max(int(self.chunks_per_poll), min(int(self.chunks_per_poll) * 2, 128))
+        self._batch_pool_size = 6
+        self._max_in_flight_batches = 3
         self._available_batch_slots: deque[_ChunkGpuBatch] = deque()
         self._batch_slots_pending_reuse: deque[_ChunkGpuBatch] = deque()
         self._leased_surface_batches: dict[int, _ChunkGpuBatch] = {}
@@ -289,7 +290,9 @@ class MetalTerrainBackend:
             compute={"module": shader_module, "entry_point": "fill_chunk_surface_grids_main"},
         )
         for _ in range(self._batch_pool_size):
-            self._available_batch_slots.append(self._allocate_chunk_batch_resources(self.chunks_per_poll))
+            self._available_batch_slots.append(
+                self._allocate_chunk_batch_resources(self._submit_target_chunks)
+            )
 
     def _write_params(self, *, sample_origin_x: float, sample_origin_z: float, height_limit: int, chunk_x: int, chunk_z: int, sample_size: int, seed: int) -> None:
         payload = struct.pack(
@@ -414,12 +417,16 @@ class MetalTerrainBackend:
     @profile
     def _create_chunk_batch(self, chunks: list[tuple[int, int]]) -> "_ChunkGpuBatch":
         chunk_count = len(chunks)
+        target_capacity = max(int(self._submit_target_chunks), chunk_count)
+
         if self._available_batch_slots:
             batch = self._available_batch_slots.popleft()
+            if chunk_count > batch.max_chunks:
+                self._available_batch_slots.appendleft(batch)
+                batch = self._allocate_chunk_batch_resources(target_capacity)
         else:
-            batch = self._allocate_chunk_batch_resources(max(self.chunks_per_poll, chunk_count))
-        if chunk_count > batch.max_chunks:
-            batch = self._allocate_chunk_batch_resources(chunk_count)
+            batch = self._allocate_chunk_batch_resources(target_capacity)
+
         batch.chunk_count = chunk_count
         batch.chunks = list(chunks)
         if chunk_count > 0:
@@ -430,16 +437,19 @@ class MetalTerrainBackend:
     def _submit_next_batch(self) -> None:
         if not self._pending_jobs:
             return
+
         available_slots = max(0, self._max_in_flight_batches - len(self._in_flight_batches))
         if available_slots <= 0:
             return
 
+        target_chunks = self._submit_target_chunks
+
         submitted: list[_ChunkGpuBatch] = []
         while self._pending_jobs and available_slots > 0:
             merged: list[tuple[int, int]] = []
-            while self._pending_jobs and len(merged) < self.chunks_per_poll:
+            while self._pending_jobs and len(merged) < target_chunks:
                 job = self._pending_jobs.popleft()
-                take = min(self.chunks_per_poll - len(merged), len(job))
+                take = min(target_chunks - len(merged), len(job))
                 if take:
                     merged.extend(job[:take])
                 if take < len(job):
