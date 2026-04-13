@@ -4008,6 +4008,7 @@ class TerrainRenderer:
             )
         )
 
+    @profile
     def _gpu_make_chunk_mesh_batches_from_surface_gpu_batches(
         self,
         surface_batches: list[ChunkSurfaceGpuBatch],
@@ -4098,6 +4099,7 @@ class TerrainRenderer:
                 )
             )
 
+    @profile
     def _finalize_pending_gpu_mesh_batches(self, budget: int | None = None) -> int:
         if not self._pending_gpu_mesh_batches:
             return 0
@@ -4634,13 +4636,11 @@ class TerrainRenderer:
             return True
         if self._chunk_request_queue_origin != current_origin:
             return True
-        if self._visible_missing_coords and not self._chunk_request_queue:
-            return True
-        yaw_delta = abs(math.atan2(
-            math.sin(self.camera.yaw - self._chunk_request_queue_yaw),
-            math.cos(self.camera.yaw - self._chunk_request_queue_yaw),
-        ))
-        return yaw_delta >= CHUNK_PREP_REORDER_YAW_DELTA
+        # Do not rebuild just because camera yaw drifted. The queue already holds a
+        # priority-ordered snapshot, and stale entries are skipped lazily during pop.
+        # Re-sorting on every yaw threshold crossing can dominate chunk prep under
+        # rapid turning even though most queued coordinates are still valid enough.
+        return bool(self._visible_missing_coords) and not self._chunk_request_queue
 
     def _rebuild_chunk_request_queue(
         self,
