@@ -41,8 +41,8 @@ DEPTH_FORMAT = "depth24plus"
 CHUNK_PREP_RATE = 1000.0
 CHUNK_PREP_TOKEN_CAP = 500.0
 CHUNK_FORWARD_CONE_LATERAL_RATIO = 0.5
-CHUNK_PREP_REQUEST_BUDGET_CAP = 16
-CHUNK_PREP_REQUEST_BATCH_SIZE = 16
+CHUNK_PREP_REQUEST_BUDGET_CAP = 64
+CHUNK_PREP_REQUEST_BATCH_SIZE = 64
 CHUNK_PREP_REORDER_YAW_DELTA = math.radians(10.0)
 ENGINE_MODE_CPU = "cpu"
 ENGINE_MODE_GPU = "gpu"
@@ -52,7 +52,7 @@ MERGED_TILE_SIZE_CHUNKS = 4
 MERGED_TILE_MIN_AGE_SECONDS = 2.0
 MERGED_TILE_MAX_CHUNKS = MERGED_TILE_SIZE_CHUNKS * MERGED_TILE_SIZE_CHUNKS
 MAX_CACHED_CHUNKS = 4225
-DEFAULT_MESH_BATCH_SIZE = 128
+DEFAULT_MESH_BATCH_SIZE = 64
 MESH_OUTPUT_SLAB_MIN_BYTES = 16 * 1024 * 1024
 INDIRECT_DRAW_COMMAND_STRIDE = 16
 GPU_VISIBILITY_WORKGROUP_SIZE = 64
@@ -1571,6 +1571,7 @@ class MeshOutputSlab:
     buffer: wgpu.GPUBuffer
     size_bytes: int
     free_ranges: list[tuple[int, int]]
+    append_offset: int = 0
 
 
 @dataclass
@@ -1645,7 +1646,7 @@ class TerrainRenderer:
         seed: int = 1337,
         use_gpu_terrain: bool | None = None,
         use_gpu_meshing: bool | None = None,
-        terrain_batch_size: int = 32,
+        terrain_batch_size: int = 128,
         mesh_batch_size: int | None = None,
     ) -> None:
         default_use_gpu = ENGINE_MODE.lower() == ENGINE_MODE_GPU
@@ -1729,6 +1730,7 @@ class TerrainRenderer:
         self._mesh_output_slabs: OrderedDict[int, MeshOutputSlab] = OrderedDict()
         self._mesh_allocations: dict[int, MeshBufferAllocation] = {}
         self._next_mesh_output_slab_id = 1
+        self._mesh_output_append_slab_id: int | None = None
         self._next_mesh_allocation_id = 1
         self._mesh_output_binding_alignment = max(
             VERTEX_STRIDE,
@@ -2449,6 +2451,10 @@ class TerrainRenderer:
         largest_free_bytes = 0
         for slab in self._mesh_output_slabs.values():
             total_bytes += int(slab.size_bytes)
+            tail_free_bytes = max(0, int(slab.size_bytes) - int(slab.append_offset))
+            free_bytes += tail_free_bytes
+            if tail_free_bytes > largest_free_bytes:
+                largest_free_bytes = tail_free_bytes
             for _, size in slab.free_ranges:
                 size = int(size)
                 free_bytes += size
@@ -2626,13 +2632,48 @@ class TerrainRenderer:
                 usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
             ),
             size_bytes=int(size_bytes),
-            free_ranges=[(0, int(size_bytes))],
+            free_ranges=[],
+            append_offset=0,
         )
         self._next_mesh_output_slab_id += 1
         self._mesh_output_slabs[slab.slab_id] = slab
+        self._mesh_output_append_slab_id = slab.slab_id
         return slab
 
-    def _allocate_from_mesh_output_slab(
+    def _register_mesh_output_allocation(
+        self,
+        slab: MeshOutputSlab,
+        offset_bytes: int,
+        size_bytes: int,
+    ) -> MeshBufferAllocation:
+        allocation = MeshBufferAllocation(
+            allocation_id=self._next_mesh_allocation_id,
+            buffer=slab.buffer,
+            offset_bytes=int(offset_bytes),
+            size_bytes=int(size_bytes),
+            slab_id=slab.slab_id,
+            refcount=0,
+        )
+        self._next_mesh_allocation_id += 1
+        self._mesh_allocations[allocation.allocation_id] = allocation
+        self._mesh_output_slabs.move_to_end(slab.slab_id)
+        self._mesh_output_append_slab_id = slab.slab_id
+        return allocation
+
+    def _allocate_from_mesh_output_slab_bump(
+        self,
+        slab: MeshOutputSlab,
+        request_bytes: int,
+    ) -> MeshBufferAllocation | None:
+        needed_bytes = max(1, int(request_bytes))
+        aligned_offset = self._align_up(int(slab.append_offset), self._mesh_output_binding_alignment)
+        alloc_end = aligned_offset + needed_bytes
+        if alloc_end > int(slab.size_bytes):
+            return None
+        slab.append_offset = alloc_end
+        return self._register_mesh_output_allocation(slab, aligned_offset, needed_bytes)
+
+    def _allocate_from_mesh_output_slab_free_ranges(
         self,
         slab: MeshOutputSlab,
         request_bytes: int,
@@ -2654,30 +2695,40 @@ class TerrainRenderer:
             if tail_size > 0:
                 new_ranges.append((alloc_end, tail_size))
             slab.free_ranges[index:index + 1] = new_ranges
-
-            allocation = MeshBufferAllocation(
-                allocation_id=self._next_mesh_allocation_id,
-                buffer=slab.buffer,
-                offset_bytes=aligned_offset,
-                size_bytes=needed_bytes,
-                slab_id=slab.slab_id,
-                refcount=0,
-            )
-            self._next_mesh_allocation_id += 1
-            self._mesh_allocations[allocation.allocation_id] = allocation
-            return allocation
+            return self._register_mesh_output_allocation(slab, aligned_offset, needed_bytes)
         return None
+
+    def _allocate_from_mesh_output_slab(
+        self,
+        slab: MeshOutputSlab,
+        request_bytes: int,
+    ) -> MeshBufferAllocation | None:
+        allocation = self._allocate_from_mesh_output_slab_bump(slab, request_bytes)
+        if allocation is not None:
+            return allocation
+        return self._allocate_from_mesh_output_slab_free_ranges(slab, request_bytes)
 
     def _allocate_mesh_output_range(self, request_bytes: int) -> MeshBufferAllocation:
         needed_bytes = max(1, int(request_bytes))
         needed_bytes = self._align_up(needed_bytes, self._mesh_output_binding_alignment)
-        for slab in self._mesh_output_slabs.values():
-            allocation = self._allocate_from_mesh_output_slab(slab, needed_bytes)
+
+        append_slab = None
+        if self._mesh_output_append_slab_id is not None:
+            append_slab = self._mesh_output_slabs.get(self._mesh_output_append_slab_id)
+        if append_slab is not None:
+            allocation = self._allocate_from_mesh_output_slab_bump(append_slab, needed_bytes)
+            if allocation is not None:
+                return allocation
+
+        for slab_id, slab in list(self._mesh_output_slabs.items()):
+            if append_slab is not None and slab_id == append_slab.slab_id:
+                continue
+            allocation = self._allocate_from_mesh_output_slab_free_ranges(slab, needed_bytes)
             if allocation is not None:
                 return allocation
 
         slab = self._create_mesh_output_slab(self._mesh_output_slab_size_for_request(needed_bytes))
-        allocation = self._allocate_from_mesh_output_slab(slab, needed_bytes)
+        allocation = self._allocate_from_mesh_output_slab_bump(slab, needed_bytes)
         if allocation is None:
             raise RuntimeError("Failed to suballocate mesh output slab.")
         return allocation
@@ -2700,12 +2751,28 @@ class TerrainRenderer:
                 merged.append([offset, size])
         return [(offset, size) for offset, size in merged]
 
+    def _trim_mesh_output_slab_tail(self, slab: MeshOutputSlab) -> None:
+        tail_offset = int(slab.append_offset)
+        if tail_offset <= 0 or not slab.free_ranges:
+            return
+        while slab.free_ranges:
+            range_offset, range_size = slab.free_ranges[-1]
+            range_end = int(range_offset) + int(range_size)
+            if range_end != tail_offset:
+                break
+            tail_offset = int(range_offset)
+            slab.free_ranges.pop()
+        slab.append_offset = tail_offset
+
     def _free_mesh_output_range(self, slab_id: int, offset_bytes: int, size_bytes: int) -> None:
         slab = self._mesh_output_slabs.get(int(slab_id))
         if slab is None:
             return
         slab.free_ranges.append((int(offset_bytes), int(size_bytes)))
         slab.free_ranges = self._coalesce_mesh_output_free_ranges(slab.free_ranges)
+        self._trim_mesh_output_slab_tail(slab)
+        if self._mesh_output_append_slab_id is None or int(slab.append_offset) < int(slab.size_bytes):
+            self._mesh_output_append_slab_id = slab.slab_id
 
     def _retain_chunk_mesh_storage(self, mesh: ChunkMesh) -> None:
         if mesh.allocation_id is None:
@@ -4651,7 +4718,8 @@ class TerrainRenderer:
         camera_chunk_x: int,
         camera_chunk_z: int,
     ) -> None:
-        if not self._visible_missing_coords:
+        missing_coords = self._visible_missing_coords
+        if not missing_coords:
             self._chunk_request_queue.clear()
             self._chunk_request_queue_origin = (camera_chunk_x, camera_chunk_z)
             self._chunk_request_queue_yaw = self.camera.yaw
@@ -4660,9 +4728,19 @@ class TerrainRenderer:
 
         forward = flat_forward_vector(self.camera.yaw)
         right = right_vector(self.camera.yaw)
-        ordered = sorted(
-            self._visible_missing_coords,
-            key=lambda coord: self._chunk_prep_priority(
+        max_ring = max(0, int(self.chunk_radius))
+        front_rings: list[list[tuple[int, int]]] = [[] for _ in range(max_ring + 1)]
+        other_rings: list[list[tuple[int, int]]] = [[] for _ in range(max_ring + 1)]
+
+        for coord in self._visible_chunk_coords:
+            if coord not in missing_coords:
+                continue
+            dx = coord[0] - camera_chunk_x
+            dz = coord[1] - camera_chunk_z
+            ring = max(abs(dx), abs(dz))
+            if ring > max_ring:
+                ring = max_ring
+            if self._chunk_in_forward_cone(
                 coord[0],
                 coord[1],
                 camera_chunk_x,
@@ -4671,8 +4749,16 @@ class TerrainRenderer:
                 forward[2],
                 right[0],
                 right[2],
-            ),
-        )
+            ):
+                front_rings[ring].append(coord)
+            else:
+                other_rings[ring].append(coord)
+
+        ordered: list[tuple[int, int]] = []
+        for ring in range(max_ring + 1):
+            ordered.extend(front_rings[ring])
+            ordered.extend(other_rings[ring])
+
         self._chunk_request_queue = deque(ordered)
         self._chunk_request_queue_origin = (camera_chunk_x, camera_chunk_z)
         self._chunk_request_queue_yaw = self.camera.yaw

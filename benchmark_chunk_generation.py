@@ -1040,7 +1040,7 @@ def main() -> None:
     parser.add_argument("--isolation-radius", type=int, default=32, help="Radius to use for frame breakdown and isolation passes.")
     parser.add_argument("--isolation-frames", type=int, default=60, help="Timed frames per isolation mode.")
     parser.add_argument("--isolation-warmup", type=int, default=8, help="Warmup frames per isolation mode.")
-    parser.add_argument("--terrain-batch-size", type=int, default=4096, help="How many chunks to batch per terrain backend poll.")
+    parser.add_argument("--terrain-batch-size", type=int, default=128, help="How many chunks to batch per terrain backend poll.")
     parser.add_argument(
         "--terrain-batch-sizes",
         type=str,
@@ -1070,7 +1070,7 @@ def main() -> None:
         action="store_true",
         help="Stop after the terrain batch benchmark and skip the render-capacity sweep.",
     )
-    parser.add_argument("--mesh-batch-size", type=int, default=16, help="How many voxel chunks to batch per mesh build pass.")
+    parser.add_argument("--mesh-batch-size", type=int, default=64, help="How many voxel chunks to batch per mesh build pass.")
     parser.add_argument(
         "--skip-terrain-validation",
         action="store_true",

@@ -195,7 +195,7 @@ class _ChunkGpuBatch:
 
 
 class MetalTerrainBackend:
-    def __init__(self, device, seed: int, chunk_size: int, height_limit: int, chunks_per_poll: int = 64) -> None:
+    def __init__(self, device, seed: int, chunk_size: int, height_limit: int, chunks_per_poll: int = 128) -> None:
         if wgpu is None:
             raise RuntimeError("wgpu is unavailable.")
         self.device = device

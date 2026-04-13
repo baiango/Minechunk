@@ -30,7 +30,7 @@ class CpuTerrainBackend:
         seed: int = 1337,
         height: int = DEFAULT_WORLD_HEIGHT,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
-        chunks_per_poll: int = 8,
+        chunks_per_poll: int = 128,
     ) -> None:
         self.seed = int(seed)
         self.height = int(height)

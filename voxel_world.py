@@ -297,7 +297,7 @@ class VoxelWorld:
         *,
         gpu_device=None,
         prefer_gpu_terrain: bool = False,
-        terrain_batch_size: int = 512,
+        terrain_batch_size: int = 128,
     ) -> None:
         self.seed = int(seed)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
