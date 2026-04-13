@@ -1791,10 +1791,10 @@ class TerrainRenderer:
         self._pending_surface_gpu_batches: deque[ChunkSurfaceGpuBatch] = deque()
         self._pending_surface_gpu_batches_chunk_total = 0
         self._pending_surface_gpu_batch_age_seconds = 1.0 / 60.0
-        self._pending_surface_gpu_batch_target_chunks = max(self.mesh_batch_size, self.terrain_batch_size) * 8
+        self._pending_surface_gpu_batch_target_chunks = max(self.mesh_batch_size, self.terrain_batch_size) * 10
+        self._async_voxel_mesh_batch_pool_limit = 48
         self._gpu_mesh_async_inflight_limit = max(32, self.mesh_batch_size * 6)
         self._gpu_mesh_async_finalize_budget = max(1, self.mesh_batch_size * 2)
-        self._async_voxel_mesh_batch_pool_limit = 16
         self._pending_surface_gpu_batches_first_enqueued_at = 0.0
         self._pending_gpu_mesh_batches: deque[PendingChunkMeshBatch] = deque()
         self._gpu_mesh_deferred_buffer_cleanup: deque[tuple[int, list[wgpu.GPUBuffer]]] = deque()
@@ -3040,25 +3040,64 @@ class TerrainRenderer:
         else:
             self._mesh_buffer_refs[key] = refs - 1
 
-    def _store_chunk_mesh(self, mesh: ChunkMesh) -> None:
-        key = (mesh.chunk_x, mesh.chunk_z)
-        self._pending_chunk_coords.discard(key)
-        existing = self.chunk_cache.pop(key, None)
-        if existing is not None:
-            self._release_chunk_mesh_storage(existing)
-        self.chunk_cache[key] = mesh
-        self._retain_chunk_mesh_storage(mesh)
-        if key in self._visible_chunk_coord_set:
-            self._visible_displayed_coords.add(key)
-            self._visible_missing_coords.discard(key)
-        while len(self.chunk_cache) > self.max_cached_chunks:
-            old_key, old_mesh = self.chunk_cache.popitem(last=False)
-            self._release_chunk_mesh_storage(old_mesh)
-            if old_key in self._visible_chunk_coord_set:
-                self._visible_displayed_coords.discard(old_key)
-                if old_key not in self._pending_chunk_coords:
-                    self._visible_missing_coords.add(old_key)
-                    self._chunk_request_queue_dirty = True
+    def _store_chunk_meshes(self, meshes: list[ChunkMesh]) -> None:
+        if not meshes:
+            return
+
+        chunk_cache = self.chunk_cache
+        cache_get = chunk_cache.get
+        cache_move_to_end = chunk_cache.move_to_end
+        release_chunk_mesh_storage = self._release_chunk_mesh_storage
+        retain_chunk_mesh_storage = self._retain_chunk_mesh_storage
+        visible_chunk_coord_set = self._visible_chunk_coord_set
+
+        mesh_key_set: set[tuple[int, int]] = set()
+
+        for mesh in meshes:
+            key = (mesh.chunk_x, mesh.chunk_z)
+            mesh_key_set.add(key)
+
+            existing = cache_get(key)
+            if existing is mesh:
+                cache_move_to_end(key)
+                continue
+
+            if existing is not None:
+                release_chunk_mesh_storage(existing)
+
+            chunk_cache[key] = mesh
+            if existing is not None:
+                cache_move_to_end(key)
+            retain_chunk_mesh_storage(mesh)
+
+        pending_chunk_coords = self._pending_chunk_coords
+        pending_chunk_coords.difference_update(mesh_key_set)
+
+        visible_keys = mesh_key_set & visible_chunk_coord_set
+        if visible_keys:
+            self._visible_displayed_coords.update(visible_keys)
+            self._visible_missing_coords.difference_update(visible_keys)
+
+        max_cached_chunks = self.max_cached_chunks
+        if len(chunk_cache) <= max_cached_chunks:
+            return
+
+        visible_displayed_coords = self._visible_displayed_coords
+        visible_missing_coords = self._visible_missing_coords
+        pop_oldest = chunk_cache.popitem
+        queue_dirty = False
+
+        while len(chunk_cache) > max_cached_chunks:
+            old_key, old_mesh = pop_oldest(last=False)
+            release_chunk_mesh_storage(old_mesh)
+            if old_key in visible_chunk_coord_set:
+                visible_displayed_coords.discard(old_key)
+                if old_key not in pending_chunk_coords:
+                    visible_missing_coords.add(old_key)
+                    queue_dirty = True
+
+        if queue_dirty:
+            self._chunk_request_queue_dirty = True
 
     def _make_chunk_mesh_fast(
         self,
@@ -4558,6 +4597,8 @@ class TerrainRenderer:
             completed += 1
             self._release_pending_chunk_mesh_readback(pending)
 
+        meshes_to_store: list[ChunkMesh] = []
+
         if pending_infos:
             total_ready_vertex_bytes = sum(info[3] for info in pending_infos)
             shared_allocation = self._allocate_mesh_output_range(total_ready_vertex_bytes)
@@ -4625,7 +4666,7 @@ class TerrainRenderer:
             self.device.queue.submit([encoder.finish()])
 
             created_at = time.perf_counter()
-            store_chunk_mesh = self._store_chunk_mesh
+            store_chunk_meshes = self._store_chunk_meshes
             shared_vertex_buffer = shared_allocation.buffer
             shared_allocation_id = shared_allocation.allocation_id
             height_cache: dict[int, tuple[float, float]] = {}
@@ -4667,7 +4708,7 @@ class TerrainRenderer:
                     mesh.binding_offset = binding_offset
                     mesh.first_vertex = first_vertex
 
-                    store_chunk_mesh(mesh)
+                    meshes_to_store.append(mesh)
 
                 if pending.resources is not None:
                     self._schedule_async_voxel_mesh_batch_resource_release(pending.resources, frames=2)
@@ -4685,6 +4726,9 @@ class TerrainRenderer:
                         ],
                         frames=2,
                     )
+
+        if meshes_to_store:
+            store_chunk_meshes(meshes_to_store)
 
         self._pending_gpu_mesh_batches = remaining
         return completed

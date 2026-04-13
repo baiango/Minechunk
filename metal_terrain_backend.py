@@ -240,7 +240,7 @@ class MetalTerrainBackend:
             int(self.seed) & 0xFFFFFFFF,
         )
         self._submit_target_chunks = max(int(self.chunks_per_poll), min(int(self.chunks_per_poll) * 2, 128))
-        self._batch_pool_size = 6
+        self._batch_pool_size = 8
         self._max_in_flight_batches = 3
         self._available_batch_slots: deque[_ChunkGpuBatch] = deque()
         self._batch_slots_pending_reuse: deque[_ChunkGpuBatch] = deque()
