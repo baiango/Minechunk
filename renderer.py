@@ -41,8 +41,8 @@ DEPTH_FORMAT = "depth24plus"
 CHUNK_PREP_RATE = 1000.0
 CHUNK_PREP_TOKEN_CAP = 500.0
 CHUNK_FORWARD_CONE_LATERAL_RATIO = 0.5
-CHUNK_PREP_REQUEST_BUDGET_CAP = 64
-CHUNK_PREP_REQUEST_BATCH_SIZE = 64
+CHUNK_PREP_REQUEST_BUDGET_CAP = 16
+CHUNK_PREP_REQUEST_BATCH_SIZE = 16
 CHUNK_PREP_REORDER_YAW_DELTA = math.radians(10.0)
 ENGINE_MODE_CPU = "cpu"
 ENGINE_MODE_GPU = "gpu"
@@ -52,10 +52,11 @@ MERGED_TILE_SIZE_CHUNKS = 4
 MERGED_TILE_MIN_AGE_SECONDS = 2.0
 MERGED_TILE_MAX_CHUNKS = MERGED_TILE_SIZE_CHUNKS * MERGED_TILE_SIZE_CHUNKS
 MAX_CACHED_CHUNKS = 4225
-DEFAULT_MESH_BATCH_SIZE = 64
+DEFAULT_MESH_BATCH_SIZE = 128
 MESH_OUTPUT_SLAB_MIN_BYTES = 16 * 1024 * 1024
 INDIRECT_DRAW_COMMAND_STRIDE = 16
 GPU_VISIBILITY_WORKGROUP_SIZE = 64
+MESH_OUTPUT_FREERANGE_SCAN_LIMIT = 4
 MESH_VISIBILITY_RECORD_DTYPE = np.dtype([("bounds", np.float32, 4), ("draw", np.uint32, 4)])
 
 # Indirect draws use first_vertex, which is counted in whole vertices, not bytes.
@@ -1646,7 +1647,7 @@ class TerrainRenderer:
         seed: int = 1337,
         use_gpu_terrain: bool | None = None,
         use_gpu_meshing: bool | None = None,
-        terrain_batch_size: int = 128,
+        terrain_batch_size: int = 32,
         mesh_batch_size: int | None = None,
     ) -> None:
         default_use_gpu = ENGINE_MODE.lower() == ENGINE_MODE_GPU
@@ -2629,7 +2630,7 @@ class TerrainRenderer:
             slab_id=self._next_mesh_output_slab_id,
             buffer=self.device.create_buffer(
                 size=max(1, int(size_bytes)),
-                usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
+                usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
             ),
             size_bytes=int(size_bytes),
             free_ranges=[],
@@ -2720,12 +2721,21 @@ class TerrainRenderer:
             if allocation is not None:
                 return allocation
 
-        for slab_id, slab in list(self._mesh_output_slabs.items()):
-            if append_slab is not None and slab_id == append_slab.slab_id:
-                continue
-            allocation = self._allocate_from_mesh_output_slab_free_ranges(slab, needed_bytes)
-            if allocation is not None:
-                return allocation
+        # Hot path favors append allocations. Re-scanning every historical slab for
+        # tiny holes costs more CPU than it saves in practice once meshing is steady.
+        # Keep reuse bounded to a few recent slabs, then grow with a fresh slab.
+        scan_limit = max(0, int(MESH_OUTPUT_FREERANGE_SCAN_LIMIT))
+        if scan_limit > 0 and self._mesh_output_slabs:
+            scanned = 0
+            for slab_id, slab in reversed(list(self._mesh_output_slabs.items())):
+                if append_slab is not None and slab_id == append_slab.slab_id:
+                    continue
+                allocation = self._allocate_from_mesh_output_slab_free_ranges(slab, needed_bytes)
+                if allocation is not None:
+                    return allocation
+                scanned += 1
+                if scanned >= scan_limit:
+                    break
 
         slab = self._create_mesh_output_slab(self._mesh_output_slab_size_for_request(needed_bytes))
         allocation = self._allocate_from_mesh_output_slab_bump(slab, needed_bytes)
@@ -3790,7 +3800,7 @@ class TerrainRenderer:
         )
         self._voxel_mesh_scratch_batch_vertex_buffer = self.device.create_buffer(
             size=VERTEX_STRIDE,
-            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
+            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
         )
         self._voxel_mesh_scratch_blocks_array = np.empty(
             (max_chunk_count, height_limit, sample_size, sample_size),
@@ -3811,9 +3821,6 @@ class TerrainRenderer:
         chunk_count: int,
     ) -> AsyncVoxelMeshBatchResources:
         self._ensure_voxel_mesh_batch_scratch(sample_size, height_limit, 1)
-        dummy_vertex_buffer = self._voxel_mesh_scratch_batch_vertex_buffer
-        assert dummy_vertex_buffer is not None
-
         chunk_capacity = max(1, int(chunk_count))
         column_capacity = max(1, (sample_size - 2) * (sample_size - 2) * chunk_capacity)
         blocks_bytes = chunk_capacity * height_limit * sample_size * sample_size * 4
@@ -3846,14 +3853,14 @@ class TerrainRenderer:
             ),
             chunk_offsets_buffer=self.device.create_buffer(
                 size=max(1, chunk_totals_bytes),
-                usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
+                usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
             ),
             params_buffer=self.device.create_buffer(
                 size=16,
                 usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
             ),
             readback_buffer=self.device.create_buffer(
-                size=max(8, chunk_totals_bytes * 2),
+                size=max(4, chunk_totals_bytes),
                 usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
             ),
             coords_array=np.empty((chunk_capacity, 2), dtype=np.int32),
@@ -3868,7 +3875,7 @@ class TerrainRenderer:
                 {"binding": 3, "resource": {"buffer": resources.column_totals_buffer}},
                 {"binding": 4, "resource": {"buffer": resources.chunk_totals_buffer}},
                 {"binding": 5, "resource": {"buffer": resources.chunk_offsets_buffer}},
-                {"binding": 6, "resource": {"buffer": dummy_vertex_buffer}},
+                {"binding": 6, "resource": {"buffer": self._voxel_mesh_scratch_batch_vertex_buffer}},
                 {"binding": 8, "resource": {"buffer": resources.params_buffer, "offset": 0, "size": 16}},
             ],
         )
@@ -4140,22 +4147,14 @@ class TerrainRenderer:
             count_pass.dispatch_workgroups(columns_per_side, columns_per_side, chunk_count)
         count_pass.end()
 
-        scan_pass = encoder.begin_compute_pass()
-        scan_pass.set_pipeline(self.voxel_mesh_scan_pipeline)
-        for _, chunk_count, _, _, count_bind_group in prepared_batches:
-            scan_pass.set_bind_group(0, count_bind_group)
-            scan_pass.dispatch_workgroups(1, 1, chunk_count)
-        scan_pass.end()
-
         for _, chunk_count, resources, _, _ in prepared_batches:
             totals_nbytes = chunk_count * 4
             encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, totals_nbytes)
-            encoder.copy_buffer_to_buffer(resources.chunk_offsets_buffer, 0, resources.readback_buffer, totals_nbytes, totals_nbytes)
 
         self.device.queue.submit([encoder.finish()])
 
         for chunk_coords, chunk_count, resources, _, _ in prepared_batches:
-            metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 8)
+            metadata_promise = resources.readback_buffer.map_async(wgpu.MapMode.READ, 0, chunk_count * 4)
             self._pending_gpu_mesh_batches.append(
                 PendingChunkMeshBatch(
                     chunk_coords=chunk_coords,
@@ -4193,13 +4192,17 @@ class TerrainRenderer:
                 continue
 
             totals_nbytes = pending.chunk_count * 4
-            metadata_nbytes = totals_nbytes * 2
             try:
-                metadata_view = pending.readback_buffer.read_mapped(0, metadata_nbytes, copy=False)
+                metadata_view = pending.readback_buffer.read_mapped(0, totals_nbytes, copy=False)
                 chunk_totals = np.frombuffer(metadata_view, dtype=np.uint32, count=pending.chunk_count).copy()
-                chunk_offsets = np.frombuffer(metadata_view, dtype=np.uint32, count=pending.chunk_count, offset=totals_nbytes).copy()
             finally:
                 pending.readback_buffer.unmap()
+
+            chunk_offsets = np.empty(pending.chunk_count, dtype=np.uint32)
+            if pending.chunk_count > 0:
+                np.cumsum(chunk_totals, dtype=np.uint32, out=chunk_offsets)
+                chunk_offsets -= chunk_totals
+                self.device.queue.write_buffer(pending.chunk_offsets_buffer, 0, memoryview(chunk_offsets))
 
             total_vertices = int(chunk_totals.sum(dtype=np.uint64))
             total_vertex_bytes = total_vertices * VERTEX_STRIDE
@@ -4645,7 +4648,7 @@ class TerrainRenderer:
         if not meshes:
             empty_buffer = self.device.create_buffer(
                 size=1,
-                usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
+                usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
             )
             return ChunkMesh(chunk_x=chunk_x, chunk_z=chunk_z, vertex_count=0, vertex_buffer=empty_buffer, max_height=int(voxel_grid.shape[0]), vertex_offset=0, created_at=time.perf_counter())
         return meshes[0]
