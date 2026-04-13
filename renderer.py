@@ -40,7 +40,7 @@ LIGHT_DIRECTION = (0.35, 0.90, 0.25)
 DEPTH_FORMAT = "depth24plus"
 ENGINE_MODE_CPU = "cpu"
 ENGINE_MODE_GPU = "gpu"
-ENGINE_MODE = ENGINE_MODE_CPU
+ENGINE_MODE = ENGINE_MODE_GPU
 DEFAULT_RENDER_DISTANCE_BLOCKS = CHUNK_SIZE * 32
 MERGED_TILE_SIZE_CHUNKS = 4
 MERGED_TILE_MIN_AGE_SECONDS = 2.0
@@ -2462,7 +2462,7 @@ class TerrainRenderer:
             "MESH BIGGEST GAP: --.- MIB  ALLOCS --",
             "TOTAL DRAW VERTICES: --",
             "WALL FRAME: --.- MS",
-            "CHUNK MEMORY: -- BYTES (--.- MIB)",
+            "CHUNK PAYLOAD: -- BYTES (--.- MIB)",
             "DRAW CALLS: --",
             "VISIBLE MERGED CHUNKS (VISIBLE ONLY): --",
         ]
@@ -2553,21 +2553,22 @@ class TerrainRenderer:
         return sum(samples) / len(samples)
 
     def _chunk_cache_memory_bytes(self) -> int:
-        slab_sizes_by_buffer_id = {
-            id(slab.buffer): slab.size_bytes
-            for slab in self._mesh_output_slabs.values()
-        }
-        buffer_bytes: dict[int, int] = {}
+        allocation_bytes: dict[int, int] = {}
+        fallback_buffer_bytes: dict[int, int] = {}
+
         for mesh in self.chunk_cache.values():
+            if mesh.allocation_id is not None:
+                allocation = self._mesh_allocations.get(mesh.allocation_id)
+                if allocation is not None:
+                    allocation_bytes[allocation.allocation_id] = int(allocation.size_bytes)
+                    continue
             key = id(mesh.vertex_buffer)
-            if key in slab_sizes_by_buffer_id:
-                buffer_bytes[key] = slab_sizes_by_buffer_id[key]
-            else:
-                buffer_bytes[key] = max(
-                    buffer_bytes.get(key, 0),
-                    mesh.vertex_offset + mesh.vertex_count * VERTEX_STRIDE,
-                )
-        return sum(buffer_bytes.values())
+            fallback_buffer_bytes[key] = max(
+                fallback_buffer_bytes.get(key, 0),
+                mesh.vertex_offset + mesh.vertex_count * VERTEX_STRIDE,
+            )
+
+        return sum(allocation_bytes.values()) + sum(fallback_buffer_bytes.values())
 
     def _mesh_output_allocator_stats(self) -> tuple[int, int, int, int, int, int]:
         slab_count = len(self._mesh_output_slabs)
@@ -2655,7 +2656,7 @@ class TerrainRenderer:
             f"  COMMAND FINISH: {avg_command_finish:5.1f} MS",
             f"  QUEUE SUBMIT: {avg_queue_submit:5.1f} MS",
             f"WALL FRAME: {avg_wall_frame:5.1f} MS",
-            f"CHUNK MEMORY: {chunk_memory_bytes:,} BYTES ({chunk_memory_mib:5.2f} MIB)",
+            f"CHUNK PAYLOAD: {chunk_memory_bytes:,} BYTES ({chunk_memory_mib:5.2f} MIB)",
             f"TOTAL DRAW VERTICES: {visible_vertices:,}",
             f"VISIBLE BUT NOT READY: {visible_but_not_ready}",
             f"PENDING CHUNK REQUESTS: {pending_chunk_requests}",
