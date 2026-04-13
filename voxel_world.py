@@ -26,8 +26,6 @@ from terrain_kernels import (
     BEDROCK,
     DIRT,
     STONE,
-    fill_chunk_surface_grids,
-    surface_profile_at as sample_surface_profile_at,
 )
 
 
@@ -81,29 +79,6 @@ def _create_preferred_gpu_backend(
                 + "; ".join(errors),
                 file=sys.stderr,
             )
-
-    if MetalTerrainBackend is not None:
-        metal_candidates = []
-        if gpu_device is not None:
-            metal_candidates.append((gpu_device, "provided device"))
-        metal_candidates.append((None, "system default device"))
-
-        tried_none = False
-        for metal_device, label in metal_candidates:
-            if metal_device is None:
-                if tried_none:
-                    continue
-                tried_none = True
-            try:
-                return MetalTerrainBackend(
-                    metal_device,
-                    seed,
-                    chunk_size,
-                    height_limit,
-                    chunks_per_poll=chunks_per_poll,
-                )
-            except Exception as exc:
-                errors.append(f"Metal terrain backend could not be created via {label} ({exc!s})")
 
     if WgpuTerrainBackend is not None and gpu_device is not None:
         try:

@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import render_constants as render_consts
+from render_utils import clamp
+
+CHUNK_SAMPLE_SIZE = render_consts.CHUNK_SAMPLE_SIZE
+MAX_FACES_PER_CELL = render_consts.MAX_FACES_PER_CELL
+VERTICES_PER_FACE = render_consts.VERTICES_PER_FACE
+MAX_VERTICES_PER_CHUNK = render_consts.MAX_VERTICES_PER_CHUNK
+VERTEX_STRIDE = render_consts.VERTEX_STRIDE
+LIGHT_DIRECTION = render_consts.LIGHT_DIRECTION
+DEPTH_FORMAT = render_consts.DEPTH_FORMAT
+ENGINE_MODE_CPU = render_consts.ENGINE_MODE_CPU
+ENGINE_MODE_WGPU = render_consts.ENGINE_MODE_WGPU
+ENGINE_MODE_METAL = render_consts.ENGINE_MODE_METAL
+DEFAULT_RENDER_DISTANCE_BLOCKS = render_consts.DEFAULT_RENDER_DISTANCE_BLOCKS
+MERGED_TILE_SIZE_CHUNKS = render_consts.MERGED_TILE_SIZE_CHUNKS
+MERGED_TILE_MIN_AGE_SECONDS = render_consts.MERGED_TILE_MIN_AGE_SECONDS
+MERGED_TILE_MAX_CHUNKS = render_consts.MERGED_TILE_MAX_CHUNKS
+MAX_CACHED_CHUNKS = render_consts.MAX_CACHED_CHUNKS
+DEFAULT_MESH_BATCH_SIZE = render_consts.DEFAULT_MESH_BATCH_SIZE
+MESH_OUTPUT_SLAB_MIN_BYTES = render_consts.MESH_OUTPUT_SLAB_MIN_BYTES
+INDIRECT_DRAW_COMMAND_STRIDE = render_consts.INDIRECT_DRAW_COMMAND_STRIDE
+GPU_VISIBILITY_WORKGROUP_SIZE = render_consts.GPU_VISIBILITY_WORKGROUP_SIZE
+MESH_OUTPUT_FREERANGE_SCAN_LIMIT = render_consts.MESH_OUTPUT_FREERANGE_SCAN_LIMIT
+MESH_VISIBILITY_RECORD_DTYPE = render_consts.MESH_VISIBILITY_RECORD_DTYPE
+VOXEL_SURFACE_EXPAND_BIND_GROUP_CACHE_LIMIT = render_consts.VOXEL_SURFACE_EXPAND_BIND_GROUP_CACHE_LIMIT
+HUD_FONT_SCALE = render_consts.HUD_FONT_SCALE
+HUD_FONT_CHAR_WIDTH = render_consts.HUD_FONT_CHAR_WIDTH
+HUD_FONT_CHAR_HEIGHT = render_consts.HUD_FONT_CHAR_HEIGHT
+HUD_PANEL_PADDING = render_consts.HUD_PANEL_PADDING
+HUD_LINE_SPACING = render_consts.HUD_LINE_SPACING
+HUD_GLYPH_SPACING = render_consts.HUD_GLYPH_SPACING
+PROFILE_REPORT_INTERVAL = render_consts.PROFILE_REPORT_INTERVAL
+FRAME_BREAKDOWN_SAMPLE_WINDOW = render_consts.FRAME_BREAKDOWN_SAMPLE_WINDOW
+SWAPCHAIN_MAX_FPS = render_consts.SWAPCHAIN_MAX_FPS
+SWAPCHAIN_USE_VSYNC = render_consts.SWAPCHAIN_USE_VSYNC
+SPRINT_FLY_SPEED = render_consts.SPRINT_FLY_SPEED
+
+
+@dataclass
+class Camera:
+    position: list[float]
+    yaw: float
+    pitch: float
+    move_speed: float = 34.0
+    look_speed: float = 0.0035
+    sprint_multiplier: float = 2.25
+
+    def clamp_pitch(self) -> None:
+        self.pitch = clamp(self.pitch, -1.45, 1.45)
+
+
+engine_mode = ENGINE_MODE_CPU
+chunk_prep_request_budget_cap = 8 if engine_mode != ENGINE_MODE_CPU else 2

@@ -352,6 +352,7 @@ class WgpuTerrainBackend:
         if chunks:
             # Push fresh requests to the front so newly-facing terrain wins over stale backlog.
             self._pending_jobs.appendleft(list(chunks))
+            self._submit_next_batch()
         return job_id
 
     def chunk_voxel_grid(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
