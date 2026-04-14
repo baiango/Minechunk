@@ -8,9 +8,9 @@ from collections import deque
 import numpy as np
 import wgpu
 
-import mesh_cache_helpers as mesh_cache
-import meshing_types as mt
-from terrain_backend import ChunkSurfaceGpuBatch, ChunkVoxelResult
+from . import mesh_cache_helpers as mesh_cache
+from . import meshing_types as mt
+from .terrain_backend import ChunkSurfaceGpuBatch, ChunkVoxelResult
 
 try:
     profile  # type: ignore[name-defined]
@@ -20,7 +20,7 @@ except NameError:  # pragma: no cover - only used outside kernprof
 
 
 def _renderer_module():
-    import renderer
+    from . import renderer
 
     return renderer
 

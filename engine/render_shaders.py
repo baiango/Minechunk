@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import render_constants as render_consts
+from . import render_constants as render_consts
 
 INDIRECT_DRAW_COMMAND_STRIDE = render_consts.INDIRECT_DRAW_COMMAND_STRIDE
 GPU_VISIBILITY_WORKGROUP_SIZE = render_consts.GPU_VISIBILITY_WORKGROUP_SIZE

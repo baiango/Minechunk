@@ -4,3 +4,4 @@ scalene-profile.json
 scalene-profile.html
 *.lprof
 lineprof.txt
+*/__pycache__

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from voxel_world import CHUNK_SIZE
+from .voxel_world import CHUNK_SIZE
 
 CHUNK_SAMPLE_SIZE = CHUNK_SIZE + 2
 MAX_FACES_PER_CELL = 5

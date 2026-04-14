@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import render_constants as render_consts
-from render_utils import clamp
+from . import render_constants as render_consts
+from .render_utils import clamp
 
 CHUNK_SAMPLE_SIZE = render_consts.CHUNK_SAMPLE_SIZE
 MAX_FACES_PER_CELL = render_consts.MAX_FACES_PER_CELL

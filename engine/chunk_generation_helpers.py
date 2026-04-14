@@ -8,15 +8,15 @@ import time
 import numpy as np
 import wgpu
 
-import mesh_cache_helpers as mesh_cache
-from meshing_types import ChunkMesh
-from terrain_backend import ChunkVoxelResult
-from terrain_kernels import build_chunk_vertex_array_from_voxels
-import wgpu_chunk_mesher as wgpu_mesher
+from . import mesh_cache_helpers as mesh_cache
+from .meshing_types import ChunkMesh
+from .terrain_backend import ChunkVoxelResult
+from .terrain_kernels import build_chunk_vertex_array_from_voxels
+from . import wgpu_chunk_mesher as wgpu_mesher
 
 
 def _renderer_module():
-    import renderer as renderer_module
+    from . import renderer as renderer_module
 
     return renderer_module
 
@@ -454,6 +454,6 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
     renderer._last_displayed_chunk_coords = set(displayed_chunk_coords)
     chunk_stream_ms = (time.perf_counter() - prep_start) * 1000.0
     renderer._last_chunk_stream_drained = chunk_stream_drained
-    import hud_profile_helpers as hud_profile
+    from . import hud_profile_helpers as hud_profile
     hud_profile.record_frame_breakdown_sample(renderer, "chunk_stream_bytes", chunk_stream_bytes)
     return visibility_lookup_ms, chunk_stream_ms

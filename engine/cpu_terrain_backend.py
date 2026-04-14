@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult
-from terrain_kernels import (
+from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult
+from .terrain_kernels import (
     fill_chunk_surface_grids,
     fill_chunk_voxel_grid,
     surface_profile_at as sample_surface_profile_at,
@@ -111,7 +111,7 @@ class CpuTerrainBackend:
         return ready
 
     def poll_ready_chunk_voxel_batches(self) -> list["ChunkVoxelResult"]:
-        from terrain_backend import ChunkVoxelResult
+        from .terrain_backend import ChunkVoxelResult
 
         ready: list[ChunkVoxelResult] = []
         budget = self.chunks_per_poll

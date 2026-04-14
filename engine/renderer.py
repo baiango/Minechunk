@@ -7,11 +7,11 @@ from collections import OrderedDict, deque
 
 import numpy as np
 import wgpu
-import chunk_generation_helpers as chunk_gen
-import hud_profile_helpers as hud_profile
-import mesh_cache_helpers as mesh_cache
-from renderer_config import *
-from render_shaders import (
+from . import chunk_generation_helpers as chunk_gen
+from . import hud_profile_helpers as hud_profile
+from . import mesh_cache_helpers as mesh_cache
+from .renderer_config import *
+from .render_shaders import (
     GPU_VISIBILITY_SHADER,
     HUD_SHADER,
     RENDER_SHADER,
@@ -19,7 +19,7 @@ from render_shaders import (
     VOXEL_MESH_BATCH_SHADER,
     VOXEL_SURFACE_EXPAND_SHADER,
 )
-from render_utils import (
+from .render_utils import (
     clamp,
     cross3,
     flat_forward_vector,
@@ -28,14 +28,14 @@ from render_utils import (
     pack_camera_uniform,
     right_vector,
 )
-import wgpu_chunk_mesher as wgpu_mesher
+from . import wgpu_chunk_mesher as wgpu_mesher
 try:
     from wgpu.backends.wgpu_native import multi_draw_indirect as wgpu_native_multi_draw_indirect
 except Exception:
     wgpu_native_multi_draw_indirect = None
 from rendercanvas.auto import RenderCanvas, loop
 
-from meshing_types import (
+from .meshing_types import (
     AsyncVoxelMeshBatchResources,
     ChunkMesh,
     ChunkRenderBatch,
@@ -43,8 +43,8 @@ from meshing_types import (
     MeshOutputSlab,
     PendingChunkMeshBatch,
 )
-from voxel_world import CHUNK_SIZE, WORLD_HEIGHT, VoxelWorld
-from terrain_backend import ChunkSurfaceGpuBatch
+from .voxel_world import CHUNK_SIZE, WORLD_HEIGHT, VoxelWorld
+from .terrain_backend import ChunkSurfaceGpuBatch
 
 try:
     profile  # type: ignore[name-defined]

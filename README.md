@@ -85,19 +85,11 @@ The Metal roadmap is intended to cover the entire terrain-to-frame pipeline, not
 
 ## Repository Layout
 
-- `main.py`: minimal entry point that starts `TerrainRenderer`
-- `renderer.py`: camera, chunk residency, resource setup, draw submission, HUD, profiler
-- `renderer_config.py`: engine mode selection and top-level renderer tuning
-- `voxel_world.py`: world facade plus backend selection and fallback logic
-- `cpu_terrain_backend.py`: CPU terrain generation backend
-- `wgpu_terrain_backend.py`: `wgpu` compute terrain backend
-- `metal_terrain_backend.py`: native Metal terrain backend for macOS
-- `chunk_generation_helpers.py`: visible-set refresh, chunk request scheduling, backlog draining
-- `wgpu_chunk_mesher.py`: GPU voxel meshing, batch finalization, buffer lifecycle helpers
-- `mesh_cache_helpers.py`: mesh cache, slab allocator, tile merges, visibility batch building
-- `terrain_kernels.py`: Numba-backed terrain sampling, voxel expansion, and CPU meshing kernels
-- `render_shaders.py`: WGSL shaders for terrain rendering, meshing, visibility, and HUDs
-- `benchmark_chunk_generation.py`: terrain validation and benchmark harness
+- `main.py`: root entry point that starts `engine.renderer.TerrainRenderer`
+- `engine/`: runtime package containing the renderer, backends, mesh cache, shaders, and helpers
+- `benchmark_chunk_generation.py`: root-level terrain validation and benchmark harness
+- `docs/`: captured screenshots for the CPU, Wgpu, and Metal demos
+- `res/`: bundled HUD font asset
 
 ## Build And Run
 
@@ -112,7 +104,7 @@ To enable the optional Metal terrain backend on macOS:
 python3 -m pip install pyobjc-framework-Metal
 ```
 
-Backend selection lives in `renderer_config.py` via `engine_mode`:
+Backend selection lives in `engine/renderer_config.py` via `engine_mode`:
 
 - `ENGINE_MODE_CPU`
 - `ENGINE_MODE_WGPU`

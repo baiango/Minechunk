@@ -11,8 +11,8 @@ from typing import Callable
 
 import wgpu
 
-from terrain_kernels import build_chunk_vertex_array
-from voxel_world import CHUNK_SIZE, VoxelWorld
+from engine.terrain_kernels import build_chunk_vertex_array
+from engine.voxel_world import CHUNK_SIZE, VoxelWorld
 
 
 def _bench_surface_grids(world: VoxelWorld, coords: list[tuple[int, int]], rounds: int) -> tuple[float, int]:
@@ -1120,7 +1120,7 @@ def main() -> None:
     print(f"average vertices per chunk: {total_vertices / max(1, total_chunks):.1f}")
 
     try:
-        from renderer import TerrainRenderer
+        from engine.renderer import TerrainRenderer
     except Exception as exc:
         print()
         print(f"GPU render benchmark skipped: {exc.__class__.__name__}: {exc}")

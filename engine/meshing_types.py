@@ -23,7 +23,7 @@ class ChunkMesh:
 
     def __post_init__(self) -> None:
         try:
-            import renderer as renderer_module
+            from . import renderer as renderer_module
 
             chunk_size = int(renderer_module.CHUNK_SIZE)
             vertex_stride = int(renderer_module.VERTEX_STRIDE)

@@ -21,8 +21,8 @@ from typing import Optional
 
 import numpy as np
 
-from terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
-from terrain_kernels import expand_chunk_surface_to_voxel_grid
+from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
+from .terrain_kernels import expand_chunk_surface_to_voxel_grid
 
 try:
     import Metal

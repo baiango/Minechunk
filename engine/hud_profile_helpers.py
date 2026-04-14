@@ -9,14 +9,14 @@ import time
 from ctypes.util import find_library
 from pathlib import Path
 
-import mesh_cache_helpers as mesh_cache
-import render_constants as render_consts
+from . import mesh_cache_helpers as mesh_cache
+from . import render_constants as render_consts
 import wgpu
-from render_utils import pack_vertex, screen_to_ndc
+from .render_utils import pack_vertex, screen_to_ndc
 
 
 def _renderer_module():
-    import renderer as renderer_module
+    from . import renderer as renderer_module
 
     return renderer_module
 

@@ -5,7 +5,7 @@ import argparse
 
 def main() -> None:
     try:
-        from renderer import TerrainRenderer
+        from engine.renderer import TerrainRenderer
     except ModuleNotFoundError as exc:
         raise SystemExit(
             "This build targets wgpu-py. Install the runtime dependencies with "

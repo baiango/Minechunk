@@ -5,9 +5,9 @@ import struct
 
 import numpy as np
 
-from cpu_terrain_backend import CpuTerrainBackend
+from .cpu_terrain_backend import CpuTerrainBackend
 try:
-    from metal_terrain_backend import MetalTerrainBackend
+    from .metal_terrain_backend import MetalTerrainBackend
 except Exception as exc:  # pragma: no cover - optional on non-mac / CPU-only fallback
     MetalTerrainBackend = None  # type: ignore[assignment]
     METAL_TERRAIN_IMPORT_ERROR = exc
@@ -15,13 +15,13 @@ else:
     METAL_TERRAIN_IMPORT_ERROR = None
 
 try:
-    from wgpu_terrain_backend import WgpuTerrainBackend
+    from .wgpu_terrain_backend import WgpuTerrainBackend
 except Exception:  # pragma: no cover - optional during Metal-only deployments
     WgpuTerrainBackend = None  # type: ignore[assignment]
 
-from terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
+from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
 
-from terrain_kernels import (
+from .terrain_kernels import (
     AIR,
     BEDROCK,
     DIRT,

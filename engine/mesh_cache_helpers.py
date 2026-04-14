@@ -8,13 +8,13 @@ import time
 import numpy as np
 import wgpu
 
-import render_constants as render_consts
-from meshing_types import ChunkDrawBatch, ChunkMesh, ChunkRenderBatch, MeshBufferAllocation, MeshOutputSlab
-import wgpu_chunk_mesher as wgpu_mesher
+from . import render_constants as render_consts
+from .meshing_types import ChunkDrawBatch, ChunkMesh, ChunkRenderBatch, MeshBufferAllocation, MeshOutputSlab
+from . import wgpu_chunk_mesher as wgpu_mesher
 
 
 def _renderer_module():
-    import renderer as renderer_module
+    from . import renderer as renderer_module
 
     return renderer_module
 
