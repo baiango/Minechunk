@@ -68,6 +68,21 @@ The following are intentionally not implemented:
 
 These are excluded by design to keep the visual output honest and to preserve raw geometry-generation and presentation cost as measured quantities.
 
+## Future Features
+
+The following items are planned future work and are not part of the current engine contract:
+
+- Full native Metal backend
+  - Terrain generation on Metal
+  - Chunk meshing on Metal
+  - Renderer execution on Metal
+- Baked ambient occlusion
+- Screen-space ambient occlusion
+- Screen-space volumetric lighting
+- Exponential squared fog
+
+The Metal roadmap is intended to cover the entire terrain-to-frame pipeline, not only backend sampling. The rendering features above are listed as separate passes and effects so their costs remain independently measurable.
+
 ## Repository Layout
 
 - `main.py`: minimal entry point that starts `TerrainRenderer`
