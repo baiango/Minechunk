@@ -298,6 +298,7 @@ def refresh_visible_chunk_set(renderer) -> float:
 
 def service_background_gpu_work(renderer) -> None:
     wgpu_mesher.process_gpu_buffer_cleanup(renderer)
+    mesh_cache.process_deferred_mesh_output_frees(renderer)
     if renderer.use_gpu_meshing:
         wgpu_mesher.finalize_pending_gpu_mesh_batches(renderer)
 

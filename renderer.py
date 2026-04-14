@@ -146,6 +146,7 @@ class TerrainRenderer:
         self._mesh_buffer_refs: dict[int, int] = {}
         self._mesh_output_slabs: OrderedDict[int, MeshOutputSlab] = OrderedDict()
         self._mesh_allocations: dict[int, MeshBufferAllocation] = {}
+        self._deferred_mesh_output_frees: deque[tuple[int, int, int, int]] = deque()
         self._next_mesh_output_slab_id = 1
         self._mesh_output_append_slab_id: int | None = None
         self._next_mesh_allocation_id = 1
@@ -161,7 +162,7 @@ class TerrainRenderer:
         self._mesh_draw_indirect_capacity = 0
         self._mesh_draw_indirect_buffer = None
         self._mesh_draw_indirect_array = np.empty((0, 4), dtype=np.uint32)
-        self.use_gpu_built_visibility = True
+        self.use_gpu_visibility_culling = True
         self._mesh_visibility_record_capacity = 0
         self._mesh_visibility_record_buffer = None
         self._mesh_visibility_record_array = np.empty(0, dtype=MESH_VISIBILITY_RECORD_DTYPE)
@@ -999,7 +1000,7 @@ class TerrainRenderer:
         encoder = self.device.create_command_encoder()
         use_gpu_visibility = bool(
             self.use_gpu_indirect_render
-            and self.use_gpu_built_visibility
+            and self.use_gpu_visibility_culling
             and self.mesh_visibility_pipeline is not None
             and self._mesh_output_slabs
             and hasattr(wgpu.GPURenderCommandsMixin, "draw_indirect")

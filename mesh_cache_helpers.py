@@ -8,6 +8,7 @@ import time
 import numpy as np
 import wgpu
 
+import render_constants as render_consts
 from meshing_types import ChunkDrawBatch, ChunkMesh, ChunkRenderBatch, MeshBufferAllocation, MeshOutputSlab
 import wgpu_chunk_mesher as wgpu_mesher
 
@@ -169,10 +170,13 @@ def allocate_mesh_output_range(renderer, request_bytes: int) -> MeshBufferAlloca
         allocation = allocate_from_mesh_output_slab_bump(renderer, append_slab, needed_bytes)
         if allocation is not None:
             return allocation
+        allocation = allocate_from_mesh_output_slab_free_ranges(renderer, append_slab, needed_bytes)
+        if allocation is not None:
+            return allocation
 
     renderer_module = _renderer_module()
     scan_limit = max(0, int(renderer_module.MESH_OUTPUT_FREERANGE_SCAN_LIMIT))
-    if scan_limit > 0 and renderer._mesh_output_slabs:
+    if renderer._mesh_output_slabs:
         scanned = 0
         for slab_id, slab in reversed(list(renderer._mesh_output_slabs.items())):
             if append_slab is not None and slab_id == append_slab.slab_id:
@@ -181,7 +185,7 @@ def allocate_mesh_output_range(renderer, request_bytes: int) -> MeshBufferAlloca
             if allocation is not None:
                 return allocation
             scanned += 1
-            if scanned >= scan_limit:
+            if scan_limit > 0 and scanned >= scan_limit:
                 break
 
     slab = create_mesh_output_slab(renderer, mesh_output_slab_size_for_request(renderer, needed_bytes))
@@ -224,6 +228,23 @@ def trim_mesh_output_slab_tail(renderer, slab: MeshOutputSlab) -> None:
     slab.append_offset = tail_offset
 
 
+def refresh_mesh_output_append_slab(renderer) -> None:
+    renderer._mesh_output_append_slab_id = None
+    for slab_id, slab in reversed(list(renderer._mesh_output_slabs.items())):
+        if int(slab.append_offset) < int(slab.size_bytes):
+            renderer._mesh_output_append_slab_id = slab_id
+            return
+
+
+def retire_mesh_output_slab_if_empty(renderer, slab: MeshOutputSlab) -> None:
+    if int(slab.append_offset) != 0 or slab.free_ranges:
+        return
+    renderer._mesh_output_slabs.pop(slab.slab_id, None)
+    if renderer._mesh_output_append_slab_id == slab.slab_id:
+        refresh_mesh_output_append_slab(renderer)
+    slab.buffer.destroy()
+
+
 def free_mesh_output_range(renderer, slab_id: int, offset_bytes: int, size_bytes: int) -> None:
     slab = renderer._mesh_output_slabs.get(int(slab_id))
     if slab is None:
@@ -231,8 +252,32 @@ def free_mesh_output_range(renderer, slab_id: int, offset_bytes: int, size_bytes
     slab.free_ranges.append((int(offset_bytes), int(size_bytes)))
     slab.free_ranges = coalesce_mesh_output_free_ranges(slab.free_ranges)
     trim_mesh_output_slab_tail(renderer, slab)
+    retire_mesh_output_slab_if_empty(renderer, slab)
+    if slab.slab_id not in renderer._mesh_output_slabs:
+        return
     if renderer._mesh_output_append_slab_id is None or int(slab.append_offset) < int(slab.size_bytes):
         renderer._mesh_output_append_slab_id = slab.slab_id
+
+
+def schedule_mesh_output_range_free(renderer, slab_id: int, offset_bytes: int, size_bytes: int) -> None:
+    delay_frames = max(1, int(render_consts.MESH_OUTPUT_FREE_DELAY_FRAMES))
+    renderer._deferred_mesh_output_frees.append(
+        (delay_frames, int(slab_id), int(offset_bytes), int(size_bytes))
+    )
+
+
+def process_deferred_mesh_output_frees(renderer) -> None:
+    if not renderer._deferred_mesh_output_frees:
+        return
+    next_queue = []
+    while renderer._deferred_mesh_output_frees:
+        frames_left, slab_id, offset_bytes, size_bytes = renderer._deferred_mesh_output_frees.popleft()
+        frames_left -= 1
+        if frames_left <= 0:
+            free_mesh_output_range(renderer, slab_id, offset_bytes, size_bytes)
+        else:
+            next_queue.append((frames_left, slab_id, offset_bytes, size_bytes))
+    renderer._deferred_mesh_output_frees.extend(next_queue)
 
 
 def retain_chunk_mesh_storage(renderer, mesh: ChunkMesh) -> None:
@@ -259,7 +304,12 @@ def release_chunk_mesh_storage(renderer, mesh: ChunkMesh) -> None:
     if allocation.slab_id is None:
         allocation.buffer.destroy()
         return
-    free_mesh_output_range(renderer, allocation.slab_id, allocation.offset_bytes, allocation.size_bytes)
+    schedule_mesh_output_range_free(
+        renderer,
+        allocation.slab_id,
+        allocation.offset_bytes,
+        allocation.size_bytes,
+    )
 
 
 def clear_tile_render_batches(renderer) -> None:
