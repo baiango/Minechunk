@@ -2,7 +2,7 @@
 
 Minechunk is a chunk-streamed voxel terrain engine implemented in Python on top of `wgpu-py`. The codebase is organized around deterministic terrain synthesis, explicit chunk residency, meshing, visibility culling, and indirect draw submission. It is a measurement-oriented engine, not a simplification showcase.
 
-The checked-in configuration defaults to the CPU terrain backend. Rendering still goes through the GPU-backed `wgpu` presentation path, and optional terrain backends exist for `wgpu` and native Metal on macOS.
+The checked-in configuration currently sets `engine_mode = ENGINE_MODE_METAL` in `engine/renderer_config.py`. On macOS with `pyobjc-framework-Metal` installed, terrain generation and meshing use Metal. If Metal is unavailable, Minechunk automatically falls back to `wgpu` terrain, then to CPU terrain if no GPU terrain backend can be created.
 
 ## Engine Specification
 
@@ -72,16 +72,13 @@ These are excluded by design to keep the visual output honest and to preserve ra
 
 The following items are planned future work and are not part of the current engine contract:
 
-- Full native Metal backend
-  - Terrain generation on Metal
-  - Chunk meshing on Metal
-  - Renderer execution on Metal
+- Native Metal renderer execution path (terrain generation and chunk meshing on Metal are already implemented)
 - Baked ambient occlusion
 - Screen-space ambient occlusion
 - Screen-space volumetric lighting
 - Exponential squared fog
 
-The Metal roadmap is intended to cover the entire terrain-to-frame pipeline, not only backend sampling. The rendering features above are listed as separate passes and effects so their costs remain independently measurable.
+The remaining Metal roadmap item is renderer execution on Metal so the entire terrain-to-frame path can run without the `wgpu` presentation renderer. The rendering features above are listed as separate passes and effects so their costs remain independently measurable.
 
 ## Repository Layout
 
@@ -98,7 +95,7 @@ python3 -m pip install -r requirements.txt
 python3 main.py
 ```
 
-To enable the optional Metal terrain backend on macOS:
+To enable the default checked-in Metal mode on macOS:
 
 ```bash
 python3 -m pip install pyobjc-framework-Metal
@@ -109,6 +106,10 @@ Backend selection lives in `engine/renderer_config.py` via `engine_mode`:
 - `ENGINE_MODE_CPU`
 - `ENGINE_MODE_WGPU`
 - `ENGINE_MODE_METAL`
+
+Current checked-in default:
+
+- `engine_mode = ENGINE_MODE_METAL`
 
 If the preferred backend cannot be created, the terrain facade falls back to an available backend and prints a warning.
 
