@@ -84,7 +84,6 @@ The remaining Metal roadmap item is renderer execution on Metal so the entire te
 
 - `main.py`: root entry point that starts `engine.renderer.TerrainRenderer`
 - `engine/`: runtime package containing the renderer, backends, mesh cache, shaders, and helpers
-- `benchmark_chunk_generation.py`: root-level terrain validation and benchmark harness
 - `docs/`: captured screenshots for the CPU, Wgpu, and Metal demos
 - `res/`: bundled HUD font asset
 
@@ -112,16 +111,6 @@ Current checked-in default:
 - `engine_mode = ENGINE_MODE_METAL`
 
 If the preferred backend cannot be created, the terrain facade falls back to an available backend and prints a warning.
-
-## Benchmark Harness
-
-The benchmark script measures terrain throughput, validates backend parity, sweeps batch sizes, and collects frame-time statistics when timestamp queries are available.
-
-```bash
-python3 benchmark_chunk_generation.py
-```
-
-The harness is intended for controlled comparisons between backend choices, cache sizes, batch sizes, and render-radius settings.
 
 ## Controls
 
