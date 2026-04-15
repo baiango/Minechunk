@@ -29,6 +29,7 @@ from .render_utils import (
     right_vector,
 )
 from . import wgpu_chunk_mesher as wgpu_mesher
+from . import metal_chunk_mesher as metal_mesher
 try:
     from wgpu.backends.wgpu_native import multi_draw_indirect as wgpu_native_multi_draw_indirect
 except Exception:
@@ -68,6 +69,7 @@ class TerrainRenderer:
     ) -> None:
         default_use_gpu = _engine_mode_uses_gpu_path()
         self.use_gpu_terrain = default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)
+        self.use_gpu_meshing = default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
         if mesh_batch_size is None:
             self.mesh_batch_size = max(1, min(int(self.terrain_batch_size), DEFAULT_MESH_BATCH_SIZE))
@@ -100,6 +102,7 @@ class TerrainRenderer:
         self.context = self.canvas.get_wgpu_context()
         self.color_format = self.context.get_preferred_format(self.adapter)
         self.render_api_label = self._describe_render_api()
+        self.render_backend_label = "Wgpu"
         self.context.configure(
             device=self.device,
             format=self.color_format,
@@ -114,11 +117,17 @@ class TerrainRenderer:
             prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
         )
+        self._using_metal_meshing = bool(self.use_gpu_meshing and self.world.terrain_backend_label() == "Metal")
+        if self.use_gpu_meshing:
+            self.mesh_backend_label = "Metal" if self._using_metal_meshing else "Wgpu"
+        if self._using_metal_meshing:
+            metal_mesher.prewarm_metal_chunk_mesher(self)
         if self.use_gpu_terrain and self.world.terrain_backend_label() == "Metal":
             print(
-                "Info: Metal terrain backend active; renderer will bridge terrain results back through CPU arrays before wgpu meshing/rendering.",
+                "Info: Metal terrain backend active; renderer will use the Metal mesher for chunk meshing.",
                 file=sys.stderr,
             )
+        self._log_backend_diagnostics()
 
         self.camera = Camera(position=[0.0, 200.0, 0.0], yaw=math.pi, pitch=-1.20)
         self.keys_down: set[str] = set()
@@ -170,8 +179,9 @@ class TerrainRenderer:
         self.max_cached_chunks = MAX_CACHED_CHUNKS
         self._cache_capacity_warned = False
         self._current_move_speed = self.camera.move_speed
-        self.use_gpu_meshing = default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)
-        self.mesh_backend_label = "Wgpu" if self.use_gpu_meshing else "CPU"
+        self.mesh_backend_label = (
+            "Metal" if self._using_metal_meshing else ("Wgpu" if self.use_gpu_meshing else "CPU")
+        )
         self.voxel_mesh_scan_validate_every = 0
         self._voxel_mesh_scan_batches_processed = 0
         self._pending_voxel_mesh_results: deque = deque()
@@ -510,32 +520,43 @@ class TerrainRenderer:
                 layout=self.device.create_pipeline_layout(bind_group_layouts=[self.mesh_visibility_bind_group_layout]),
                 compute={"module": self.device.create_shader_module(code=GPU_VISIBILITY_SHADER), "entry_point": "main"},
             )
-            self.voxel_mesh_count_pipeline = self.device.create_compute_pipeline(
-                layout=self.device.create_pipeline_layout(bind_group_layouts=[self.voxel_mesh_count_bind_group_layout]),
-                compute={"module": self.device.create_shader_module(code=VOXEL_MESH_BATCH_SHADER), "entry_point": "count_main"},
-            )
-            self.voxel_mesh_scan_pipeline = self.device.create_compute_pipeline(
-                layout=self.device.create_pipeline_layout(bind_group_layouts=[self.voxel_mesh_scan_bind_group_layout]),
-                compute={"module": self.device.create_shader_module(code=VOXEL_MESH_BATCH_SHADER), "entry_point": "scan_main"},
-            )
-            self.voxel_mesh_emit_pipeline = self.device.create_compute_pipeline(
-                layout=self.device.create_pipeline_layout(bind_group_layouts=[self.voxel_mesh_emit_bind_group_layout]),
-                compute={"module": self.device.create_shader_module(code=VOXEL_MESH_BATCH_SHADER), "entry_point": "emit_main"},
-            )
-            self.voxel_surface_expand_pipeline = self.device.create_compute_pipeline(
-                layout=self.device.create_pipeline_layout(bind_group_layouts=[self.voxel_surface_expand_bind_group_layout]),
-                compute={"module": self.device.create_shader_module(code=VOXEL_SURFACE_EXPAND_SHADER), "entry_point": "expand_main"},
-            )
         except Exception as exc:
             self.mesh_visibility_pipeline = None
-            self.tile_merge_pipeline = None
+            self.use_gpu_visibility_culling = False
+            print(f"Warning: GPU visibility pipeline could not be created ({exc!s}); using CPU visibility.", file=sys.stderr)
+
+        if self._using_metal_meshing:
             self.voxel_mesh_count_pipeline = None
             self.voxel_mesh_scan_pipeline = None
             self.voxel_mesh_emit_pipeline = None
             self.voxel_surface_expand_pipeline = None
-            self.use_gpu_meshing = False
-            self.mesh_backend_label = "CPU"
-            print(f"Warning: GPU meshing could not be created ({exc!s}); using CPU meshing.", file=sys.stderr)
+        else:
+            try:
+                self.voxel_mesh_count_pipeline = self.device.create_compute_pipeline(
+                    layout=self.device.create_pipeline_layout(bind_group_layouts=[self.voxel_mesh_count_bind_group_layout]),
+                    compute={"module": self.device.create_shader_module(code=VOXEL_MESH_BATCH_SHADER), "entry_point": "count_main"},
+                )
+                self.voxel_mesh_scan_pipeline = self.device.create_compute_pipeline(
+                    layout=self.device.create_pipeline_layout(bind_group_layouts=[self.voxel_mesh_scan_bind_group_layout]),
+                    compute={"module": self.device.create_shader_module(code=VOXEL_MESH_BATCH_SHADER), "entry_point": "scan_main"},
+                )
+                self.voxel_mesh_emit_pipeline = self.device.create_compute_pipeline(
+                    layout=self.device.create_pipeline_layout(bind_group_layouts=[self.voxel_mesh_emit_bind_group_layout]),
+                    compute={"module": self.device.create_shader_module(code=VOXEL_MESH_BATCH_SHADER), "entry_point": "emit_main"},
+                )
+                self.voxel_surface_expand_pipeline = self.device.create_compute_pipeline(
+                    layout=self.device.create_pipeline_layout(bind_group_layouts=[self.voxel_surface_expand_bind_group_layout]),
+                    compute={"module": self.device.create_shader_module(code=VOXEL_SURFACE_EXPAND_SHADER), "entry_point": "expand_main"},
+                )
+            except Exception as exc:
+                self.voxel_mesh_count_pipeline = None
+                self.voxel_mesh_scan_pipeline = None
+                self.voxel_mesh_emit_pipeline = None
+                self.voxel_surface_expand_pipeline = None
+                self.use_gpu_meshing = False
+                self.mesh_backend_label = "CPU"
+                self._using_metal_meshing = False
+                print(f"Warning: GPU meshing could not be created ({exc!s}); using CPU meshing.", file=sys.stderr)
         self.render_pipeline = self.device.create_render_pipeline(
             layout=self.device.create_pipeline_layout(bind_group_layouts=[self.render_bind_group_layout]),
             vertex={
@@ -782,6 +803,19 @@ class TerrainRenderer:
             return summary.strip()
         return "unknown"
 
+    def _log_backend_diagnostics(self) -> None:
+        terrain_backend = getattr(self.world, "_backend", None)
+        terrain_device = getattr(terrain_backend, "device", None)
+        print(
+            "Info: Backend diagnostics: "
+            f"render_backend={self.render_backend_label}, "
+            f"render_device={type(self.device).__name__}, "
+            f"terrain_backend={type(terrain_backend).__name__}, "
+            f"terrain_device={type(terrain_device).__name__}, "
+            f"mesh_backend={self.mesh_backend_label}",
+            file=sys.stderr,
+        )
+
     def _device_limit(self, name: str, default: int) -> int:
         limits = getattr(self.device, "limits", None)
         if limits is None:
@@ -861,11 +895,17 @@ class TerrainRenderer:
             prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
         )
+        self._using_metal_meshing = bool(self.use_gpu_meshing and self.world.terrain_backend_label() == "Metal")
+        if self.use_gpu_meshing:
+            self.mesh_backend_label = "Metal" if self._using_metal_meshing else "Wgpu"
+        if self._using_metal_meshing:
+            metal_mesher.prewarm_metal_chunk_mesher(self)
         if self.use_gpu_terrain and self.world.terrain_backend_label() == "Metal":
             print(
-                "Info: Metal terrain backend active; renderer will bridge terrain results back through CPU arrays before wgpu meshing/rendering.",
+                "Info: Metal terrain backend active; renderer will use the Metal mesher for chunk meshing.",
                 file=sys.stderr,
             )
+        self._log_backend_diagnostics()
         self.camera.position[:] = [0.0, 200.0, 0.0]
         self.camera.yaw = math.pi
         self.camera.pitch = -1.20

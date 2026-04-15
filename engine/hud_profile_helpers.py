@@ -550,6 +550,7 @@ def refresh_profile_summary(renderer, now: float) -> None:
         f"AVG FPS {avg_fps:5.1f}  CPU {avg_cpu_ms:5.1f}MS",
         f"FRAME P50 {frame_p50_ms:5.1f}MS  P95 {frame_p95_ms:5.1f}MS  P99 {frame_p99_ms:5.1f}MS",
         f"RENDER API  {renderer.render_api_label}",
+        f"RENDER BACKEND {renderer.render_backend_label}",
         f"ENGINE MODE {renderer.engine_mode_label}",
         f"PRESENT     FPS {renderer_module.SWAPCHAIN_MAX_FPS}  VSYNC {'ON' if renderer_module.SWAPCHAIN_USE_VSYNC else 'OFF'}",
         f"MESH SLABS {slab_count:2d}  USED {slab_used_bytes / (1024.0 * 1024.0):4.1f} MIB  FREE {slab_free_bytes / (1024.0 * 1024.0):4.1f} MIB",
@@ -609,6 +610,7 @@ def refresh_frame_breakdown_summary(renderer) -> None:
     lines = [
         f"FRAME BREAKDOWN @ DIMENSION {renderer.render_dimension_chunks}x{renderer.render_dimension_chunks} CHUNKS",
         f"MOVE SPEED: {renderer._current_move_speed:5.1f} B/S",
+        f"RENDER BACKEND: {renderer.render_backend_label}",
         f"TERRAIN BACKEND: {renderer.world.terrain_backend_label()}",
         f"MESH BACKEND: {renderer.mesh_backend_label}",
         f"CHUNK DIMS: {renderer_module.CHUNK_SIZE}x{renderer_module.WORLD_HEIGHT}x{renderer_module.CHUNK_SIZE}",

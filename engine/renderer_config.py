@@ -53,5 +53,5 @@ class Camera:
         self.pitch = clamp(self.pitch, -1.45, 1.45)
 
 
-engine_mode = ENGINE_MODE_CPU
+engine_mode = ENGINE_MODE_METAL
 chunk_prep_request_budget_cap = 8 if engine_mode != ENGINE_MODE_CPU else 2

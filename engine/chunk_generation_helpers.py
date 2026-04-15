@@ -13,12 +13,20 @@ from .meshing_types import ChunkMesh
 from .terrain_backend import ChunkVoxelResult
 from .terrain_kernels import build_chunk_vertex_array_from_voxels
 from . import wgpu_chunk_mesher as wgpu_mesher
+from . import metal_chunk_mesher as metal_mesher
 
 
 def _renderer_module():
     from . import renderer as renderer_module
 
     return renderer_module
+
+
+def _terrain_mesher(renderer):
+    terrain_label = renderer.world.terrain_backend_label()
+    if terrain_label == "Metal":
+        return metal_mesher
+    return wgpu_mesher
 
 
 def chunk_prep_priority(renderer, chunk_x: int, chunk_z: int, camera_chunk_x: int, camera_chunk_z: int) -> tuple[float, int, int]:
@@ -165,7 +173,8 @@ def cpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_z: int, voxel_
 
 
 def gpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
-    meshes = wgpu_mesher.make_chunk_mesh_batch_from_voxels(
+    mesher = _terrain_mesher(renderer)
+    meshes = mesher.make_chunk_mesh_batch_from_voxels(
         renderer,
         [
             ChunkVoxelResult(
@@ -297,10 +306,13 @@ def refresh_visible_chunk_set(renderer) -> float:
 
 
 def service_background_gpu_work(renderer) -> None:
-    wgpu_mesher.process_gpu_buffer_cleanup(renderer)
+    mesher = _terrain_mesher(renderer)
+    if hasattr(mesher, "process_gpu_buffer_cleanup"):
+        mesher.process_gpu_buffer_cleanup(renderer)
     mesh_cache.process_deferred_mesh_output_frees(renderer)
     if renderer.use_gpu_meshing:
-        wgpu_mesher.finalize_pending_gpu_mesh_batches(renderer)
+        if hasattr(mesher, "finalize_pending_gpu_mesh_batches"):
+            mesher.finalize_pending_gpu_mesh_batches(renderer)
 
 
 def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
@@ -314,6 +326,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
     terrain_backend_label = renderer.world.terrain_backend_label()
     using_wgpu_terrain = terrain_backend_label == "Wgpu"
     using_metal_terrain = terrain_backend_label == "Metal"
+    mesher = _terrain_mesher(renderer)
     if renderer.use_gpu_meshing:
         if using_wgpu_terrain:
             ready_results = renderer.world.poll_ready_chunk_voxel_batches()
@@ -342,7 +355,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
                 for result in batch:
                     chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
                 meshes = (
-                    wgpu_mesher.make_chunk_mesh_batch_from_voxels(renderer, batch)
+                    mesher.make_chunk_mesh_batch_from_voxels(renderer, batch)
                     if using_wgpu_terrain or using_metal_terrain
                     else cpu_make_chunk_mesh_batch_from_voxels(renderer, batch)
                 )
@@ -374,7 +387,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
                 drain_budget -= len(batch)
                 for result in batch:
                     chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
-                meshes = wgpu_mesher.make_chunk_mesh_batch_from_voxels(renderer, batch)
+                meshes = mesher.make_chunk_mesh_batch_from_voxels(renderer, batch)
                 for mesh in meshes:
                     mesh_cache.store_chunk_mesh(renderer, mesh)
         else:
