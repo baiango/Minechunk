@@ -49,6 +49,7 @@ class MeshOutputSlab:
     size_bytes: int
     free_ranges: list[tuple[int, int]]
     append_offset: int = 0
+    size_class_bytes: int = 0
 
 
 @dataclass
@@ -66,6 +67,12 @@ class ChunkRenderBatch:
     signature: tuple[tuple[int, int], ...]
     vertex_count: int
     vertex_buffer: wgpu.GPUBuffer
+    bounds: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    chunk_count: int = 0
+    complete_tile: bool = False
+    all_mature: bool = False
+    visible_mask: int = 0
+    source_version: int = 0
 
 
 @dataclass
@@ -96,6 +103,7 @@ class AsyncVoxelMeshBatchResources:
     coords_array: np.ndarray
     zero_counts_array: np.ndarray
     count_bind_group: object | None = None
+    scan_bind_group: object | None = None
     emit_bind_group: object | None = None
     emit_bind_group_cache: dict[int, object] = field(default_factory=dict)
 
@@ -126,6 +134,7 @@ class PendingChunkMeshBatch:
     readback_offset: int = 0
     readback_owner: PendingChunkMeshReadbackGroup | None = None
     owned_surface_buffers: list[wgpu.GPUBuffer] = field(default_factory=list)
+    surface_release_callbacks: list[object] = field(default_factory=list)
     resources: AsyncVoxelMeshBatchResources | None = None
     metadata_promise: object | None = None
     submitted_at: float = 0.0

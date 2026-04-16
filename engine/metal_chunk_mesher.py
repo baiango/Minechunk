@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import sys
 import threading
 import time
 from collections import deque
@@ -60,12 +61,15 @@ class MetalMesherSlot:
     coords_buffer: object
     counts_buffer: object
     overflow_buffer: object
+    column_counts_buffer: object
+    column_offsets_buffer: object
     vertex_pool_buffer: object
     in_flight: bool = False
 
 
 @dataclass
 class AsyncVoxelMeshBatchResources:
+    mesher: "MetalChunkMesher | None"
     slot: MetalMesherSlot | None
     chunk_results: list[ChunkVoxelResult]
     on_complete: Callable[[list[object]], None] | None = None
@@ -118,7 +122,10 @@ class MetalChunkMesher:
 
         self._lock = threading.Lock()
         self._slots: list[MetalMesherSlot] = []
-        self._pipeline = self._build_pipeline("mesh_columns_fixed_slice")
+        self._count_pipeline = self._build_pipeline("count_columns_fixed_slice")
+        self._scan_serial_pipeline = self._build_pipeline("scan_columns_fixed_slice_serial")
+        self._scan_parallel_pipeline = self._build_pipeline("scan_columns_fixed_slice_parallel")
+        self._emit_pipeline = self._build_pipeline("emit_columns_fixed_slice")
         self._destroyed = False
 
         upload_options = (
@@ -131,6 +138,7 @@ class MetalChunkMesher:
         blocks_bytes = self.chunk_capacity * self.height_limit * self.sample_size * self.sample_size * 4
         coords_bytes = self.chunk_capacity * 2 * 4
         meta_bytes = self.chunk_capacity * 4
+        column_count_bytes = self.chunk_capacity * (self.sample_size - 2) * (self.sample_size - 2) * 4
         vertex_pool_bytes = self.chunk_capacity * self.max_vertices_per_chunk * self.vertex_stride
 
         for slot_id in range(self.inflight_slots):
@@ -145,6 +153,8 @@ class MetalChunkMesher:
                     coords_buffer=device.newBufferWithLength_options_(coords_bytes, upload_options),
                     counts_buffer=device.newBufferWithLength_options_(meta_bytes, meta_options),
                     overflow_buffer=device.newBufferWithLength_options_(meta_bytes, meta_options),
+                    column_counts_buffer=device.newBufferWithLength_options_(column_count_bytes, meta_options),
+                    column_offsets_buffer=device.newBufferWithLength_options_(column_count_bytes, meta_options),
                     vertex_pool_buffer=device.newBufferWithLength_options_(vertex_pool_bytes, vertex_options),
                 )
             )
@@ -161,9 +171,14 @@ class MetalChunkMesher:
                 slot.coords_buffer = None
                 slot.counts_buffer = None
                 slot.overflow_buffer = None
+                slot.column_counts_buffer = None
+                slot.column_offsets_buffer = None
                 slot.vertex_pool_buffer = None
             self._slots.clear()
-            self._pipeline = None
+            self._count_pipeline = None
+            self._scan_serial_pipeline = None
+            self._scan_parallel_pipeline = None
+            self._emit_pipeline = None
             self.command_queue = None
             self.device = None
 
@@ -212,6 +227,7 @@ class MetalChunkMesher:
     ) -> AsyncVoxelMeshBatchResources | None:
         if not chunk_results:
             resources = AsyncVoxelMeshBatchResources(
+                mesher=self,
                 slot=None,
                 chunk_results=[],
                 on_complete=on_complete,
@@ -246,6 +262,7 @@ class MetalChunkMesher:
             return None
 
         resources = AsyncVoxelMeshBatchResources(
+            mesher=self,
             slot=slot,
             chunk_results=list(chunk_results),
             on_complete=on_complete,
@@ -273,6 +290,10 @@ class MetalChunkMesher:
             coords_view = self._i32_view(slot.coords_buffer, chunk_count * 2).reshape((chunk_count, 2))
             counts_view = self._u32_view(slot.counts_buffer, chunk_count)
             overflow_view = self._u32_view(slot.overflow_buffer, chunk_count)
+            columns_per_side = sample_size - 2
+            column_count = chunk_count * columns_per_side * columns_per_side
+            column_counts_view = self._u32_view(slot.column_counts_buffer, column_count)
+            column_offsets_view = self._u32_view(slot.column_offsets_buffer, column_count)
 
             for i, result in enumerate(chunk_results):
                 blocks_view[i] = np.ascontiguousarray(result.blocks, dtype=np.uint32)
@@ -282,6 +303,8 @@ class MetalChunkMesher:
 
             counts_view.fill(0)
             overflow_view.fill(0)
+            column_counts_view.fill(0)
+            column_offsets_view.fill(0)
 
             params_bytes = struct.pack(
                 "<8I",
@@ -297,33 +320,68 @@ class MetalChunkMesher:
 
             command_buffer = self.command_queue.commandBuffer()
             encoder = command_buffer.computeCommandEncoder()
-            encoder.setComputePipelineState_(self._pipeline)
+
+            count_tew = int(self._count_pipeline.threadExecutionWidth())
+            count_max_total = int(self._count_pipeline.maxTotalThreadsPerThreadgroup())
+            count_tg_width = max(1, count_tew)
+            count_tg_height = max(1, count_max_total // count_tg_width)
+            count_threads_per_tg = Metal.MTLSizeMake(count_tg_width, count_tg_height, 1)
+            count_grid = Metal.MTLSizeMake(columns_per_side, columns_per_side, chunk_count)
+
+            encoder.setComputePipelineState_(self._count_pipeline)
+            encoder.setBuffer_offset_atIndex_(slot.blocks_buffer, 0, 0)
+            encoder.setBuffer_offset_atIndex_(slot.column_counts_buffer, 0, 1)
+            encoder.setBytes_length_atIndex_(params_bytes, len(params_bytes), 2)
+            encoder.dispatchThreads_threadsPerThreadgroup_(count_grid, count_threads_per_tg)
+
+            columns_per_chunk = columns_per_side * columns_per_side
+            scan_parallel_max_total = int(self._scan_parallel_pipeline.maxTotalThreadsPerThreadgroup())
+            if columns_per_chunk <= 1024 and scan_parallel_max_total >= 1024:
+                scan_threads = 1024
+                scan_threads_per_tg = Metal.MTLSizeMake(scan_threads, 1, 1)
+                scan_grid = Metal.MTLSizeMake(scan_threads, 1, chunk_count)
+                scan_pipeline = self._scan_parallel_pipeline
+            else:
+                scan_tew = int(self._scan_serial_pipeline.threadExecutionWidth())
+                scan_threads_per_tg = Metal.MTLSizeMake(max(1, scan_tew), 1, 1)
+                scan_grid = Metal.MTLSizeMake(chunk_count, 1, 1)
+                scan_pipeline = self._scan_serial_pipeline
+            encoder.setComputePipelineState_(scan_pipeline)
+            encoder.setBuffer_offset_atIndex_(slot.column_counts_buffer, 0, 0)
+            encoder.setBuffer_offset_atIndex_(slot.column_offsets_buffer, 0, 1)
+            encoder.setBuffer_offset_atIndex_(slot.counts_buffer, 0, 2)
+            encoder.setBuffer_offset_atIndex_(slot.overflow_buffer, 0, 3)
+            encoder.setBytes_length_atIndex_(params_bytes, len(params_bytes), 4)
+            encoder.dispatchThreads_threadsPerThreadgroup_(scan_grid, scan_threads_per_tg)
+
+            emit_tew = int(self._emit_pipeline.threadExecutionWidth())
+            emit_max_total = int(self._emit_pipeline.maxTotalThreadsPerThreadgroup())
+            emit_tg_width = max(1, emit_tew)
+            emit_tg_height = max(1, emit_max_total // emit_tg_width)
+            emit_threads_per_tg = Metal.MTLSizeMake(emit_tg_width, emit_tg_height, 1)
+            emit_grid = Metal.MTLSizeMake(columns_per_side, columns_per_side, chunk_count)
+
+            encoder.setComputePipelineState_(self._emit_pipeline)
             encoder.setBuffer_offset_atIndex_(slot.blocks_buffer, 0, 0)
             encoder.setBuffer_offset_atIndex_(slot.materials_buffer, 0, 1)
             encoder.setBuffer_offset_atIndex_(slot.coords_buffer, 0, 2)
-            encoder.setBuffer_offset_atIndex_(slot.counts_buffer, 0, 3)
-            encoder.setBuffer_offset_atIndex_(slot.overflow_buffer, 0, 4)
-            encoder.setBuffer_offset_atIndex_(slot.vertex_pool_buffer, 0, 5)
-            encoder.setBytes_length_atIndex_(params_bytes, len(params_bytes), 6)
-
-            tew = int(self._pipeline.threadExecutionWidth())
-            max_total = int(self._pipeline.maxTotalThreadsPerThreadgroup())
-            tg_width = max(1, tew)
-            tg_height = max(1, max_total // tg_width)
-            threads_per_tg = Metal.MTLSizeMake(tg_width, tg_height, 1)
-            grid = Metal.MTLSizeMake(sample_size - 2, sample_size - 2, chunk_count)
-
-            encoder.dispatchThreads_threadsPerThreadgroup_(grid, threads_per_tg)
+            encoder.setBuffer_offset_atIndex_(slot.column_counts_buffer, 0, 3)
+            encoder.setBuffer_offset_atIndex_(slot.column_offsets_buffer, 0, 4)
+            encoder.setBuffer_offset_atIndex_(slot.overflow_buffer, 0, 5)
+            encoder.setBuffer_offset_atIndex_(slot.vertex_pool_buffer, 0, 6)
+            encoder.setBytes_length_atIndex_(params_bytes, len(params_bytes), 7)
+            encoder.dispatchThreads_threadsPerThreadgroup_(emit_grid, emit_threads_per_tg)
             encoder.endEncoding()
         except Exception as exc:
             self._release_slot(slot)
             _complete_gpu_mesh_batch(renderer, resources, error=exc, meshes=None, callback_invoked=False)
             raise
 
+        slot_ref = slot
+        chunk_results_snapshot = resources.chunk_results
+
         def _done(cb):
-            meshes: list[object] = []
             error: Exception | None = None
-            callback_invoked = False
             try:
                 status = int(cb.status())
                 completed_status = int(getattr(Metal, "MTLCommandBufferStatusCompleted", 4))
@@ -331,50 +389,15 @@ class MetalChunkMesher:
                     err = cb.error()
                     status_name = _command_buffer_status_name(status)
                     raise RuntimeError(f"Metal mesher command buffer failed: status={status_name}, error={err}")
-
-                counts = self._u32_view(slot.counts_buffer, chunk_count).copy()
-                overflow = self._u32_view(slot.overflow_buffer, chunk_count).copy()
-
-                pool_nbytes = chunk_count * self.max_vertices_per_chunk * self.vertex_stride
-                pool_view = memoryview(slot.vertex_pool_buffer.contents().as_buffer(pool_nbytes))
-                for i, result in enumerate(chunk_results):
-                    if int(overflow[i]) != 0:
-                        continue
-
-                    vertex_count = int(counts[i])
-                    if vertex_count <= 0:
-                        continue
-                    if vertex_count > self.max_vertices_per_chunk:
-                        raise RuntimeError(
-                            f"Metal mesher produced vertex_count={vertex_count} beyond per-chunk max={self.max_vertices_per_chunk}"
-                        )
-
-                    vertex_offset = i * self.max_vertices_per_chunk * self.vertex_stride
-                    vertex_nbytes = vertex_count * self.vertex_stride
-                    vertex_bytes = bytes(pool_view[vertex_offset : vertex_offset + vertex_nbytes])
-                    meshes.append(
-                        {
-                            "chunk_x": int(result.chunk_x),
-                            "chunk_z": int(result.chunk_z),
-                            "vertex_count": vertex_count,
-                            "max_height": int(height_limit),
-                            "vertex_bytes": vertex_bytes,
-                        }
-                    )
-
-                if on_complete is not None:
-                    callback_invoked = True
-                    on_complete(meshes)
             except Exception as exc:
                 error = exc
             finally:
-                self._release_slot(slot)
                 _complete_gpu_mesh_batch(
                     renderer,
                     resources,
-                    meshes=meshes,
+                    meshes=None,
                     error=error,
-                    callback_invoked=callback_invoked,
+                    callback_invoked=False,
                 )
 
         try:
@@ -417,6 +440,41 @@ def _ensure_renderer_async_state(renderer) -> None:
             setattr(renderer, "_metal_gpu_buffer_cleanup_queue", deque())
         if getattr(renderer, "_metal_gpu_mesh_async_errors", None) is None:
             setattr(renderer, "_metal_gpu_mesh_async_errors", deque())
+
+
+def shutdown_renderer_async_state(renderer) -> None:
+    completed_queue = getattr(renderer, "_metal_completed_gpu_mesh_batches", None)
+    if completed_queue is not None:
+        while True:
+            try:
+                resources = completed_queue.popleft()
+            except Exception:
+                break
+            destroy_async_voxel_mesh_batch_resources(resources)
+
+    cleanup_queue = getattr(renderer, "_metal_gpu_buffer_cleanup_queue", None)
+    if cleanup_queue is not None:
+        while True:
+            try:
+                resources = cleanup_queue.popleft()
+            except Exception:
+                break
+            destroy_async_voxel_mesh_batch_resources(resources)
+
+    pending = getattr(renderer, "_metal_pending_gpu_mesh_batches", None)
+    if pending is not None:
+        pending.clear()
+
+    lock = _mesher_cache_lock(renderer)
+    with lock:
+        cache = dict(_mesher_cache(renderer))
+        _mesher_cache(renderer).clear()
+    for entry in cache.values():
+        if isinstance(entry, MetalChunkMesher):
+            try:
+                entry.destroy()
+            except Exception:
+                pass
 
 
 def _register_pending_gpu_mesh_batch(renderer, resources: AsyncVoxelMeshBatchResources) -> None:
@@ -602,39 +660,121 @@ def make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVoxelRe
     return []
 
 
+
+def _build_completed_meshes_from_resources(renderer, resources: AsyncVoxelMeshBatchResources) -> list[object]:
+    slot = resources.slot
+    mesher = resources.mesher
+    if slot is None or mesher is None:
+        return []
+
+    chunk_count = len(resources.chunk_results)
+    if chunk_count <= 0:
+        return []
+
+    counts = mesher._u32_view(slot.counts_buffer, chunk_count).copy()
+    overflow = mesher._u32_view(slot.overflow_buffer, chunk_count).copy()
+    pool_nbytes = chunk_count * mesher.max_vertices_per_chunk * mesher.vertex_stride
+    pool_view = memoryview(slot.vertex_pool_buffer.contents().as_buffer(pool_nbytes))
+
+    meshes: list[object] = []
+    overflow_results: list[ChunkVoxelResult] = []
+    overflow_coords: list[tuple[int, int]] = []
+    for i, result in enumerate(resources.chunk_results):
+        if int(overflow[i]) != 0:
+            overflow_results.append(result)
+            overflow_coords.append((int(result.chunk_x), int(result.chunk_z)))
+            continue
+
+        vertex_count = int(counts[i])
+        if vertex_count <= 0:
+            continue
+        if vertex_count > mesher.max_vertices_per_chunk:
+            raise RuntimeError(
+                f"Metal mesher produced vertex_count={vertex_count} beyond per-chunk max={mesher.max_vertices_per_chunk}"
+            )
+
+        vertex_offset = i * mesher.max_vertices_per_chunk * mesher.vertex_stride
+        vertex_nbytes = vertex_count * mesher.vertex_stride
+        vertex_bytes = bytes(pool_view[vertex_offset : vertex_offset + vertex_nbytes])
+        meshes.append(
+            {
+                "chunk_x": int(result.chunk_x),
+                "chunk_z": int(result.chunk_z),
+                "vertex_count": vertex_count,
+                "max_height": int(resources.chunk_results[i].blocks.shape[0]),
+                "vertex_bytes": vertex_bytes,
+            }
+        )
+
+    if overflow_results:
+        from .chunk_generation_helpers import cpu_make_chunk_mesh_batch_from_voxels
+
+        preview = ", ".join(f"({x},{z})" for x, z in overflow_coords[:8])
+        more = "" if len(overflow_coords) <= 8 else f" ... +{len(overflow_coords) - 8} more"
+        print(
+            f"Warning: Metal mesher overflow on {len(overflow_results)} chunk(s); falling back to CPU meshing for {preview}{more}.",
+            file=sys.stderr,
+        )
+        meshes.extend(cpu_make_chunk_mesh_batch_from_voxels(renderer, overflow_results))
+
+    return meshes
+
+
 def _append_completed_meshes_to_renderer(renderer, meshes: list[object]) -> None:
     if not meshes:
         return
     from .chunk_generation_helpers import make_chunk_mesh_fast
 
     created_at = time.perf_counter()
+    packed_meshes: list[tuple[int, int, int, int, bytes]] = []
+    passthrough_meshes: list[object] = []
+    total_vertex_bytes = 0
+
     for mesh in meshes:
         if isinstance(mesh, dict) and "vertex_bytes" in mesh:
-            vertex_bytes = mesh["vertex_bytes"]
-            size_bytes = max(1, len(vertex_bytes))
-            vertex_buffer = renderer.device.create_buffer(
-                size=size_bytes,
-                usage=wgpu.BufferUsage.VERTEX
-                | wgpu.BufferUsage.COPY_DST
-                | wgpu.BufferUsage.COPY_SRC
-                | wgpu.BufferUsage.STORAGE,
+            vertex_bytes = bytes(mesh["vertex_bytes"])
+            packed_meshes.append(
+                (
+                    int(mesh["chunk_x"]),
+                    int(mesh["chunk_z"]),
+                    int(mesh["vertex_count"]),
+                    int(mesh["max_height"]),
+                    vertex_bytes,
+                )
             )
-            if vertex_bytes:
-                renderer.device.queue.write_buffer(vertex_buffer, 0, vertex_bytes)
-            chunk_mesh = make_chunk_mesh_fast(
-                renderer,
-                chunk_x=int(mesh["chunk_x"]),
-                chunk_z=int(mesh["chunk_z"]),
-                vertex_count=int(mesh["vertex_count"]),
-                vertex_buffer=vertex_buffer,
-                vertex_offset=0,
-                max_height=int(mesh["max_height"]),
-                created_at=created_at,
-                allocation_id=None,
-            )
-            mesh_cache.store_chunk_mesh(renderer, chunk_mesh)
+            total_vertex_bytes += len(vertex_bytes)
         else:
-            mesh_cache.store_chunk_mesh(renderer, mesh)
+            passthrough_meshes.append(mesh)
+
+    chunk_meshes: list[object] = []
+    if packed_meshes:
+        batch_allocation = mesh_cache.allocate_mesh_output_range(renderer, total_vertex_bytes)
+        batch_buffer = batch_allocation.buffer
+        cursor_bytes = 0
+        for chunk_x, chunk_z, vertex_count, max_height, vertex_bytes in packed_meshes:
+            vertex_offset = batch_allocation.offset_bytes + cursor_bytes
+            if vertex_bytes:
+                renderer.device.queue.write_buffer(batch_buffer, vertex_offset, vertex_bytes)
+            chunk_meshes.append(
+                make_chunk_mesh_fast(
+                    renderer,
+                    chunk_x=chunk_x,
+                    chunk_z=chunk_z,
+                    vertex_count=vertex_count,
+                    vertex_buffer=batch_buffer,
+                    vertex_offset=vertex_offset,
+                    max_height=max_height,
+                    created_at=created_at,
+                    allocation_id=batch_allocation.allocation_id,
+                )
+            )
+            cursor_bytes += len(vertex_bytes)
+
+    for mesh in passthrough_meshes:
+        chunk_meshes.append(mesh)
+
+    if chunk_meshes:
+        mesh_cache.store_chunk_meshes(renderer, chunk_meshes)
 
 
 def process_gpu_buffer_cleanup(renderer) -> None:
@@ -653,7 +793,7 @@ def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> in
     process_gpu_buffer_cleanup(renderer)
 
     if budget is None:
-        limit = None
+        limit = max(1, int(getattr(renderer, "_metal_gpu_mesh_async_finalize_budget", 1)))
     else:
         limit = max(0, int(budget))
         if limit == 0:
@@ -673,7 +813,13 @@ def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> in
         if resources.error is not None and first_error is None:
             first_error = resources.error
 
-        if resources.deliver_to_renderer and resources.completed_meshes:
+        if resources.error is None and not resources.completed_meshes:
+            resources.completed_meshes = _build_completed_meshes_from_resources(renderer, resources)
+
+        if resources.on_complete is not None and not resources.callback_invoked:
+            resources.on_complete(resources.completed_meshes)
+            resources.callback_invoked = True
+        elif resources.deliver_to_renderer and resources.completed_meshes:
             _append_completed_meshes_to_renderer(renderer, resources.completed_meshes)
 
         resources.finalized = True
@@ -699,7 +845,10 @@ def destroy_async_voxel_mesh_batch_resources(resources) -> None:
 
     resources.cleaned_up = True
     resources.finalized = True
+    if resources.mesher is not None:
+        resources.mesher._release_slot(resources.slot)
     resources.slot = None
+    resources.mesher = None
     resources.on_complete = None
     resources.error = None
     resources.chunk_results.clear()

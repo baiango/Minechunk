@@ -292,14 +292,34 @@ def rebuild_chunk_request_queue(renderer, camera_chunk_x: int, camera_chunk_z: i
     renderer._chunk_request_queue_dirty = False
 
 
+
+def _chunk_prep_backlog_target(renderer) -> int:
+    base_target = max(1, int(max(renderer.mesh_batch_size, renderer.terrain_batch_size)))
+    backend = getattr(getattr(renderer, "world", None), "_backend", None)
+    if backend is None:
+        return base_target
+
+    chunks_per_poll = max(1, int(getattr(backend, "chunks_per_poll", base_target)))
+    submit_target = max(chunks_per_poll, int(getattr(backend, "_submit_target_chunks", chunks_per_poll)))
+    max_in_flight = max(1, int(getattr(backend, "_max_in_flight_batches", 1)))
+    return max(base_target, submit_target * max_in_flight)
+
+
+def _chunk_prep_pipeline_backlog(renderer, terrain_backend_label: str) -> int:
+    backlog = len(renderer._pending_chunk_coords) + len(renderer._pending_voxel_mesh_results)
+    if terrain_backend_label == "Wgpu":
+        backlog += int(getattr(renderer, "_pending_surface_gpu_batches_chunk_total", 0))
+    return backlog
+
 def refresh_visible_chunk_set(renderer) -> float:
     visibility_start = time.perf_counter()
     renderer_module = _renderer_module()
-    current_origin = (int(renderer.camera.position[0] // renderer_module.CHUNK_SIZE), int(renderer.camera.position[2] // renderer_module.CHUNK_SIZE))
+    current_origin = (
+        int(renderer.camera.position[0] // renderer_module.CHUNK_SIZE),
+        int(renderer.camera.position[2] // renderer_module.CHUNK_SIZE),
+    )
     if renderer._visible_chunk_origin != current_origin or not renderer._visible_chunk_coords:
-        renderer._visible_chunk_origin = current_origin
-        renderer._visible_chunk_coords = renderer._chunk_coords_in_view()
-        renderer._visible_chunk_coord_set = set(renderer._visible_chunk_coords)
+        renderer._refresh_visible_chunk_coords()
         rebuild_visible_missing_tracking(renderer)
     renderer._warn_if_visible_exceeds_cache()
     return (time.perf_counter() - visibility_start) * 1000.0
@@ -311,6 +331,8 @@ def service_background_gpu_work(renderer) -> None:
         mesher.process_gpu_buffer_cleanup(renderer)
     mesh_cache.process_deferred_mesh_output_frees(renderer)
     if renderer.use_gpu_meshing:
+        if renderer.world.terrain_backend_label() == "Wgpu" and hasattr(mesher, "drain_pending_surface_gpu_batches_to_meshing"):
+            mesher.drain_pending_surface_gpu_batches_to_meshing(renderer)
         if hasattr(mesher, "finalize_pending_gpu_mesh_batches"):
             mesher.finalize_pending_gpu_mesh_batches(renderer)
 
@@ -329,38 +351,38 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
     mesher = _terrain_mesher(renderer)
     if renderer.use_gpu_meshing:
         if using_wgpu_terrain:
-            ready_results = renderer.world.poll_ready_chunk_voxel_batches()
+            ready_surface_batches = renderer.world.poll_ready_chunk_surface_gpu_batches()
             chunk_stream_drained = 0
             chunk_stream_bytes = 0.0
-            drain_budget = max(1, renderer.mesh_batch_size)
-            ready_results.sort(
-                key=lambda result: chunk_prep_priority(
-                    renderer,
-                    int(result.chunk_x),
-                    int(result.chunk_z),
-                    current_origin[0],
-                    current_origin[1],
+            if ready_surface_batches:
+                ready_surface_batches.sort(
+                    key=lambda batch: min(
+                        (
+                            chunk_prep_priority(
+                                renderer,
+                                int(chunk_x),
+                                int(chunk_z),
+                                current_origin[0],
+                                current_origin[1],
+                            )
+                            for chunk_x, chunk_z in batch.chunks
+                        ),
+                        default=(0.0, 0, 0),
+                    )
                 )
-            )
-            for result in ready_results:
-                chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
-            for result in reversed(ready_results):
-                renderer._pending_voxel_mesh_results.appendleft(result)
-            while renderer._pending_voxel_mesh_results and drain_budget > 0:
-                batch_size = min(renderer.mesh_batch_size, len(renderer._pending_voxel_mesh_results))
-                batch_size = min(batch_size, drain_budget)
-                batch = [renderer._pending_voxel_mesh_results.popleft() for _ in range(batch_size)]
-                chunk_stream_drained += len(batch)
-                drain_budget -= len(batch)
-                for result in batch:
-                    chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
-                meshes = (
-                    mesher.make_chunk_mesh_batch_from_voxels(renderer, batch)
-                    if using_wgpu_terrain or using_metal_terrain
-                    else cpu_make_chunk_mesh_batch_from_voxels(renderer, batch)
-                )
-                for mesh in meshes:
-                    mesh_cache.store_chunk_mesh(renderer, mesh)
+                for surface_batch in ready_surface_batches:
+                    batch_chunk_count = len(surface_batch.chunks)
+                    chunk_stream_drained += batch_chunk_count
+                    chunk_stream_bytes += float(batch_chunk_count * int(surface_batch.cell_count) * 8)
+                if hasattr(mesher, "enqueue_surface_gpu_batches_for_meshing"):
+                    mesher.enqueue_surface_gpu_batches_for_meshing(renderer, ready_surface_batches)
+                else:
+                    for surface_batch in ready_surface_batches:
+                        meshes = mesher.make_chunk_mesh_batch_from_surface_gpu_batch(renderer, surface_batch)
+                        for mesh in meshes:
+                            mesh_cache.store_chunk_mesh(renderer, mesh)
+                if hasattr(mesher, "drain_pending_surface_gpu_batches_to_meshing"):
+                    mesher.drain_pending_surface_gpu_batches_to_meshing(renderer)
         elif using_metal_terrain:
             ready_results = renderer.world.poll_ready_chunk_voxel_batches()
             chunk_stream_bytes = 0.0
@@ -377,16 +399,14 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
             )
             for result in ready_results:
                 chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
-            for result in reversed(ready_results):
-                renderer._pending_voxel_mesh_results.appendleft(result)
+            for result in ready_results:
+                renderer._pending_voxel_mesh_results.append(result)
             while renderer._pending_voxel_mesh_results and drain_budget > 0:
                 batch_size = min(renderer.mesh_batch_size, len(renderer._pending_voxel_mesh_results))
                 batch_size = min(batch_size, drain_budget)
                 batch = [renderer._pending_voxel_mesh_results.popleft() for _ in range(batch_size)]
                 chunk_stream_drained += len(batch)
                 drain_budget -= len(batch)
-                for result in batch:
-                    chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
                 meshes = mesher.make_chunk_mesh_batch_from_voxels(renderer, batch)
                 for mesh in meshes:
                     mesh_cache.store_chunk_mesh(renderer, mesh)
@@ -407,8 +427,8 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
                 current_origin[1],
             )
         )
-        for result in reversed(ready_results):
-            renderer._pending_voxel_mesh_results.appendleft(result)
+        for result in ready_results:
+            renderer._pending_voxel_mesh_results.append(result)
         while renderer._pending_voxel_mesh_results and drain_budget > 0:
             batch_size = min(renderer.mesh_batch_size, len(renderer._pending_voxel_mesh_results))
             batch_size = min(batch_size, drain_budget)
@@ -421,15 +441,25 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
 
     missing_coords = renderer._visible_missing_coords
     missing_count = len(missing_coords)
-    prep_budget = min(
-        missing_count,
-        max(1, min(renderer_module.chunk_prep_request_budget_cap, renderer.mesh_batch_size * 2, 32)),
+    base_request_budget = max(
+        1,
+        min(renderer_module.chunk_prep_request_budget_cap, max(renderer.mesh_batch_size, renderer.terrain_batch_size)),
     )
 
     camera_chunk_x = current_origin[0]
     camera_chunk_z = current_origin[1]
     pending_chunk_coords = renderer._pending_chunk_coords
     displayed_chunk_coords = renderer._visible_displayed_coords
+
+    visible_count = max(1, len(renderer._visible_chunk_coords))
+    displayed_ratio = len(displayed_chunk_coords) / float(visible_count)
+    pipeline_backlog = _chunk_prep_pipeline_backlog(renderer, terrain_backend_label)
+    backlog_target = _chunk_prep_backlog_target(renderer)
+    bootstrap_budget = max(0, backlog_target - pipeline_backlog)
+    if displayed_ratio < renderer_module.chunk_prep_bootstrap_displayed_ratio_threshold:
+        prep_budget = min(missing_count, max(base_request_budget, bootstrap_budget))
+    else:
+        prep_budget = min(missing_count, base_request_budget)
 
     if prep_budget > 0 and missing_count > 0 and chunk_request_queue_needs_rebuild(renderer, current_origin):
         rebuild_chunk_request_queue(renderer, camera_chunk_x, camera_chunk_z)
@@ -452,7 +482,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
             request_coords.append(coord)
 
     if request_coords:
-        batch_size = max(1, min(renderer.mesh_batch_size * 2, 32))
+        batch_size = max(1, min(renderer_module.chunk_prep_request_budget_cap, max(renderer.mesh_batch_size, renderer.terrain_batch_size)))
         request_batches = [
             request_coords[index : index + batch_size]
             for index in range(0, len(request_coords), batch_size)

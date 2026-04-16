@@ -55,3 +55,4 @@ class Camera:
 
 engine_mode = ENGINE_MODE_METAL
 chunk_prep_request_budget_cap = 8 if engine_mode != ENGINE_MODE_CPU else 2
+chunk_prep_bootstrap_displayed_ratio_threshold = 0.05

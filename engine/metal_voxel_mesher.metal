@@ -76,44 +76,14 @@ inline void emit_quad(
     emit_vertex(dst, base + 5u, p3, normal, color);
 }
 
-inline bool reserve_chunk_slice(
-    device atomic_uint *chunkVertexCounts,
-    device atomic_uint *overflowFlags,
-    uint chunkIndex,
-    uint need,
-    uint maxVerticesPerChunk,
-    thread uint &baseOut
-) {
-    uint expected = atomic_load_explicit(&chunkVertexCounts[chunkIndex], memory_order_relaxed);
-
-    while (true) {
-        if (expected > maxVerticesPerChunk || need > (maxVerticesPerChunk - expected)) {
-            atomic_store_explicit(&overflowFlags[chunkIndex], 1u, memory_order_relaxed);
-            return false;
-        }
-
-        uint desired = expected + need;
-        if (atomic_compare_exchange_weak_explicit(
-                &chunkVertexCounts[chunkIndex],
-                &expected,
-                desired,
-                memory_order_relaxed,
-                memory_order_relaxed)) {
-            baseOut = expected;
-            return true;
-        }
-        // expected updated on failure
-    }
+inline uint column_linear_index(uint chunkIndex, uint columnX, uint columnZ, uint columnsPerSide) {
+    return chunkIndex * (columnsPerSide * columnsPerSide) + columnZ * columnsPerSide + columnX;
 }
 
-kernel void mesh_columns_fixed_slice(
-    device const uint       *blocks            [[buffer(0)]],
-    device const uint       *materials         [[buffer(1)]],
-    device const ChunkCoord *chunkCoords       [[buffer(2)]],
-    device atomic_uint      *chunkVertexCounts [[buffer(3)]],
-    device atomic_uint      *overflowFlags     [[buffer(4)]],
-    device VoxelVertex      *vertexPool        [[buffer(5)]],
-    constant MesherParams   &params            [[buffer(6)]],
+kernel void count_columns_fixed_slice(
+    device const uint     *blocks             [[buffer(0)]],
+    device uint           *columnVertexCounts [[buffer(1)]],
+    constant MesherParams &params             [[buffer(2)]],
     uint3 gid [[thread_position_in_grid]]
 ) {
     uint columnsPerSide = params.sampleSize - 2u;
@@ -139,20 +109,168 @@ kernel void mesh_columns_fixed_slice(
         if (blocks[idx - params.sampleSize] == 0u)                    columnVertexCount += 6u;
     }
 
-    if (columnVertexCount == 0u) return;
+    columnVertexCounts[column_linear_index(chunkIndex, gid.x, gid.y, columnsPerSide)] = columnVertexCount;
+}
 
-    uint chunkLocalBase = 0u;
-    if (!reserve_chunk_slice(
-            chunkVertexCounts,
-            overflowFlags,
-            chunkIndex,
-            columnVertexCount,
-            params.maxVerticesPerChunk,
-            chunkLocalBase)) {
+kernel void scan_columns_fixed_slice_serial(
+    device const uint     *columnVertexCounts [[buffer(0)]],
+    device uint           *columnVertexOffsets[[buffer(1)]],
+    device uint           *chunkVertexCounts  [[buffer(2)]],
+    device uint           *overflowFlags      [[buffer(3)]],
+    constant MesherParams &params             [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.chunkCount) {
         return;
     }
 
-    uint dstBase = chunkIndex * params.maxVerticesPerChunk + chunkLocalBase;
+    uint columnsPerSide = params.sampleSize - 2u;
+    uint columnsPerChunk = columnsPerSide * columnsPerSide;
+    uint base = gid * columnsPerChunk;
+    uint running = 0u;
+
+    for (uint i = 0u; i < columnsPerChunk; ++i) {
+        uint count = columnVertexCounts[base + i];
+        columnVertexOffsets[base + i] = running;
+        running += count;
+    }
+
+    if (running > params.maxVerticesPerChunk) {
+        overflowFlags[gid] = 1u;
+        chunkVertexCounts[gid] = 0u;
+        return;
+    }
+
+    overflowFlags[gid] = 0u;
+    chunkVertexCounts[gid] = running;
+}
+
+constant uint kScanThreadgroupWidth = 1024u;
+
+kernel void scan_columns_fixed_slice_parallel(
+    device const uint     *columnVertexCounts [[buffer(0)]],
+    device uint           *columnVertexOffsets[[buffer(1)]],
+    device uint           *chunkVertexCounts  [[buffer(2)]],
+    device uint           *overflowFlags      [[buffer(3)]],
+    constant MesherParams &params             [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]]
+) {
+    uint chunkIndex = tgid.z;
+    if (chunkIndex >= params.chunkCount) {
+        return;
+    }
+
+    uint columnsPerSide = params.sampleSize - 2u;
+    uint columnsPerChunk = columnsPerSide * columnsPerSide;
+    if (columnsPerChunk > kScanThreadgroupWidth) {
+        if (lid.x == 0u) {
+            uint base = chunkIndex * columnsPerChunk;
+            uint running = 0u;
+            for (uint i = 0u; i < columnsPerChunk; ++i) {
+                uint count = columnVertexCounts[base + i];
+                columnVertexOffsets[base + i] = running;
+                running += count;
+            }
+            if (running > params.maxVerticesPerChunk) {
+                overflowFlags[chunkIndex] = 1u;
+                chunkVertexCounts[chunkIndex] = 0u;
+            } else {
+                overflowFlags[chunkIndex] = 0u;
+                chunkVertexCounts[chunkIndex] = running;
+            }
+        }
+        return;
+    }
+
+    uint tid = lid.x;
+    uint base = chunkIndex * columnsPerChunk;
+    threadgroup uint scratch[kScanThreadgroupWidth];
+    threadgroup uint lastValue;
+
+    uint value = 0u;
+    if (tid < columnsPerChunk) {
+        value = columnVertexCounts[base + tid];
+    }
+    scratch[tid] = value;
+    if (tid == columnsPerChunk - 1u) {
+        lastValue = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = 1u; offset < kScanThreadgroupWidth; offset <<= 1u) {
+        uint index = ((tid + 1u) * offset * 2u) - 1u;
+        if (index < kScanThreadgroupWidth) {
+            scratch[index] += scratch[index - offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        scratch[kScanThreadgroupWidth - 1u] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = kScanThreadgroupWidth >> 1u; offset > 0u; offset >>= 1u) {
+        uint index = ((tid + 1u) * offset * 2u) - 1u;
+        if (index < kScanThreadgroupWidth) {
+            uint temp = scratch[index - offset];
+            scratch[index - offset] = scratch[index];
+            scratch[index] += temp;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < columnsPerChunk) {
+        columnVertexOffsets[base + tid] = scratch[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        uint running = 0u;
+        if (columnsPerChunk > 0u) {
+            running = scratch[columnsPerChunk - 1u] + lastValue;
+        }
+        if (running > params.maxVerticesPerChunk) {
+            overflowFlags[chunkIndex] = 1u;
+            chunkVertexCounts[chunkIndex] = 0u;
+        } else {
+            overflowFlags[chunkIndex] = 0u;
+            chunkVertexCounts[chunkIndex] = running;
+        }
+    }
+}
+
+kernel void emit_columns_fixed_slice(
+    device const uint       *blocks             [[buffer(0)]],
+    device const uint       *materials          [[buffer(1)]],
+    device const ChunkCoord *chunkCoords        [[buffer(2)]],
+    device const uint       *columnVertexCounts [[buffer(3)]],
+    device const uint       *columnVertexOffsets[[buffer(4)]],
+    device const uint       *overflowFlags      [[buffer(5)]],
+    device VoxelVertex      *vertexPool         [[buffer(6)]],
+    constant MesherParams   &params             [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint columnsPerSide = params.sampleSize - 2u;
+    if (gid.x >= columnsPerSide || gid.y >= columnsPerSide || gid.z >= params.chunkCount) {
+        return;
+    }
+
+    uint chunkIndex = gid.z;
+    if (overflowFlags[chunkIndex] != 0u) {
+        return;
+    }
+
+    uint columnIndex = column_linear_index(chunkIndex, gid.x, gid.y, columnsPerSide);
+    uint columnVertexCount = columnVertexCounts[columnIndex];
+    if (columnVertexCount == 0u) return;
+
+    uint localX = gid.x + 1u;
+    uint localZ = gid.y + 1u;
+    uint plane = params.sampleSize * params.sampleSize;
+    uint dstBase = chunkIndex * params.maxVerticesPerChunk + columnVertexOffsets[columnIndex];
     uint written = 0u;
 
     ChunkCoord cc = chunkCoords[chunkIndex];
@@ -179,7 +297,6 @@ kernel void mesh_columns_fixed_slice(
         float3 north  = material_color(material, y) * 0.60f;
 
         if (y + 1u >= params.heightLimit || blocks[idx + plane] == 0u) {
-            // fixed winding for +Y
             emit_quad(vertexPool, dstBase + written,
                 float3(x0, y1, z0),
                 float3(x0, y1, z1),
@@ -191,7 +308,6 @@ kernel void mesh_columns_fixed_slice(
         }
 
         if (y == 0u || blocks[idx - plane] == 0u) {
-            // fixed winding for -Y
             emit_quad(vertexPool, dstBase + written,
                 float3(x0, y0, z0),
                 float3(x1, y0, z0),

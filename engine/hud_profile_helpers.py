@@ -504,13 +504,34 @@ def build_frame_breakdown_hud_vertices(renderer, lines: list[str]) -> tuple[byte
     return build_hud_vertices(renderer, lines, align_right=True)
 
 
-def draw_hud_overlay(renderer, encoder, color_view, vertex_bytes: bytes, vertex_count: int) -> None:
+def _ensure_hud_vertex_buffer(renderer, attr_prefix: str, vertex_bytes: bytes):
+    buffer_attr = f"{attr_prefix}_vertex_buffer"
+    capacity_attr = f"{attr_prefix}_vertex_buffer_capacity"
     if not vertex_bytes:
+        setattr(renderer, buffer_attr, None)
+        setattr(renderer, capacity_attr, 0)
+        return None
+
+    existing = getattr(renderer, buffer_attr, None)
+    capacity = int(getattr(renderer, capacity_attr, 0) or 0)
+    size = len(vertex_bytes)
+    if existing is None or capacity < size:
+        if existing is not None:
+            existing.destroy()
+        capacity = max(4096, 1 << (size - 1).bit_length())
+        existing = renderer.device.create_buffer(
+            size=capacity,
+            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.COPY_DST,
+        )
+        setattr(renderer, buffer_attr, existing)
+        setattr(renderer, capacity_attr, capacity)
+    renderer.device.queue.write_buffer(existing, 0, vertex_bytes)
+    return existing
+
+
+def draw_hud_overlay(renderer, encoder, color_view, hud_buffer, vertex_count: int) -> None:
+    if hud_buffer is None or vertex_count <= 0:
         return
-    hud_buffer = renderer.device.create_buffer_with_data(
-        data=vertex_bytes,
-        usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.COPY_DST,
-    )
     hud_pass = encoder.begin_render_pass(
         color_attachments=[
             {
@@ -530,13 +551,13 @@ def draw_hud_overlay(renderer, encoder, color_view, vertex_bytes: bytes, vertex_
 def draw_profile_hud(renderer, encoder, color_view) -> None:
     if not renderer.profiling_enabled:
         return
-    draw_hud_overlay(renderer, encoder, color_view, renderer.profile_hud_vertex_bytes, renderer.profile_hud_vertex_count)
+    draw_hud_overlay(renderer, encoder, color_view, renderer.profile_hud_vertex_buffer, renderer.profile_hud_vertex_count)
 
 
 def draw_frame_breakdown_hud(renderer, encoder, color_view) -> None:
     if not renderer.profiling_enabled:
         return
-    draw_hud_overlay(renderer, encoder, color_view, renderer.frame_breakdown_vertex_bytes, renderer.frame_breakdown_vertex_count)
+    draw_hud_overlay(renderer, encoder, color_view, renderer.frame_breakdown_vertex_buffer, renderer.frame_breakdown_vertex_count)
 
 
 def refresh_profile_summary(renderer, now: float) -> None:
@@ -556,8 +577,10 @@ def refresh_profile_summary(renderer, now: float) -> None:
         f"MESH SLABS {slab_count:2d}  USED {slab_used_bytes / (1024.0 * 1024.0):4.1f} MIB  FREE {slab_free_bytes / (1024.0 * 1024.0):4.1f} MIB",
         f"MESH BIGGEST GAP {slab_largest_free_bytes / (1024.0 * 1024.0):4.1f} MIB  ALLOCS {slab_alloc_count:3d}",
     ]
-    renderer.profile_hud_lines = lines
-    renderer.profile_hud_vertex_bytes, renderer.profile_hud_vertex_count = build_profile_hud_vertices(renderer, lines)
+    if lines != renderer.profile_hud_lines or renderer.profile_hud_vertex_count <= 0:
+        renderer.profile_hud_lines = lines
+        renderer.profile_hud_vertex_bytes, renderer.profile_hud_vertex_count = build_profile_hud_vertices(renderer, lines)
+        _ensure_hud_vertex_buffer(renderer, "profile_hud", renderer.profile_hud_vertex_bytes)
     renderer.profile_window_start = now
     renderer.profile_next_report = now + renderer_module.PROFILE_REPORT_INTERVAL
     renderer.profile_window_cpu_ms = 0.0
@@ -630,12 +653,14 @@ def refresh_frame_breakdown_summary(renderer) -> None:
         f"  COMMAND FINISH: {avg_command_finish:5.1f} MS",
         f"  QUEUE SUBMIT: {avg_queue_submit:5.1f} MS",
         f"WALL FRAME: {avg_wall_frame:5.1f} MS",
-        f"CHUNK PAYLOAD: {chunk_memory_bytes:,} BYTES ({chunk_memory_mib:5.2f} MIB)",
+        f"CHUNK VRAM: {chunk_memory_bytes:,} BYTES ({chunk_memory_mib:5.2f} MIB)",
         f"TOTAL DRAW VERTICES: {visible_vertices:,}",
         f"VISIBLE BUT NOT READY: {visible_but_not_ready}",
         f"PENDING CHUNK REQUESTS: {pending_chunk_requests}",
         f"DRAW CALLS: {draw_calls}",
         f"VISIBLE MERGED CHUNKS (VISIBLE ONLY): {merged_chunks}",
     ]
-    renderer.frame_breakdown_lines = lines
-    renderer.frame_breakdown_vertex_bytes, renderer.frame_breakdown_vertex_count = build_frame_breakdown_hud_vertices(renderer, lines)
+    if lines != renderer.frame_breakdown_lines or renderer.frame_breakdown_vertex_count <= 0:
+        renderer.frame_breakdown_lines = lines
+        renderer.frame_breakdown_vertex_bytes, renderer.frame_breakdown_vertex_count = build_frame_breakdown_hud_vertices(renderer, lines)
+        _ensure_hud_vertex_buffer(renderer, "frame_breakdown", renderer.frame_breakdown_vertex_bytes)

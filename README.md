@@ -1,129 +1,216 @@
 # Minechunk
 
-Minechunk is a chunk-streamed voxel terrain engine implemented in Python on top of `wgpu-py`. The codebase is organized around deterministic terrain synthesis, explicit chunk residency, meshing, visibility culling, and indirect draw submission. It is a measurement-oriented engine, not a simplification showcase.
+Minechunk is a measurement-first voxel terrain engine written in Python.
 
-The checked-in configuration currently sets `engine_mode = ENGINE_MODE_METAL` in `engine/renderer_config.py`. On macOS with `pyobjc-framework-Metal` installed, terrain generation and meshing use Metal. If Metal is unavailable, Minechunk automatically falls back to `wgpu` terrain, then to CPU terrain if no GPU terrain backend can be created.
+It streams a full `65 × 65` visible chunk field, keeps explicit chunk residency, builds chunk meshes on CPU or GPU, performs GPU visibility culling, and submits terrain through indirect draw commands. The project is intentionally **not** built around geometry-reduction tricks. It exists to measure raw terrain generation, meshing, streaming, and presentation cost under a real visible scene.
 
-## Engine Specification
+The checked-in default is currently:
 
-- Chunk dimensions: `32 x 128 x 32`
-- Chunk surface sample footprint: `34 x 34`
-- Default render radius: `32` chunks (`1,024` blocks)
-- Default visible square: `65 x 65` chunks (`4,225` chunk slots)
-- Default mesh cache capacity: `4,225` chunks
-- Terrain model: deterministic heightfield with voxel column expansion
-- Render submission: indirect draws with GPU visibility culling
-- Profiling: built-in HUD plus frame breakdown overlay
-- Movement: free-flight camera with sprint scaling
+- `engine_mode = ENGINE_MODE_METAL`
 
-The default residency envelope is a `65 x 65` chunk square. The cache capacity is sized to hold that envelope.
+That means Minechunk will try to use the native Metal terrain backend on macOS first. If Metal is unavailable, it falls back to the `wgpu` terrain backend, and then to the CPU terrain backend.
+
+## Current State
+
+What exists today:
+
+- deterministic terrain synthesis
+- chunk streaming and explicit residency tracking
+- CPU terrain backend
+- `wgpu` terrain backend
+- native Metal terrain backend for macOS
+- CPU meshing
+- `wgpu` GPU meshing
+- Metal GPU meshing
+- GPU visibility culling
+- indirect draw submission
+- merged render tiles
+- built-in profiling HUD and frame-breakdown HUD
+
+What does **not** exist yet:
+
+- native Metal renderer path
+- greedy meshing
+- level of detail
+- geometry simplification
+
+Rendering still goes through the `wgpu` presentation path. Metal is already used for terrain generation and meshing when the Metal backend is active.
+
+## Engine Contract
+
+- Chunk size: `32 × 128 × 32`
+- Surface sampling footprint per chunk: `34 × 34`
+- Default render distance: `32` chunks (`1024` blocks)
+- Default visible square: `65 × 65` chunks (`4225` chunk slots)
+- Default cache capacity: `4225` chunks
+- Vertex stride: `48` bytes
+- Default mesh batch size: `128`
+- Minimum mesh output slab: `64 MiB`
+- GPU visibility workgroup size: `64`
+- Swapchain cap: `320 FPS`
+- VSync default: `off`
+
+The cache is intentionally sized to hold the full default visible square.
+
+## Why This Engine Is Weird On Purpose
+
+Minechunk deliberately keeps expensive things visible instead of hiding them behind simplification.
+
+It does **not** use:
+
+- greedy meshing
+- LOD
+- decimated far terrain
+- “fake” benchmark scenes that avoid full residency pressure
+
+That makes the numbers harsher, but also more honest. The project is meant to answer questions like:
+
+- how much chunk throughput survives under a real visible scene?
+- what is the actual p99 frame cost of sustained streaming?
+- where do CPU↔GPU synchronization costs start to dominate?
+- how stable is chunk residency under continuous movement?
+
+## Pipeline Overview
+
+`TerrainRenderer.draw_frame()` drives the frame.
+
+1. Camera input updates yaw, pitch, and free-flight motion.
+2. The visible chunk square is recomputed when the camera crosses chunk boundaries.
+3. Visible render batches are prepared from the chunk cache and merged tile cache.
+4. If enabled, GPU visibility culling writes indirect draw commands.
+5. Terrain, HUD, and frame-breakdown overlays are encoded into one command buffer.
+6. The command buffer is submitted through `wgpu`.
+7. Deferred GPU resources and pending GPU mesh batches are finalized.
+8. Ready terrain results are drained, meshed, and inserted into the ordered chunk cache.
+9. Missing visible chunks are reprioritized and new terrain requests are issued.
+10. Per-frame breakdown metrics are sampled for the HUD.
+
+The runtime uses slab-backed mesh output buffers plus explicit suballocation metadata instead of per-chunk buffer churn. That keeps residency pressure visible and makes allocator behavior measurable.
+
+## Terrain Model
+
+Terrain is deterministic and heightfield-driven.
+
+For each `(x, z)` surface position, layered 2D value noise produces:
+
+- surface height
+- top material
+
+The engine then expands that surface into a full voxel column.
+
+Material layering is simple and explicit:
+
+- `BEDROCK` at `y = 0`
+- `STONE` below the upper soil band
+- `DIRT` near the top
+- surface material at the top voxel
+- `AIR` above the sampled height
+
+This keeps terrain generation predictable enough for backend validation while still producing large streamed worlds.
+
+## Backends
+
+### CPU
+
+`CpuTerrainBackend` is the reference path. It is the simplest backend and the fallback when GPU terrain cannot be created.
+
+### Wgpu
+
+`WgpuTerrainBackend` uses compute passes through `wgpu-py`. This path shares the renderer’s graphics API and is portable across supported `wgpu` platforms.
+
+### Metal
+
+`MetalTerrainBackend` is a native macOS backend implemented through PyObjC + Metal. When Metal terrain is active, Minechunk can also route chunk meshing through the Metal mesher.
+
+Fallback order when `ENGINE_MODE_METAL` is selected:
+
+1. Metal terrain backend
+2. `wgpu` terrain backend
+3. CPU terrain backend
 
 ## Measured Performance
 
-All figures below were recorded on an Apple M4 system using the CPU backend with profiling enabled.
+The checked-in measurements below describe a profiled Apple M4 run using the **CPU backend**.
 
-Profiling overhead is substantial. The profiler materially slows the engine and lowers the observed frame-time and chunk-throughput numbers. Treat the values below as profiled measurements, not unprofiled ceilings, and do not compare them directly against unprofiled runs.
+These are **profiled** numbers. The built-in HUD and profiling instrumentation add real overhead, so they should not be treated as absolute ceilings.
 
 | Scenario | Motion / Load | Result |
 | --- | --- | --- |
-| End-to-end chunk streaming, meshing, and rendering | Flying at approximately `1.5k blocks/s` | Approximately `550 chunks/s`, `P99 4.7 ms` |
-| Saturated visible set | Standing in a fully loaded `65 x 65` chunk field | `P99 36.2 ms` |
+| End-to-end chunk streaming, meshing, and rendering | Flying at approximately `1.5k blocks/s` | approximately `550 chunks/s`, `P99 4.7 ms` |
+| Saturated visible set | Standing in a fully loaded `65 × 65` chunk field | `P99 36.2 ms` |
 
-These numbers describe the CPU backend path, not a GPU-terrain-only configuration.
-
-## Pipeline
-
-`draw_frame()` is the top-level frame graph. The order is fixed:
-
-1. Pointer events update yaw and pitch through `_handle_pointer_move()`, while `self._update_camera(dt)` integrates free-flight motion from the current key state and clamps camera height to `[4.0, world.height + 48.0]`.
-2. `chunk_gen.refresh_visible_chunk_set(self)` recomputes `_visible_chunk_origin`, `_visible_chunk_coords`, and `_visible_chunk_coord_set` when the camera crosses a chunk boundary. The visible envelope is a square of `(2 * chunk_radius + 1)^2` chunk coordinates, which is `65 x 65` at the default radius of `32`.
-3. `_submit_render()` writes the 80-byte camera uniform, then builds either `mesh_cache.visible_render_batches(self, encoder)` or `mesh_cache.visible_render_batches_indirect(self, encoder)` depending on indirect-draw support. When `use_gpu_visibility_culling` is enabled and `_mesh_output_slabs` is non-empty, the renderer also dispatches `mesh_visibility_pipeline` in workgroups of `GPU_VISIBILITY_WORKGROUP_SIZE = 64` to populate `_mesh_draw_indirect_buffer`.
-4. The render pass binds `camera_bind_group`, sets the vertex buffer for each visible batch, and issues either `draw()`, `draw_indirect()`, or `multi_draw_indirect()` depending on backend support and command batching.
-5. `hud_profile.draw_profile_hud(self, encoder, color_view)` and `hud_profile.draw_frame_breakdown_hud(self, encoder, color_view)` append the profiler overlays into the same command buffer before submission.
-6. `encoder.finish()` and `self.device.queue.submit([command_buffer])` present the frame. `swapchain_acquire_ms` is measured separately because drawable acquisition can stall independently of command encoding.
-7. `chunk_gen.service_background_gpu_work(self)` reclaims deferred GPU buffers, processes deferred mesh-output frees, and finalizes pending GPU mesh batches when `use_gpu_meshing` is enabled.
-8. `chunk_gen.prepare_chunks(self, dt)` pulls ready `ChunkVoxelResult` records from the active terrain backend, sorts them by `chunk_prep_priority()` `(distance_sq, abs(dz), abs(dx))`, then drains them in batches capped by `mesh_batch_size`. On the default CPU path, each record is handed to `accept_chunk_voxel_result()`, which routes through `make_chunk_mesh_from_voxels()` and the CPU meshing helpers when GPU meshing is disabled; on `wgpu` or Metal terrain paths, the batch is forwarded to `wgpu_mesher.make_chunk_mesh_batch_from_voxels()`. The resulting `ChunkMesh` objects are stored into the ordered chunk cache.
-9. The request queue is rebuilt from `_visible_missing_coords` in Chebyshev rings around the current chunk origin, then drained in bounded batches. The per-frame request budget is `min(missing_count, max(1, min(chunk_prep_request_budget_cap, mesh_batch_size * 2, 32)))`, which defaults to `2` in CPU mode.
-10. Frame-breakdown samples are recorded for `world_update`, `visibility_lookup`, `chunk_stream`, `chunk_stream_bytes`, `chunk_displayed_added`, `camera_upload`, `swapchain_acquire`, `render_encode`, `command_finish`, `queue_submit`, `wall_frame`, `draw_calls`, `merged_chunks`, `visible_vertices`, `visible_chunk_targets`, `visible_chunks`, and `pending_chunk_requests`.
-
-The implementation uses shared mesh slabs, suballocated mesh-output buffers, and explicit allocation metadata instead of per-chunk buffer churn. That keeps residency stable under sustained streaming pressure and makes the allocator behavior visible to the profiler.
-
-## Terrain Backends
-
-`VoxelWorld` exposes the terrain source through a backend facade:
-
-- `CpuTerrainBackend` is the reference implementation and the default checked-in path.
-- `WgpuTerrainBackend` generates terrain data via `wgpu` compute passes.
-- `MetalTerrainBackend` is a native Metal backend for macOS via PyObjC.
-
-Terrain is deterministic and heightfield-driven. Surface height and top material are sampled from layered 2D value noise, then expanded into voxel columns. This engine does not attempt to hide terrain cost behind aggressive simplification.
-
-## Explicit Non-Goals
-
-The following are intentionally not implemented:
-
-- Greedy meshing
-- Level of detail
-- Geometry simplification
-
-These are excluded by design to keep the visual output honest and to preserve raw geometry-generation and presentation cost as measured quantities.
-
-## Future Features
-
-The following items are planned future work and are not part of the current engine contract:
-
-- Native Metal renderer execution path (terrain generation and chunk meshing on Metal are already implemented)
-- Baked ambient occlusion
-- Screen-space ambient occlusion
-- Screen-space volumetric lighting
-- Exponential squared fog
-
-The remaining Metal roadmap item is renderer execution on Metal so the entire terrain-to-frame path can run without the `wgpu` presentation renderer. The rendering features above are listed as separate passes and effects so their costs remain independently measurable.
-
-## Repository Layout
-
-- `main.py`: root entry point that starts `engine.renderer.TerrainRenderer`
-- `engine/`: runtime package containing the renderer, backends, mesh cache, shaders, and helpers
-- `docs/`: captured screenshots for the CPU, Wgpu, and Metal demos
-- `res/`: bundled HUD font asset
+Those figures describe the CPU path under a real visible scene, not a terrain-only benchmark.
 
 ## Build And Run
 
+Install base dependencies:
+
 ```bash
 python3 -m pip install -r requirements.txt
+```
+
+Run:
+
+```bash
 python3 main.py
 ```
 
-To enable the default checked-in Metal mode on macOS:
+Optional macOS Metal support:
 
 ```bash
 python3 -m pip install pyobjc-framework-Metal
 ```
 
-Backend selection lives in `engine/renderer_config.py` via `engine_mode`:
+## Backend Selection
+
+Backend selection lives in `engine/renderer_config.py`:
 
 - `ENGINE_MODE_CPU`
 - `ENGINE_MODE_WGPU`
 - `ENGINE_MODE_METAL`
 
-Current checked-in default:
+Checked-in default:
 
-- `engine_mode = ENGINE_MODE_METAL`
+```python
+engine_mode = ENGINE_MODE_METAL
+```
 
-If the preferred backend cannot be created, the terrain facade falls back to an available backend and prints a warning.
+If the preferred backend cannot be created, Minechunk prints a warning and falls back to an available backend.
 
 ## Controls
 
-- `WASD` or arrow keys: move horizontally
+- `WASD` or arrow keys: horizontal movement
 - `X`: move up
 - `Z`: move down
-- `Shift`: sprint and fly faster
-- Left mouse drag: look around
-- `F3`: toggle profiling HUDs
-- `R`: regenerate the world with a new seed
+- `Shift`: sprint / fast flight
+- left mouse drag: look around
+- `F3`: toggle profiling HUD
+- `R`: regenerate world with a new seed
 
-## Captures
+## Repository Layout
+
+- `main.py` — entry point
+- `engine/renderer.py` — main runtime, render loop, chunk streaming, visibility, submission
+- `engine/voxel_world.py` — terrain facade and backend selection
+- `engine/cpu_terrain_backend.py` — CPU terrain generation path
+- `engine/wgpu_terrain_backend.py` — `wgpu` terrain compute backend
+- `engine/metal_terrain_backend.py` — native Metal terrain backend
+- `engine/wgpu_chunk_mesher.py` — `wgpu` GPU meshing path
+- `engine/metal_chunk_mesher.py` — Metal GPU meshing path
+- `engine/terrain_kernels.py` — terrain and mesh-generation kernels
+- `engine/mesh_cache_helpers.py` — visible-batch and tile-cache helpers
+- `engine/hud_profile_helpers.py` — profiling HUD generation
+- `docs/` — captured demo screenshots
+- `res/` — HUD font asset
+
+## Screenshots
 
 | CPU | Wgpu | Metal |
 | --- | --- | --- |
 | ![CPU mode screenshot](docs/m4-cpu-demo-screenshot.png) | ![Wgpu mode screenshot](docs/m4-wgpu-demo-screenshot.png) | ![Metal mode screenshot](docs/m4-metal-demo-screenshot.png) |
+
+## Notes
+
+Minechunk is a renderer-and-systems project, not a content pipeline or gameplay project.
+
+The point is not “Minecraft clone in Python.” The point is building a chunk-streamed voxel engine where backend behavior, synchronization cost, residency pressure, and frame-time composition stay visible enough to study.

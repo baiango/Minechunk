@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import sys
-import struct
-
 import numpy as np
 
 from .cpu_terrain_backend import CpuTerrainBackend
@@ -101,268 +99,8 @@ def _create_preferred_gpu_backend(
     raise RuntimeError("; ".join(errors))
 
 
-GPU_TERRAIN_SHADER = """
-struct TerrainParams {
-    sample_origin: vec4f,
-    chunk_and_sample: vec4i,
-    seed_and_pad: vec4u,
-}
-
-@group(0) @binding(0) var<storage, read_write> heights: array<u32>;
-@group(0) @binding(1) var<storage, read_write> materials: array<u32>;
-@group(0) @binding(2) var<uniform> params: TerrainParams;
-
-fn hash2(ix: i32, iy: i32, seed: u32) -> f32 {
-    let value = sin(
-        f32(ix) * 127.1 +
-        f32(iy) * 311.7 +
-        f32(seed) * 74.7
-    ) * 43758.5453123;
-    return fract(value);
-}
-
-fn fade(t: f32) -> f32 {
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    return a + (b - a) * t;
-}
-
-fn value_noise_2d(x: f32, y: f32, seed: u32, frequency: f32) -> f32 {
-    let px = x * frequency;
-    let py = y * frequency;
-    let x0 = floor(px);
-    let y0 = floor(py);
-    let xf = px - x0;
-    let yf = py - y0;
-
-    let ix0 = i32(x0);
-    let iy0 = i32(y0);
-    let ix1 = ix0 + 1;
-    let iy1 = iy0 + 1;
-
-    let v00 = hash2(ix0, iy0, seed);
-    let v10 = hash2(ix1, iy0, seed);
-    let v01 = hash2(ix0, iy1, seed);
-    let v11 = hash2(ix1, iy1, seed);
-
-    let u = fade(xf);
-    let v = fade(yf);
-    let nx0 = lerp(v00, v10, u);
-    let nx1 = lerp(v01, v11, u);
-    return lerp(nx0, nx1, v) * 2.0 - 1.0;
-}
-
-fn terrain_sample(x: f32, z: f32, seed: u32, height_limit: u32) -> vec2u {
-    let broad = value_noise_2d(x, z, seed + 11u, 0.0009765625);
-    let ridge = value_noise_2d(x, z, seed + 23u, 0.00390625);
-    let detail = value_noise_2d(x, z, seed + 47u, 0.010416667);
-
-    var height_f = 26.0 + broad * 18.0 + ridge * 14.0 + detail * 8.0;
-    if (height_f < 4.0) {
-        height_f = 4.0;
-    }
-
-    let upper_bound = height_limit - 1u;
-    let upper_bound_f = f32(upper_bound);
-    if (height_f > upper_bound_f) {
-        height_f = upper_bound_f;
-    }
-    let height_i = u32(height_f);
-
-    var material = 4u;
-    if (height_i >= 90u) {
-        material = 6u;
-    } else if (height_i <= 14u) {
-        material = 5u;
-    } else if (height_i >= 70u && detail > 0.12) {
-        material = 2u;
-    }
-    return vec2u(height_i, material);
-}
-
-@compute @workgroup_size(1, 1, 1)
-fn sample_surface_profile_at_main() {
-    let result = terrain_sample(
-        params.sample_origin.x,
-        params.sample_origin.y,
-        params.seed_and_pad.x,
-        u32(params.sample_origin.w),
-    );
-    heights[0u] = result.x;
-    materials[0u] = result.y;
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn fill_chunk_surface_grids_main(@builtin(global_invocation_id) gid: vec3u) {
-    let sample_size = u32(params.chunk_and_sample.z);
-    if (gid.x >= sample_size || gid.y >= sample_size) {
-        return;
-    }
-
-    let chunk_x = params.chunk_and_sample.x;
-    let chunk_z = params.chunk_and_sample.y;
-    let chunk_size = 32i;
-    let origin_x = chunk_x * chunk_size - 1i;
-    let origin_z = chunk_z * chunk_size - 1i;
-    let world_x = f32(origin_x + i32(gid.x));
-    let world_z = f32(origin_z + i32(gid.y));
-    let result = terrain_sample(world_x, world_z, params.seed_and_pad.x, u32(params.sample_origin.w));
-
-    let cell_index = gid.y * sample_size + gid.x;
-    heights[cell_index] = result.x;
-    materials[cell_index] = result.y;
-}
-"""
-
-
-class _TerrainGpuBackend:
-    def __init__(self, device, chunk_size: int, height_limit: int) -> None:
-        if wgpu is None:
-            raise RuntimeError("wgpu is unavailable.")
-        self.device = device
-        self.chunk_size = int(chunk_size)
-        self.height_limit = int(height_limit)
-        self.sample_size = self.chunk_size + 2
-        self.cell_count = self.sample_size * self.sample_size
-        self._params_buffer = device.create_buffer(
-            size=64,
-            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
-        )
-        self._single_heights_buffer = device.create_buffer(
-            size=4,
-            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
-        )
-        self._single_materials_buffer = device.create_buffer(
-            size=4,
-            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
-        )
-        self._grid_heights_buffer = device.create_buffer(
-            size=self.cell_count * 4,
-            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
-        )
-        self._grid_materials_buffer = device.create_buffer(
-            size=self.cell_count * 4,
-            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
-        )
-        self._bind_group_layout = device.create_bind_group_layout(
-            entries=[
-                {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-                {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "storage"}},
-                {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE, "buffer": {"type": "uniform"}},
-            ]
-        )
-        self._single_bind_group = device.create_bind_group(
-            layout=self._bind_group_layout,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._single_heights_buffer}},
-                {"binding": 1, "resource": {"buffer": self._single_materials_buffer}},
-                {"binding": 2, "resource": {"buffer": self._params_buffer, "offset": 0, "size": 64}},
-            ],
-        )
-        self._grid_bind_group = device.create_bind_group(
-            layout=self._bind_group_layout,
-            entries=[
-                {"binding": 0, "resource": {"buffer": self._grid_heights_buffer}},
-                {"binding": 1, "resource": {"buffer": self._grid_materials_buffer}},
-                {"binding": 2, "resource": {"buffer": self._params_buffer, "offset": 0, "size": 64}},
-            ],
-        )
-        shader_module = device.create_shader_module(code=GPU_TERRAIN_SHADER)
-        self._single_pipeline = device.create_compute_pipeline(
-            layout=device.create_pipeline_layout(bind_group_layouts=[self._bind_group_layout]),
-            compute={"module": shader_module, "entry_point": "sample_surface_profile_at_main"},
-        )
-        self._grid_pipeline = device.create_compute_pipeline(
-            layout=device.create_pipeline_layout(bind_group_layouts=[self._bind_group_layout]),
-            compute={"module": shader_module, "entry_point": "fill_chunk_surface_grids_main"},
-        )
-
-    def _write_params(
-        self,
-        *,
-        sample_origin_x: float,
-        sample_origin_z: float,
-        height_limit: int,
-        chunk_x: int,
-        chunk_z: int,
-        sample_size: int,
-        seed: int,
-    ) -> None:
-        payload = struct.pack(
-            "<4f4i4I",
-            float(sample_origin_x),
-            float(sample_origin_z),
-            0.0,
-            float(height_limit),
-            int(chunk_x),
-            int(chunk_z),
-            int(sample_size),
-            0,
-            int(seed) & 0xFFFFFFFF,
-            0,
-            0,
-            0,
-        )
-        self.device.queue.write_buffer(self._params_buffer, 0, payload)
-
-    def surface_profile_at(self, x: int, z: int, seed: int) -> tuple[int, int]:
-        self._write_params(
-            sample_origin_x=float(x),
-            sample_origin_z=float(z),
-            height_limit=self.height_limit,
-            chunk_x=0,
-            chunk_z=0,
-            sample_size=1,
-            seed=seed,
-        )
-        encoder = self.device.create_command_encoder()
-        compute_pass = encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self._single_pipeline)
-        compute_pass.set_bind_group(0, self._single_bind_group)
-        compute_pass.dispatch_workgroups(1, 1, 1)
-        compute_pass.end()
-        self.device.queue.submit([encoder.finish()])
-        height = np.frombuffer(self.device.queue.read_buffer(self._single_heights_buffer, 0, 4), dtype=np.uint32, count=1)[0]
-        material = np.frombuffer(self.device.queue.read_buffer(self._single_materials_buffer, 0, 4), dtype=np.uint32, count=1)[0]
-        return int(height), int(material)
-
-    def fill_chunk_surface_grids(
-        self,
-        heights: np.ndarray,
-        materials: np.ndarray,
-        chunk_x: int,
-        chunk_z: int,
-        seed: int,
-    ) -> None:
-        self._write_params(
-            sample_origin_x=0.0,
-            sample_origin_z=0.0,
-            height_limit=self.height_limit,
-            chunk_x=chunk_x,
-            chunk_z=chunk_z,
-            sample_size=self.sample_size,
-            seed=seed,
-        )
-        encoder = self.device.create_command_encoder()
-        compute_pass = encoder.begin_compute_pass()
-        compute_pass.set_pipeline(self._grid_pipeline)
-        compute_pass.set_bind_group(0, self._grid_bind_group)
-        workgroups = (self.sample_size + 7) // 8
-        compute_pass.dispatch_workgroups(workgroups, workgroups, 1)
-        compute_pass.end()
-        self.device.queue.submit([encoder.finish()])
-        heights[:] = np.frombuffer(
-            self.device.queue.read_buffer(self._grid_heights_buffer, 0, self.cell_count * 4),
-            dtype=np.uint32,
-            count=self.cell_count,
-        )
-        materials[:] = np.frombuffer(
-            self.device.queue.read_buffer(self._grid_materials_buffer, 0, self.cell_count * 4),
-            dtype=np.uint32,
-            count=self.cell_count,
-        )
+# Legacy inline wgpu terrain backend removed.
+# Use engine.wgpu_terrain_backend.WgpuTerrainBackend or engine.metal_terrain_backend.MetalTerrainBackend.
 
 
 class VoxelWorld:
@@ -376,7 +114,7 @@ class VoxelWorld:
         gpu_device=None,
         prefer_gpu_terrain: bool = False,
         prefer_metal_backend: bool = False,
-        terrain_batch_size: int = 128,
+        terrain_batch_size: int = 256,
     ) -> None:
         self.seed = int(seed)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
@@ -465,6 +203,12 @@ class VoxelWorld:
 
     def terrain_backend_label(self) -> str:
         return self._backend.terrain_backend_label()
+
+    def destroy(self) -> None:
+        destroy = getattr(self._backend, "destroy", None)
+        if destroy is None:
+            return
+        destroy()
 
     def validate_chunk_surface_grids(self, chunk_x: int, chunk_z: int) -> TerrainValidationReport:
         cpu_backend = CpuTerrainBackend(self.seed, self.height, self.chunk_size)

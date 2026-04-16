@@ -152,18 +152,23 @@ def create_async_voxel_mesh_batch_resources(renderer, sample_size: int, height_l
         zero_counts_array=np.zeros(chunk_capacity, dtype=np.uint32),
     )
 
+    shared_entries = [
+        {"binding": 0, "resource": {"buffer": resources.blocks_buffer}},
+        {"binding": 1, "resource": {"buffer": resources.materials_buffer}},
+        {"binding": 2, "resource": {"buffer": resources.coords_buffer}},
+        {"binding": 3, "resource": {"buffer": resources.column_totals_buffer}},
+        {"binding": 4, "resource": {"buffer": resources.chunk_totals_buffer}},
+        {"binding": 5, "resource": {"buffer": resources.chunk_offsets_buffer}},
+        {"binding": 6, "resource": {"buffer": resources.emit_vertex_buffer}},
+        {"binding": 8, "resource": {"buffer": resources.params_buffer, "offset": 0, "size": 16}},
+    ]
     resources.count_bind_group = renderer.device.create_bind_group(
         layout=renderer.voxel_mesh_count_bind_group_layout,
-        entries=[
-            {"binding": 0, "resource": {"buffer": resources.blocks_buffer}},
-            {"binding": 1, "resource": {"buffer": resources.materials_buffer}},
-            {"binding": 2, "resource": {"buffer": resources.coords_buffer}},
-            {"binding": 3, "resource": {"buffer": resources.column_totals_buffer}},
-            {"binding": 4, "resource": {"buffer": resources.chunk_totals_buffer}},
-            {"binding": 5, "resource": {"buffer": resources.chunk_offsets_buffer}},
-            {"binding": 6, "resource": {"buffer": resources.emit_vertex_buffer}},
-            {"binding": 8, "resource": {"buffer": resources.params_buffer, "offset": 0, "size": 16}},
-        ],
+        entries=shared_entries,
+    )
+    resources.scan_bind_group = renderer.device.create_bind_group(
+        layout=renderer.voxel_mesh_scan_bind_group_layout,
+        entries=shared_entries,
     )
     resources.emit_bind_group = renderer.device.create_bind_group(
         layout=renderer.voxel_mesh_emit_bind_group_layout,
@@ -397,6 +402,7 @@ def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
     params_already_uploaded: bool = False,
     encoder=None,
     submit: bool = True,
+    surface_release_callbacks: list[object] | None = None,
 ) -> None:
     if renderer.voxel_mesh_count_pipeline is None or renderer.voxel_mesh_emit_pipeline is None:
         raise RuntimeError("GPU meshing pipeline is unavailable.")
@@ -408,8 +414,14 @@ def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
     columns_per_side = sample_size - 2
     if not async_voxel_mesh_batch_resources_match(resources, sample_size, height_limit, chunk_count):
         raise RuntimeError("Async voxel mesh batch resources do not match requested batch size.")
+    coords_view = resources.coords_array[:chunk_count]
+    for index, (chunk_x, chunk_z) in enumerate(chunk_coords_list):
+        coords_view[index, 0] = int(chunk_x)
+        coords_view[index, 1] = int(chunk_z)
     count_bind_group = resources.count_bind_group
+    scan_bind_group = resources.scan_bind_group
     assert count_bind_group is not None
+    assert scan_bind_group is not None
 
     zero_view = resources.zero_counts_array[:chunk_count]
     zero_view.fill(0)
@@ -423,7 +435,9 @@ def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
 
     if not params_already_uploaded:
         renderer.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
+    renderer.device.queue.write_buffer(resources.coords_buffer, 0, memoryview(coords_view))
     renderer.device.queue.write_buffer(resources.chunk_totals_buffer, 0, memoryview(zero_view))
+    renderer.device.queue.write_buffer(resources.chunk_offsets_buffer, 0, memoryview(zero_view))
 
     if encoder is None:
         encoder = renderer.device.create_command_encoder()
@@ -435,12 +449,11 @@ def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
 
     compute_pass = encoder.begin_compute_pass()
     compute_pass.set_pipeline(renderer.voxel_mesh_scan_pipeline)
-    compute_pass.set_bind_group(0, count_bind_group)
+    compute_pass.set_bind_group(0, scan_bind_group)
     compute_pass.dispatch_workgroups(1, 1, chunk_count)
     compute_pass.end()
 
     encoder.copy_buffer_to_buffer(resources.chunk_totals_buffer, 0, resources.readback_buffer, 0, chunk_count * 4)
-    encoder.copy_buffer_to_buffer(resources.chunk_offsets_buffer, 0, resources.readback_buffer, chunk_count * 4, chunk_count * 4)
     if submit:
         renderer.device.queue.submit([encoder.finish()])
 
@@ -461,6 +474,7 @@ def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
             params_buffer=resources.params_buffer,
             readback_buffer=resources.readback_buffer,
             resources=resources,
+            surface_release_callbacks=list(surface_release_callbacks or ()),
             metadata_promise=metadata_promise,
             submitted_at=time.perf_counter(),
         )
@@ -802,7 +816,7 @@ def make_chunk_mesh_batch_from_surface_gpu_batch(
     compute_pass.end()
     renderer.device.queue.submit([encoder.finish()])
 
-    return make_chunk_mesh_batch_from_gpu_buffers(
+    meshes = make_chunk_mesh_batch_from_gpu_buffers(
         renderer,
         chunk_coords,
         blocks_buffer,
@@ -810,6 +824,16 @@ def make_chunk_mesh_batch_from_surface_gpu_batch(
         sample_size,
         height_limit,
     )
+    callback = getattr(surface_batch, "_release_callback", None)
+    if callable(callback):
+        try:
+            callback()
+        finally:
+            try:
+                setattr(surface_batch, "_release_callback", None)
+            except Exception:
+                pass
+    return meshes
 
 
 def make_chunk_mesh_batches_from_surface_gpu_batches(renderer, surface_batches: list[ChunkSurfaceGpuBatch]) -> None:
@@ -820,8 +844,62 @@ def make_chunk_mesh_batches_from_surface_gpu_batches(renderer, surface_batches: 
     if not surface_batches:
         return
 
+    sample_size = renderer.world.chunk_size + 2
+    height_limit = renderer.world.height
+    workgroups = (sample_size + 7) // 8
+
     for surface_batch in surface_batches:
-        make_chunk_mesh_batch_from_surface_gpu_batch(renderer, surface_batch, defer_finalize=False)
+        if not surface_batch.chunks:
+            release_surface_gpu_batch_immediately(renderer, surface_batch)
+            continue
+
+        chunk_coords = surface_batch.chunks if isinstance(surface_batch.chunks, list) else list(surface_batch.chunks)
+        chunk_count = len(chunk_coords)
+        resources = acquire_async_voxel_mesh_batch_resources(renderer, sample_size, height_limit, chunk_count)
+        params_bytes = struct.pack(
+            "<4I",
+            int(sample_size),
+            int(height_limit),
+            int(chunk_count),
+            int(renderer.world.chunk_size),
+        )
+
+        renderer.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
+        expand_bind_group = get_voxel_surface_expand_bind_group(
+            renderer,
+            surface_batch,
+            resources.blocks_buffer,
+            resources.materials_buffer,
+            resources.params_buffer,
+        )
+
+        encoder = renderer.device.create_command_encoder()
+        compute_pass = encoder.begin_compute_pass()
+        compute_pass.set_pipeline(renderer.voxel_surface_expand_pipeline)
+        compute_pass.set_bind_group(0, expand_bind_group)
+        compute_pass.dispatch_workgroups(workgroups, workgroups, chunk_count * height_limit)
+        compute_pass.end()
+
+        surface_release_callbacks: list[object] = []
+        callback = getattr(surface_batch, "_release_callback", None)
+        if callable(callback):
+            surface_release_callbacks.append(callback)
+            try:
+                setattr(surface_batch, "_release_callback", None)
+            except Exception:
+                pass
+
+        enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
+            renderer,
+            chunk_coords,
+            resources,
+            sample_size,
+            height_limit,
+            params_already_uploaded=True,
+            encoder=encoder,
+            submit=True,
+            surface_release_callbacks=surface_release_callbacks,
+        )
 
 
 def release_pending_chunk_mesh_readback(renderer, pending) -> None:
@@ -832,17 +910,30 @@ def release_pending_chunk_mesh_readback(renderer, pending) -> None:
                 pending.readback_buffer.unmap()
             except Exception:
                 pass
-        return
-    owner.remaining_batches -= 1
-    if owner.remaining_batches > 0:
-        return
-    if owner.buffer.map_state != "unmapped":
+    else:
+        owner.remaining_batches -= 1
+        if owner.remaining_batches > 0:
+            return
+        if owner.buffer.map_state != "unmapped":
+            try:
+                owner.buffer.unmap()
+            except Exception:
+                pass
         try:
-            owner.buffer.unmap()
+            owner.buffer.destroy()
+        except Exception:
+            pass
+
+    callbacks = getattr(pending, "surface_release_callbacks", None) or ()
+    for callback in callbacks:
+        if not callable(callback):
+            continue
+        try:
+            callback()
         except Exception:
             pass
     try:
-        owner.buffer.destroy()
+        pending.surface_release_callbacks.clear()
     except Exception:
         pass
 
@@ -902,6 +993,8 @@ def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> in
         copy_batches: list[tuple[wgpu.GPUBuffer, int, wgpu.GPUBuffer, int]] = []
         cursor_bytes = 0
         for pending, chunk_totals, chunk_offsets, total_vertex_bytes in pending_infos:
+            if pending.chunk_count > 0:
+                renderer.device.queue.write_buffer(pending.chunk_offsets_buffer, 0, memoryview(chunk_offsets))
             batch_base_offset = shared_allocation.offset_bytes + cursor_bytes
             emit_bind_group = None
             emit_vertex_buffer = None

@@ -38,6 +38,7 @@ from rendercanvas.auto import RenderCanvas, loop
 
 from .meshing_types import (
     AsyncVoxelMeshBatchResources,
+    ChunkDrawBatch,
     ChunkMesh,
     ChunkRenderBatch,
     MeshBufferAllocation,
@@ -64,7 +65,7 @@ class TerrainRenderer:
         seed: int = 1337,
         use_gpu_terrain: bool | None = None,
         use_gpu_meshing: bool | None = None,
-        terrain_batch_size: int = 32,
+        terrain_batch_size: int = 256,
         mesh_batch_size: int | None = None,
     ) -> None:
         default_use_gpu = _engine_mode_uses_gpu_path()
@@ -72,7 +73,7 @@ class TerrainRenderer:
         self.use_gpu_meshing = default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
         if mesh_batch_size is None:
-            self.mesh_batch_size = max(1, min(int(self.terrain_batch_size), DEFAULT_MESH_BATCH_SIZE))
+            self.mesh_batch_size = max(1, int(self.terrain_batch_size))
         else:
             self.mesh_batch_size = max(1, int(mesh_batch_size))
         self._pending_surface_gpu_batch_target_multiplier = 10
@@ -117,6 +118,7 @@ class TerrainRenderer:
             prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
         )
+        self.mesh_backend_label = "CPU"
         self._using_metal_meshing = bool(self.use_gpu_meshing and self.world.terrain_backend_label() == "Metal")
         if self.use_gpu_meshing:
             self.mesh_backend_label = "Metal" if self._using_metal_meshing else "Wgpu"
@@ -144,6 +146,9 @@ class TerrainRenderer:
         self._visible_chunk_coords: list[tuple[int, int]] = []
         self._visible_chunk_coord_set: set[tuple[int, int]] = set()
         self._visible_chunk_origin: tuple[int, int] | None = None
+        self._visible_tile_keys: list[tuple[int, int]] = []
+        self._visible_tile_coords: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
+        self._visible_tile_masks: dict[tuple[int, int], int] = {}
         self._visible_displayed_coords: set[tuple[int, int]] = set()
         self._visible_missing_coords: set[tuple[int, int]] = set()
         self._chunk_request_queue: deque[tuple[int, int]] = deque()
@@ -152,6 +157,11 @@ class TerrainRenderer:
         self._pending_chunk_coords: set[tuple[int, int]] = set()
         self._transient_render_buffers: list[list[wgpu.GPUBuffer]] = []
         self._tile_render_batches: dict[tuple[int, int], ChunkRenderBatch] = {}
+        self._tile_dirty_keys: set[tuple[int, int]] = set()
+        self._tile_versions: dict[tuple[int, int], int] = {}
+        self._visible_layout_version = 0
+        self._tile_mutation_version = 0
+        self._cached_tile_draw_batches: dict[tuple[int, int, int], tuple[list[ChunkDrawBatch], int, int, int]] = {}
         self._mesh_buffer_refs: dict[int, int] = {}
         self._mesh_output_slabs: OrderedDict[int, MeshOutputSlab] = OrderedDict()
         self._mesh_allocations: dict[int, MeshBufferAllocation] = {}
@@ -194,6 +204,7 @@ class TerrainRenderer:
         self._async_voxel_mesh_batch_pool_limit = 48
         self._gpu_mesh_async_inflight_limit = max(32, self.mesh_batch_size * 6)
         self._gpu_mesh_async_finalize_budget = max(1, self.mesh_batch_size * 2)
+        self._metal_gpu_mesh_async_finalize_budget = max(1, min(2, self.mesh_batch_size))
         self._pending_surface_gpu_batches_first_enqueued_at = 0.0
         self._pending_gpu_mesh_batches: deque[PendingChunkMeshBatch] = deque()
         self._gpu_mesh_deferred_buffer_cleanup: deque[tuple[int, list[wgpu.GPUBuffer]]] = deque()
@@ -210,6 +221,9 @@ class TerrainRenderer:
         self.profile_hud_lines: list[str] = []
         self.profile_hud_vertex_bytes = b""
         self.profile_hud_vertex_count = 0
+        self.profile_hud_vertex_buffer = None
+        self.profile_hud_vertex_buffer_capacity = 0
+        self._shutdown_complete = False
         self._hud_geometry_cache: OrderedDict[tuple[bool, int, int, tuple[str, ...]], tuple[bytes, int]] = OrderedDict()
         self.frame_breakdown_samples: dict[str, deque[float]] = {
             "world_update": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
@@ -234,6 +248,8 @@ class TerrainRenderer:
         self.frame_breakdown_lines: list[str] = []
         self.frame_breakdown_vertex_bytes = b""
         self.frame_breakdown_vertex_count = 0
+        self.frame_breakdown_vertex_buffer = None
+        self.frame_breakdown_vertex_buffer_capacity = 0
         self._last_frame_draw_calls = 0
         self._last_frame_merged_batches = 0
         self._last_new_displayed_chunks = 0
@@ -644,7 +660,23 @@ class TerrainRenderer:
         self.canvas.request_draw(self.draw_frame)
 
     def run(self) -> None:
-        loop.run()
+        try:
+            loop.run()
+        finally:
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
+        try:
+            metal_mesher.shutdown_renderer_async_state(self)
+        except Exception:
+            pass
+        try:
+            self.world.destroy()
+        except Exception:
+            pass
 
     def _handle_resize(self, event) -> None:
         self.depth_size = (0, 0)
@@ -750,7 +782,7 @@ class TerrainRenderer:
             "MESH BIGGEST GAP: --.- MIB  ALLOCS --",
             "TOTAL DRAW VERTICES: --",
             "WALL FRAME: --.- MS",
-            "CHUNK PAYLOAD: -- BYTES (--.- MIB)",
+            "CHUNK VRAM: -- BYTES (--.- MIB)",
             "DRAW CALLS: --",
             "VISIBLE MERGED CHUNKS (VISIBLE ONLY): --",
         ]
@@ -806,13 +838,14 @@ class TerrainRenderer:
     def _log_backend_diagnostics(self) -> None:
         terrain_backend = getattr(self.world, "_backend", None)
         terrain_device = getattr(terrain_backend, "device", None)
+        mesh_backend_label = getattr(self, "mesh_backend_label", "CPU")
         print(
             "Info: Backend diagnostics: "
             f"render_backend={self.render_backend_label}, "
             f"render_device={type(self.device).__name__}, "
             f"terrain_backend={type(terrain_backend).__name__}, "
             f"terrain_device={type(terrain_device).__name__}, "
-            f"mesh_backend={self.mesh_backend_label}",
+            f"mesh_backend={mesh_backend_label}",
             file=sys.stderr,
         )
 
@@ -888,6 +921,14 @@ class TerrainRenderer:
         mesh_cache.clear_tile_render_batches(self)
         self._clear_transient_render_buffers()
         self._visible_chunk_origin = None
+        try:
+            metal_mesher.shutdown_renderer_async_state(self)
+        except Exception:
+            pass
+        try:
+            self.world.destroy()
+        except Exception:
+            pass
         self.world = VoxelWorld(
             int(time.time()) & 0x7FFFFFFF,
             gpu_device=self.device,
@@ -996,13 +1037,152 @@ class TerrainRenderer:
                 coords.append((chunk_x + dx, chunk_z + dz))
         return coords
 
+    def _visible_chunk_bounds(self, origin: tuple[int, int]) -> tuple[int, int, int, int]:
+        radius = int(self.chunk_radius)
+        return (
+            int(origin[0] - radius),
+            int(origin[0] + radius),
+            int(origin[1] - radius),
+            int(origin[1] + radius),
+        )
+
+    def _tile_key_for_chunk(self, chunk_x: int, chunk_z: int) -> tuple[int, int]:
+        tile_size = int(MERGED_TILE_SIZE_CHUNKS)
+        return (int(chunk_x) // tile_size, int(chunk_z) // tile_size)
+
+    def _tile_bit_for_chunk(self, chunk_x: int, chunk_z: int) -> tuple[tuple[int, int], int]:
+        tile_size = int(MERGED_TILE_SIZE_CHUNKS)
+        tile_key_value = self._tile_key_for_chunk(int(chunk_x), int(chunk_z))
+        local_x = int(chunk_x) - tile_key_value[0] * tile_size
+        local_z = int(chunk_z) - tile_key_value[1] * tile_size
+        if 0 <= local_x < tile_size and 0 <= local_z < tile_size:
+            return tile_key_value, 1 << (local_z * tile_size + local_x)
+        return tile_key_value, 0
+
+    def _rebuild_visible_tile_layout_from_coords(self) -> None:
+        tile_groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        tile_masks: dict[tuple[int, int], int] = {}
+        for chunk_x, chunk_z in self._visible_chunk_coords:
+            tile_key_value, tile_bit = self._tile_bit_for_chunk(int(chunk_x), int(chunk_z))
+            tile_groups.setdefault(tile_key_value, []).append((int(chunk_x), int(chunk_z)))
+            if tile_bit != 0:
+                tile_masks[tile_key_value] = int(tile_masks.get(tile_key_value, 0)) | int(tile_bit)
+        self._visible_tile_keys = sorted(tile_groups)
+        self._visible_tile_coords = {
+            key: tuple(sorted(coords))
+            for key, coords in tile_groups.items()
+        }
+        self._visible_tile_masks = tile_masks
+
+    def _apply_visible_chunk_coord_delta(self, new_origin: tuple[int, int]) -> bool:
+        old_origin = self._visible_chunk_origin
+        old_coords = self._visible_chunk_coord_set
+        if old_origin is None or not old_coords:
+            return False
+
+        dx = int(new_origin[0] - old_origin[0])
+        dz = int(new_origin[1] - old_origin[1])
+        if dx == 0 and dz == 0:
+            return True
+        if max(abs(dx), abs(dz)) > 4:
+            return False
+
+        old_min_x, old_max_x, old_min_z, old_max_z = self._visible_chunk_bounds(old_origin)
+        new_min_x, new_max_x, new_min_z, new_max_z = self._visible_chunk_bounds(new_origin)
+        leaving: set[tuple[int, int]] = set()
+        entering: set[tuple[int, int]] = set()
+
+        if dx > 0:
+            for chunk_x in range(old_min_x, min(old_max_x + 1, old_min_x + dx)):
+                for chunk_z in range(old_min_z, old_max_z + 1):
+                    leaving.add((chunk_x, chunk_z))
+            for chunk_x in range(max(old_max_x + 1, new_min_x), new_max_x + 1):
+                for chunk_z in range(new_min_z, new_max_z + 1):
+                    entering.add((chunk_x, chunk_z))
+        elif dx < 0:
+            step = -dx
+            for chunk_x in range(max(old_min_x, old_max_x - step + 1), old_max_x + 1):
+                for chunk_z in range(old_min_z, old_max_z + 1):
+                    leaving.add((chunk_x, chunk_z))
+            for chunk_x in range(new_min_x, min(new_max_x + 1, old_min_x)):
+                for chunk_z in range(new_min_z, new_max_z + 1):
+                    entering.add((chunk_x, chunk_z))
+
+        if dz > 0:
+            for chunk_z in range(old_min_z, min(old_max_z + 1, old_min_z + dz)):
+                for chunk_x in range(old_min_x, old_max_x + 1):
+                    leaving.add((chunk_x, chunk_z))
+            for chunk_z in range(max(old_max_z + 1, new_min_z), new_max_z + 1):
+                for chunk_x in range(new_min_x, new_max_x + 1):
+                    entering.add((chunk_x, chunk_z))
+        elif dz < 0:
+            step = -dz
+            for chunk_z in range(max(old_min_z, old_max_z - step + 1), old_max_z + 1):
+                for chunk_x in range(old_min_x, old_max_x + 1):
+                    leaving.add((chunk_x, chunk_z))
+            for chunk_z in range(new_min_z, min(new_max_z + 1, old_min_z)):
+                for chunk_x in range(new_min_x, new_max_x + 1):
+                    entering.add((chunk_x, chunk_z))
+
+        if not leaving and not entering:
+            return False
+
+        updated_coords = set(old_coords)
+        updated_coords.difference_update(leaving)
+        updated_coords.update(entering)
+
+        tile_groups = {
+            key: set(coords)
+            for key, coords in self._visible_tile_coords.items()
+        }
+        tile_masks = dict(self._visible_tile_masks)
+
+        for chunk_x, chunk_z in leaving:
+            tile_key_value, tile_bit = self._tile_bit_for_chunk(chunk_x, chunk_z)
+            coords = tile_groups.get(tile_key_value)
+            if coords is not None:
+                coords.discard((chunk_x, chunk_z))
+                if not coords:
+                    tile_groups.pop(tile_key_value, None)
+            if tile_bit != 0:
+                next_mask = int(tile_masks.get(tile_key_value, 0)) & ~int(tile_bit)
+                if next_mask != 0:
+                    tile_masks[tile_key_value] = next_mask
+                else:
+                    tile_masks.pop(tile_key_value, None)
+
+        for chunk_x, chunk_z in entering:
+            tile_key_value, tile_bit = self._tile_bit_for_chunk(chunk_x, chunk_z)
+            tile_groups.setdefault(tile_key_value, set()).add((chunk_x, chunk_z))
+            if tile_bit != 0:
+                tile_masks[tile_key_value] = int(tile_masks.get(tile_key_value, 0)) | int(tile_bit)
+
+        self._visible_chunk_origin = new_origin
+        self._visible_chunk_coord_set = updated_coords
+        self._visible_chunk_coords = list(updated_coords)
+        self._visible_tile_keys = sorted(tile_groups)
+        self._visible_tile_coords = {
+            key: tuple(sorted(coords))
+            for key, coords in tile_groups.items()
+        }
+        self._visible_tile_masks = tile_masks
+        self._visible_layout_version += 1
+        self._cached_tile_draw_batches.clear()
+        return True
+
     def _refresh_visible_chunk_coords(self) -> None:
-        self._visible_chunk_origin = (
+        new_origin = (
             int(self.camera.position[0] // CHUNK_SIZE),
             int(self.camera.position[2] // CHUNK_SIZE),
         )
+        if self._apply_visible_chunk_coord_delta(new_origin):
+            return
+        self._visible_chunk_origin = new_origin
         self._visible_chunk_coords = self._chunk_coords_in_view()
         self._visible_chunk_coord_set = set(self._visible_chunk_coords)
+        self._rebuild_visible_tile_layout_from_coords()
+        self._visible_layout_version += 1
+        self._cached_tile_draw_batches.clear()
 
     def _warn_if_visible_exceeds_cache(self) -> None:
         visible_count = len(self._visible_chunk_coords)
@@ -1197,6 +1377,14 @@ class TerrainRenderer:
 
             hud_profile.refresh_frame_breakdown_summary(self)
         except Exception:
+            try:
+                chunk_gen.service_background_gpu_work(self)
+            except Exception:
+                pass
+            try:
+                mesh_cache.process_deferred_mesh_output_frees(self)
+            except Exception:
+                pass
             if profile_started_at is not None:
                 hud_profile.profile_end_frame(self, profile_started_at, 0.0)
             raise
