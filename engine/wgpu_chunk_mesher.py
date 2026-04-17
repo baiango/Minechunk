@@ -26,7 +26,7 @@ def _renderer_module():
 
 
 def _chunk_half() -> float:
-    return float(_renderer_module().CHUNK_SIZE) * 0.5
+    return float(_renderer_module().CHUNK_WORLD_SIZE) * 0.5
 
 
 def ensure_voxel_mesh_batch_scratch(renderer, sample_size: int, height_limit: int, chunk_capacity: int | None = None) -> None:
@@ -78,7 +78,7 @@ def ensure_voxel_mesh_batch_scratch(renderer, sample_size: int, height_limit: in
         usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
     )
     renderer._voxel_mesh_scratch_params_buffer = renderer.device.create_buffer(
-        size=16,
+        size=32,
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
     )
     renderer._voxel_mesh_scratch_batch_vertex_buffer = renderer.device.create_buffer(
@@ -137,7 +137,7 @@ def create_async_voxel_mesh_batch_resources(renderer, sample_size: int, height_l
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
         ),
         params_buffer=renderer.device.create_buffer(
-            size=16,
+            size=32,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         ),
         readback_buffer=renderer.device.create_buffer(
@@ -426,11 +426,15 @@ def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
     zero_view = resources.zero_counts_array[:chunk_count]
     zero_view.fill(0)
     params_bytes = struct.pack(
-        "<4I",
+        "<4I4f",
         int(sample_size),
         int(height_limit),
         int(chunk_count),
         int(_renderer_module().CHUNK_SIZE),
+        float(_renderer_module().BLOCK_SIZE),
+        0.0,
+        0.0,
+        0.0,
     )
 
     if not params_already_uploaded:
@@ -646,11 +650,15 @@ def make_chunk_mesh_batch_from_gpu_buffers(
         params_buffer,
         0,
         struct.pack(
-            "<4I",
+            "<4I4f",
             int(sample_size),
             int(height_limit),
             int(chunk_count),
             int(renderer.world.chunk_size),
+            float(renderer.world.block_size),
+            0.0,
+            0.0,
+            0.0,
         ),
     )
 
@@ -785,11 +793,15 @@ def make_chunk_mesh_batch_from_surface_gpu_batch(
     sample_size = renderer.world.chunk_size + 2
     height_limit = renderer.world.height
     params_bytes = struct.pack(
-        "<4I",
+        "<4I4f",
         int(sample_size),
         int(height_limit),
         int(chunk_count),
         int(renderer.world.chunk_size),
+        float(renderer.world.block_size),
+        0.0,
+        0.0,
+        0.0,
     )
     ensure_voxel_mesh_batch_scratch(renderer, sample_size, height_limit, chunk_count)
     blocks_buffer = renderer._voxel_mesh_scratch_blocks_buffer
@@ -857,11 +869,15 @@ def make_chunk_mesh_batches_from_surface_gpu_batches(renderer, surface_batches: 
         chunk_count = len(chunk_coords)
         resources = acquire_async_voxel_mesh_batch_resources(renderer, sample_size, height_limit, chunk_count)
         params_bytes = struct.pack(
-            "<4I",
+            "<4I4f",
             int(sample_size),
             int(height_limit),
             int(chunk_count),
             int(renderer.world.chunk_size),
+            float(renderer.world.block_size),
+            0.0,
+            0.0,
+            0.0,
         )
 
         renderer.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
@@ -1048,7 +1064,7 @@ def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> in
             height_limit_int = int(pending.height_limit)
             cached_height = height_cache.get(height_limit_int)
             if cached_height is None:
-                half_height = float(height_limit_int) * 0.5
+                half_height = float(height_limit_int) * float(_renderer_module().BLOCK_SIZE) * 0.5
                 radius = float(math.sqrt(_chunk_half() * _chunk_half() * 2.0 + half_height * half_height))
                 cached_height = (half_height, radius)
                 height_cache[height_limit_int] = cached_height
@@ -1071,9 +1087,9 @@ def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> in
                 mesh.created_at = float(created_at)
                 mesh.allocation_id = shared_allocation_id
                 mesh.bounds = (
-                    float(chunk_x_int * _renderer_module().CHUNK_SIZE + _chunk_half()),
+                    float(chunk_x_int * _renderer_module().CHUNK_WORLD_SIZE + _chunk_half()),
                     half_height,
-                    float(chunk_z_int * _renderer_module().CHUNK_SIZE + _chunk_half()),
+                    float(chunk_z_int * _renderer_module().CHUNK_WORLD_SIZE + _chunk_half()),
                     radius,
                 )
                 mesh.binding_offset = binding_offset

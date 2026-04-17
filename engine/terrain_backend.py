@@ -10,9 +10,10 @@ import numpy as np
 class ChunkSurfaceResult:
     chunk_x: int
     chunk_z: int
-    heights: np.ndarray
-    materials: np.ndarray
-    source: str
+    chunk_y: int = 0
+    heights: np.ndarray | None = None
+    materials: np.ndarray | None = None
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -21,12 +22,13 @@ class ChunkVoxelResult:
     chunk_z: int
     blocks: np.ndarray
     materials: np.ndarray
-    source: str
+    chunk_y: int = 0
+    source: str = ""
 
 
 @dataclass(frozen=True)
 class ChunkSurfaceGpuBatch:
-    chunks: list[tuple[int, int]]
+    chunks: list[tuple[int, int, int]]
     heights_buffer: object
     materials_buffer: object
     cell_count: int
@@ -43,6 +45,7 @@ class TerrainValidationReport:
     material_mismatches: int
     first_height_mismatch: tuple[int, int, int, int] | None
     first_material_mismatch: tuple[int, int, int, int] | None
+    chunk_y: int = 0
 
     @property
     def matches(self) -> bool:
@@ -56,7 +59,7 @@ class TerrainBackend(Protocol):
     def chunk_surface_grids(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
         ...
 
-    def request_chunk_surface_batch(self, chunks: list[tuple[int, int]]) -> int:
+    def request_chunk_surface_batch(self, chunks: list[tuple[int, int, int]]) -> int:
         ...
 
     def poll_ready_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
@@ -71,10 +74,10 @@ class TerrainBackend(Protocol):
     def flush_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         ...
 
-    def chunk_voxel_grid(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
+    def chunk_voxel_grid(self, chunk_x: int, chunk_y: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
         ...
 
-    def request_chunk_voxel_batch(self, chunks: list[tuple[int, int]]) -> int:
+    def request_chunk_voxel_batch(self, chunks: list[tuple[int, int, int]]) -> int:
         ...
 
     def poll_ready_chunk_voxel_batches(self) -> list[ChunkVoxelResult]:

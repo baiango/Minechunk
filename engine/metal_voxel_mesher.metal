@@ -7,7 +7,7 @@ struct MesherParams {
     uint chunkCount;
     uint chunkSize;           // interior chunk size, e.g. 32
     uint maxVerticesPerChunk; // fixed slice per chunk
-    uint _pad0;
+    float blockScale;
     uint _pad1;
     uint _pad2;
 };
@@ -274,20 +274,21 @@ kernel void emit_columns_fixed_slice(
     uint written = 0u;
 
     ChunkCoord cc = chunkCoords[chunkIndex];
-    float originX = float(cc.x * int(params.chunkSize));
-    float originZ = float(cc.z * int(params.chunkSize));
+    float chunkWorldSize = float(params.chunkSize) * params.blockScale;
+    float originX = float(cc.x) * chunkWorldSize;
+    float originZ = float(cc.z) * chunkWorldSize;
 
     for (uint y = 0u; y < params.heightLimit; ++y) {
         uint idx = voxel_index(chunkIndex, y, localZ, localX, params.sampleSize, params.heightLimit);
         if (blocks[idx] == 0u) continue;
 
         uint material = materials[idx];
-        float x0 = originX + float(localX - 1u);
-        float x1 = x0 + 1.0f;
-        float y0 = float(y);
-        float y1 = y0 + 1.0f;
-        float z0 = originZ + float(localZ - 1u);
-        float z1 = z0 + 1.0f;
+        float x0 = originX + float(localX - 1u) * params.blockScale;
+        float x1 = x0 + params.blockScale;
+        float y0 = float(y) * params.blockScale;
+        float y1 = y0 + params.blockScale;
+        float z0 = originZ + float(localZ - 1u) * params.blockScale;
+        float z1 = z0 + params.blockScale;
 
         float3 top    = material_color(material, y) * 1.00f;
         float3 bottom = material_color(material, y) * 0.50f;

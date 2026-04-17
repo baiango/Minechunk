@@ -4,6 +4,9 @@ import math
 
 import numpy as np
 
+from .world_constants import BLOCK_SIZE
+
+
 try:
     from numba import njit
 except Exception:  # pragma: no cover - fallback for environments without numba
@@ -33,6 +36,12 @@ VERTEX_COMPONENTS = 12
 @njit(cache=True, fastmath=True)
 def _hash2(ix: int, iy: int, seed: int) -> float:
     value = math.sin(ix * 127.1 + iy * 311.7 + seed * 74.7) * 43758.5453123
+    return value - math.floor(value)
+
+
+@njit(cache=True, fastmath=True)
+def _hash3(ix: int, iy: int, iz: int, seed: int) -> float:
+    value = math.sin(ix * 127.1 + iy * 311.7 + iz * 74.7 + seed * 19.19) * 43758.5453123
     return value - math.floor(value)
 
 
@@ -74,6 +83,48 @@ def _value_noise_2d(x: float, y: float, seed: int, frequency: float) -> float:
 
 
 @njit(cache=True, fastmath=True)
+def _value_noise_3d(x: float, y: float, z: float, seed: int, frequency: float) -> float:
+    x *= frequency
+    y *= frequency
+    z *= frequency
+
+    x0 = math.floor(x)
+    y0 = math.floor(y)
+    z0 = math.floor(z)
+    xf = x - x0
+    yf = y - y0
+    zf = z - z0
+
+    ix0 = int(x0)
+    iy0 = int(y0)
+    iz0 = int(z0)
+    ix1 = ix0 + 1
+    iy1 = iy0 + 1
+    iz1 = iz0 + 1
+
+    u = _fade(xf)
+    v = _fade(yf)
+    w = _fade(zf)
+
+    c000 = _hash3(ix0, iy0, iz0, seed)
+    c100 = _hash3(ix1, iy0, iz0, seed)
+    c010 = _hash3(ix0, iy1, iz0, seed)
+    c110 = _hash3(ix1, iy1, iz0, seed)
+    c001 = _hash3(ix0, iy0, iz1, seed)
+    c101 = _hash3(ix1, iy0, iz1, seed)
+    c011 = _hash3(ix0, iy1, iz1, seed)
+    c111 = _hash3(ix1, iy1, iz1, seed)
+
+    x00 = _lerp(c000, c100, u)
+    x10 = _lerp(c010, c110, u)
+    x01 = _lerp(c001, c101, u)
+    x11 = _lerp(c011, c111, u)
+    y0v = _lerp(x00, x10, v)
+    y1v = _lerp(x01, x11, v)
+    return _lerp(y0v, y1v, w) * 2.0 - 1.0
+
+
+@njit(cache=True, fastmath=True)
 def _terrain_color(height: int) -> tuple[float, float, float]:
     if height <= 14:
         return 0.78, 0.71, 0.49
@@ -91,6 +142,12 @@ def _scale_color(color: tuple[float, float, float], scale: float) -> tuple[float
     return color[0] * scale, color[1] * scale, color[2] * scale
 
 
+TERRAIN_FREQUENCY_SCALE = 0.3
+CAVE_FREQUENCY_SCALE = 0.5
+CAVE_BEDROCK_CLEARANCE = 3
+SURFACE_BREACH_FREQUENCY_SCALE = 1.0
+
+
 @njit(cache=True, fastmath=True)
 def surface_profile_at(
     x: float,
@@ -98,26 +155,120 @@ def surface_profile_at(
     seed: int,
     height_limit: int,
 ) -> tuple[int, int]:
-    broad = _value_noise_2d(x, z, seed + 11, 0.0009765625)
-    ridge = _value_noise_2d(x, z, seed + 23, 0.00390625)
-    detail = _value_noise_2d(x, z, seed + 47, 0.010416667)
+    sample_x = x
+    sample_z = z
 
-    height = 26.0 + broad * 18.0 + ridge * 14.0 + detail * 8.0
-    height_i = int(height)
-    if height_i < 4:
-        height_i = 4
+    broad = _value_noise_2d(sample_x, sample_z, seed + 11, 0.0009765625 * TERRAIN_FREQUENCY_SCALE)
+    ridge = _value_noise_2d(sample_x, sample_z, seed + 23, 0.00390625 * TERRAIN_FREQUENCY_SCALE)
+    detail = _value_noise_2d(sample_x, sample_z, seed + 47, 0.010416667 * TERRAIN_FREQUENCY_SCALE)
+    micro = _value_noise_2d(sample_x, sample_z, seed + 71, 0.020833334 * TERRAIN_FREQUENCY_SCALE)
+    nano = _value_noise_2d(sample_x, sample_z, seed + 97, 0.041666668 * TERRAIN_FREQUENCY_SCALE)
 
     upper_bound = height_limit - 1
+    normalized_height = 24.0 + broad * 11.0 + ridge * 8.0 + detail * 4.5 + micro * 1.75 + nano * 0.75
+    height_scale = float(upper_bound) / 50.0 if upper_bound > 0 else 1.0
+    height_i = int(normalized_height * height_scale)
+    if height_i < 4:
+        height_i = 4
     if height_i > upper_bound:
         height_i = upper_bound
 
-    if height_i >= 90:
+    sand_threshold = max(4, int(height_limit * 0.18))
+    stone_threshold = max(sand_threshold + 6, int(height_limit * 0.58))
+    snow_threshold = max(stone_threshold + 6, int(height_limit * 0.82))
+
+    if height_i >= snow_threshold:
         return height_i, SNOW
-    if height_i <= 14:
+    if height_i <= sand_threshold:
         return height_i, SAND
-    if height_i >= 70 and detail > 0.12:
+    if height_i >= stone_threshold and (detail + micro * 0.5 + nano * 0.35) > 0.10:
         return height_i, STONE
     return height_i, GRASS
+
+
+@njit(cache=True, fastmath=True)
+def _clamp01(value: float) -> float:
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
+
+
+@njit(cache=True, fastmath=True)
+def _should_carve_cave(
+    world_x: int,
+    world_y: int,
+    world_z: int,
+    surface_height: int,
+    seed: int,
+    world_height_limit: int,
+) -> bool:
+    if world_y <= CAVE_BEDROCK_CLEARANCE:
+        return False
+    depth_below_surface = surface_height - world_y
+    if world_y >= world_height_limit - 2:
+        return False
+
+    normalized_y = float(world_y) / float(max(1, world_height_limit - 1))
+    vertical_band = 1.0 - abs(normalized_y - 0.45) * 1.6
+    vertical_band = _clamp01(vertical_band)
+    if vertical_band <= 0.0:
+        return False
+
+    xf = float(world_x)
+    yf = float(world_y)
+    zf = float(world_z)
+    cave_primary = _value_noise_3d(xf, yf * 0.85, zf, seed + 101, 0.018 * CAVE_FREQUENCY_SCALE)
+    cave_detail = _value_noise_3d(xf, yf * 1.15, zf, seed + 149, 0.041666668 * CAVE_FREQUENCY_SCALE)
+    cave_shape = _value_noise_3d(xf, yf * 0.35, zf, seed + 173, 0.009765625 * CAVE_FREQUENCY_SCALE)
+    density = cave_primary * 0.70 + cave_detail * 0.25 - cave_shape * 0.10
+
+    depth_bonus = float(depth_below_surface) * 0.004
+    if depth_bonus > 0.12:
+        depth_bonus = 0.12
+
+    shallow_bonus = 0.0
+    if depth_below_surface <= 6:
+        shallow_bonus = (6.0 - float(depth_below_surface)) * (0.12 / 6.0)
+
+    threshold = 0.62 - vertical_band * 0.08 - depth_bonus - shallow_bonus
+    if density > threshold:
+        return True
+
+    if depth_below_surface <= 2:
+        breach_primary = _value_noise_2d(xf, zf, seed + 211, 0.020833334 * SURFACE_BREACH_FREQUENCY_SCALE)
+        breach_detail = _value_noise_3d(xf, yf, zf, seed + 233, 0.03125 * CAVE_FREQUENCY_SCALE)
+        breach_density = breach_primary * 0.65 + breach_detail * 0.35
+        breach_threshold = 0.78 - vertical_band * 0.06
+        return breach_density > breach_threshold
+
+    return False
+
+
+@njit(cache=True, fastmath=True)
+def terrain_block_material_at(
+    world_x: int,
+    world_y: int,
+    world_z: int,
+    seed: int,
+    world_height_limit: int,
+) -> int:
+    if world_y < 0 or world_y >= world_height_limit:
+        return AIR
+
+    surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
+    if world_y >= surface_height:
+        return AIR
+    if _should_carve_cave(world_x, world_y, world_z, surface_height, seed, world_height_limit):
+        return AIR
+    if world_y == 0:
+        return BEDROCK
+    if world_y < surface_height - 4:
+        return STONE
+    if world_y < surface_height - 1:
+        return DIRT
+    return surface_material
 
 
 @njit(cache=True, fastmath=True)
@@ -209,13 +360,15 @@ def build_chunk_vertex_array(
     chunk_x: int,
     chunk_z: int,
     chunk_size: int,
+    block_size: float = 1.0,
 ) -> tuple[np.ndarray, int]:
     stride = chunk_size + 2
     max_vertices = chunk_size * chunk_size * MAX_FACES_PER_CELL * VERTICES_PER_FACE
     vertices = np.empty((max_vertices, VERTEX_COMPONENTS), dtype=np.float32)
     vertex_index = 0
-    origin_x = chunk_x * chunk_size
-    origin_z = chunk_z * chunk_size
+    step = float(block_size)
+    origin_x = float(chunk_x * chunk_size) * step
+    origin_z = float(chunk_z * chunk_size) * step
 
     for local_z in range(chunk_size):
         for local_x in range(chunk_size):
@@ -230,15 +383,15 @@ def build_chunk_vertex_array(
             south_height = int(height_grid[cell_index + stride])
             material = int(material_grid[cell_index])
 
-            x0 = float(origin_x + local_x)
-            x1 = x0 + 1.0
-            z0 = float(origin_z + local_z)
-            z1 = z0 + 1.0
-            y0 = float(height)
-            west_y = float(west_height)
-            east_y = float(east_height)
-            north_y = float(north_height)
-            south_y = float(south_height)
+            x0 = origin_x + float(local_x) * step
+            x1 = x0 + step
+            z0 = origin_z + float(local_z) * step
+            z1 = z0 + step
+            y0 = float(height) * step
+            west_y = float(west_height) * step
+            east_y = float(east_height) * step
+            north_y = float(north_height) * step
+            south_y = float(south_height) * step
 
             if material == BEDROCK:
                 base = (0.24, 0.22, 0.20)
@@ -341,20 +494,71 @@ def fill_chunk_voxel_grid(
         world_z = origin_z + local_z
         for local_x in range(sample_size):
             world_x = origin_x + local_x
-            surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, height_limit)
             for y in range(height_limit):
-                if y >= surface_height:
+                material = terrain_block_material_at(world_x, y, world_z, seed, height_limit)
+                if material == AIR:
                     continue
-                if y == 0:
-                    material = BEDROCK
-                elif y < surface_height - 4:
-                    material = STONE
-                elif y < surface_height - 1:
-                    material = DIRT
-                else:
-                    material = surface_material
                 blocks[y, local_z, local_x] = 1
                 materials[y, local_z, local_x] = material
+
+
+@njit(cache=True, fastmath=True)
+def fill_stacked_chunk_voxel_grid(
+    blocks: np.ndarray,
+    materials: np.ndarray,
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+    chunk_size: int,
+    seed: int,
+    world_height_limit: int,
+) -> None:
+    sample_size = chunk_size + 2
+    origin_x = chunk_x * chunk_size - 1
+    origin_z = chunk_z * chunk_size - 1
+    origin_y = chunk_y * chunk_size
+    local_height = blocks.shape[0]
+
+    for local_z in range(sample_size):
+        world_z = origin_z + local_z
+        for local_x in range(sample_size):
+            world_x = origin_x + local_x
+            for local_y in range(local_height):
+                world_y = origin_y + local_y
+                material = terrain_block_material_at(world_x, world_y, world_z, seed, world_height_limit)
+                if material == AIR:
+                    continue
+                blocks[local_y, local_z, local_x] = 1
+                materials[local_y, local_z, local_x] = material
+
+
+@njit(cache=True, fastmath=True)
+def fill_stacked_chunk_vertical_neighbor_planes(
+    top_plane: np.ndarray,
+    bottom_plane: np.ndarray,
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+    chunk_size: int,
+    seed: int,
+    world_height_limit: int,
+) -> None:
+    sample_size = chunk_size + 2
+    origin_x = chunk_x * chunk_size - 1
+    origin_z = chunk_z * chunk_size - 1
+    top_world_y = chunk_y * chunk_size + chunk_size
+    bottom_world_y = chunk_y * chunk_size - 1
+
+    for local_z in range(sample_size):
+        world_z = origin_z + local_z
+        for local_x in range(sample_size):
+            world_x = origin_x + local_x
+            if 0 <= top_world_y < world_height_limit:
+                if terrain_block_material_at(world_x, top_world_y, world_z, seed, world_height_limit) != AIR:
+                    top_plane[local_z, local_x] = 1
+            if 0 <= bottom_world_y < world_height_limit:
+                if terrain_block_material_at(world_x, bottom_world_y, world_z, seed, world_height_limit) != AIR:
+                    bottom_plane[local_z, local_x] = 1
 
 
 @njit(cache=True, fastmath=True)
@@ -524,15 +728,19 @@ def _emit_quad_components(
 
 
 @njit(cache=True, fastmath=True)
-def build_chunk_vertex_array_from_voxels(
+def build_chunk_vertex_array_from_voxels_with_boundaries(
     blocks: np.ndarray,
     materials: np.ndarray,
     chunk_x: int,
     chunk_z: int,
     chunk_size: int,
     height_limit: int,
+    top_boundary: np.ndarray,
+    bottom_boundary: np.ndarray,
+    block_size: float = 1.0,
+    chunk_y: int = 0,
 ) -> tuple[np.ndarray, int]:
-    vertex_count = count_chunk_voxel_vertices(blocks, chunk_size, height_limit)
+    vertex_count = count_chunk_voxel_vertices_with_boundaries(blocks, chunk_size, height_limit, top_boundary, bottom_boundary)
     vertices = np.empty((vertex_count, VERTEX_COMPONENTS), dtype=np.float32)
     if vertex_count == 0:
         return vertices, 0
@@ -540,17 +748,17 @@ def build_chunk_vertex_array_from_voxels(
     sample_size = chunk_size + 2
     end = sample_size - 1
     last_y = height_limit - 1
-    origin_x = float(chunk_x * chunk_size)
-    origin_z = float(chunk_z * chunk_size)
+    step = float(block_size)
+    origin_x = float(chunk_x * chunk_size) * step
+    origin_y = float(chunk_y * chunk_size) * step
+    origin_z = float(chunk_z * chunk_size) * step
     vertex_index = 0
 
     for y in range(height_limit):
         plane = blocks[y]
         mat_plane = materials[y]
-        above = blocks[y + 1] if y < last_y else plane
-        below = blocks[y - 1] if y > 0 else plane
-        y0 = float(y)
-        y1 = y0 + 1.0
+        y0 = origin_y + float(y) * step
+        y1 = y0 + step
 
         z0 = origin_z
         for local_z in range(1, end):
@@ -558,17 +766,23 @@ def build_chunk_vertex_array_from_voxels(
             row_mat = mat_plane[local_z]
             row_north = plane[local_z - 1]
             row_south = plane[local_z + 1]
-            row_above = above[local_z]
-            row_below = below[local_z]
-            z1 = z0 + 1.0
+            if y < last_y:
+                row_above = blocks[y + 1][local_z]
+            else:
+                row_above = top_boundary[local_z]
+            if y > 0:
+                row_below = blocks[y - 1][local_z]
+            else:
+                row_below = bottom_boundary[local_z]
+            z1 = z0 + step
 
             x0 = origin_x
             for local_x in range(1, end):
                 if row[local_x] == 0:
-                    x0 += 1.0
+                    x0 += step
                     continue
 
-                x1 = x0 + 1.0
+                x1 = x0 + step
                 material = int(row_mat[local_x])
 
                 if material == BEDROCK:
@@ -641,7 +855,7 @@ def build_chunk_vertex_array_from_voxels(
                 bottom_g = cg * 0.50
                 bottom_b = cb * 0.50
 
-                if y == last_y or row_above[local_x] == 0:
+                if row_above[local_x] == 0:
                     vertex_index = _emit_quad_components(
                         vertices,
                         vertex_index,
@@ -653,7 +867,7 @@ def build_chunk_vertex_array_from_voxels(
                         top_r, top_g, top_b,
                     )
 
-                if y == 0 or row_below[local_x] == 0:
+                if row_below[local_x] == 0:
                     vertex_index = _emit_quad_components(
                         vertices,
                         vertex_index,
@@ -721,7 +935,40 @@ def build_chunk_vertex_array_from_voxels(
 
 
 @njit(cache=True, fastmath=True)
-def count_chunk_voxel_vertices(blocks: np.ndarray, chunk_size: int, height_limit: int) -> int:
+def build_chunk_vertex_array_from_voxels(
+    blocks: np.ndarray,
+    materials: np.ndarray,
+    chunk_x: int,
+    chunk_z: int,
+    chunk_size: int,
+    height_limit: int,
+    block_size: float = 1.0,
+    chunk_y: int = 0,
+) -> tuple[np.ndarray, int]:
+    sample_size = chunk_size + 2
+    empty_plane = np.zeros((sample_size, sample_size), dtype=blocks.dtype)
+    return build_chunk_vertex_array_from_voxels_with_boundaries(
+        blocks,
+        materials,
+        chunk_x,
+        chunk_z,
+        chunk_size,
+        height_limit,
+        empty_plane,
+        empty_plane,
+        block_size,
+        chunk_y,
+    )
+
+
+@njit(cache=True, fastmath=True)
+def count_chunk_voxel_vertices_with_boundaries(
+    blocks: np.ndarray,
+    chunk_size: int,
+    height_limit: int,
+    top_boundary: np.ndarray,
+    bottom_boundary: np.ndarray,
+) -> int:
     sample_size = chunk_size + 2
     end = sample_size - 1
     last_y = height_limit - 1
@@ -729,22 +976,25 @@ def count_chunk_voxel_vertices(blocks: np.ndarray, chunk_size: int, height_limit
 
     for y in range(height_limit):
         plane = blocks[y]
-        above = blocks[y + 1] if y < last_y else plane
-        below = blocks[y - 1] if y > 0 else plane
-
         for local_z in range(1, end):
             row = plane[local_z]
             row_north = plane[local_z - 1]
             row_south = plane[local_z + 1]
-            row_above = above[local_z]
-            row_below = below[local_z]
+            if y < last_y:
+                row_above = blocks[y + 1][local_z]
+            else:
+                row_above = top_boundary[local_z]
+            if y > 0:
+                row_below = blocks[y - 1][local_z]
+            else:
+                row_below = bottom_boundary[local_z]
 
             for local_x in range(1, end):
                 if row[local_x] == 0:
                     continue
-                if y == last_y or row_above[local_x] == 0:
+                if row_above[local_x] == 0:
                     vertex_count += VERTICES_PER_FACE
-                if y == 0 or row_below[local_x] == 0:
+                if row_below[local_x] == 0:
                     vertex_count += VERTICES_PER_FACE
                 if row[local_x + 1] == 0:
                     vertex_count += VERTICES_PER_FACE
@@ -756,3 +1006,10 @@ def count_chunk_voxel_vertices(blocks: np.ndarray, chunk_size: int, height_limit
                     vertex_count += VERTICES_PER_FACE
 
     return vertex_count
+
+
+@njit(cache=True, fastmath=True)
+def count_chunk_voxel_vertices(blocks: np.ndarray, chunk_size: int, height_limit: int) -> int:
+    sample_size = chunk_size + 2
+    empty_plane = np.zeros((sample_size, sample_size), dtype=blocks.dtype)
+    return count_chunk_voxel_vertices_with_boundaries(blocks, chunk_size, height_limit, empty_plane, empty_plane)

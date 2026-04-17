@@ -187,6 +187,8 @@ def slab_accepts_size_class(slab: MeshOutputSlab, size_class_bytes: int) -> bool
 
 
 def create_mesh_output_slab(renderer, size_bytes: int, size_class_bytes: int) -> MeshOutputSlab:
+    if getattr(renderer, "_device_lost", False):
+        raise RuntimeError("Render device is unavailable after device loss.")
     slab = MeshOutputSlab(
         slab_id=renderer._next_mesh_output_slab_id,
         buffer=renderer.device.create_buffer(
@@ -525,8 +527,8 @@ def clear_tile_render_batches(renderer) -> None:
     renderer._cached_tile_draw_batches.clear()
 
 
-def mark_tile_dirty(renderer, chunk_x: int, chunk_z: int) -> None:
-    key = tile_key(renderer, int(chunk_x), int(chunk_z))
+def mark_tile_dirty(renderer, chunk_x: int, chunk_z: int, chunk_y: int = 0) -> None:
+    key = tile_key(renderer, int(chunk_x), int(chunk_z), int(chunk_y))
     renderer._tile_dirty_keys.add(key)
     renderer._tile_versions[key] = int(renderer._tile_versions.get(key, 0)) + 1
     renderer._tile_mutation_version += 1
@@ -544,12 +546,12 @@ def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
     retain = lambda mesh: retain_chunk_mesh_storage(renderer, mesh)
     visible_chunk_coord_set = renderer._visible_chunk_coord_set
 
-    mesh_key_set: set[tuple[int, int]] = set()
+    mesh_key_set: set[tuple[int, int, int]] = set()
 
     for mesh in meshes:
-        key = (mesh.chunk_x, mesh.chunk_z)
+        key = (mesh.chunk_x, getattr(mesh, "chunk_y", 0), mesh.chunk_z)
         mesh_key_set.add(key)
-        mark_tile_dirty(renderer, mesh.chunk_x, mesh.chunk_z)
+        mark_tile_dirty(renderer, mesh.chunk_x, mesh.chunk_z, getattr(mesh, "chunk_y", 0))
 
         existing = cache_get(key)
         if existing is mesh:
@@ -557,7 +559,7 @@ def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
             continue
 
         if existing is not None:
-            mark_tile_dirty(renderer, existing.chunk_x, existing.chunk_z)
+            mark_tile_dirty(renderer, existing.chunk_x, existing.chunk_z, getattr(existing, "chunk_y", 0))
             release(existing)
 
         chunk_cache[key] = mesh
@@ -584,7 +586,7 @@ def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
 
     while len(chunk_cache) > max_cached_chunks:
         old_key, old_mesh = pop_oldest(last=False)
-        mark_tile_dirty(renderer, old_mesh.chunk_x, old_mesh.chunk_z)
+        mark_tile_dirty(renderer, old_mesh.chunk_x, old_mesh.chunk_z, getattr(old_mesh, "chunk_y", 0))
         release(old_mesh)
         if old_key in visible_chunk_coord_set:
             visible_displayed_coords.discard(old_key)
@@ -741,13 +743,13 @@ def merge_tile_meshes(renderer, tile_meshes: list[ChunkMesh], encoder) -> wgpu.G
     return merged_buffer
 
 
-def visible_tile_mesh_groups(renderer) -> dict[tuple[int, int], list[ChunkMesh]]:
+def visible_tile_mesh_groups(renderer) -> dict[tuple[int, int, int], list[ChunkMesh]]:
     if not renderer._visible_chunk_coords:
         renderer._refresh_visible_chunk_coords()
     tile_keys = getattr(renderer, "_visible_tile_keys", None) or []
     tile_coords = getattr(renderer, "_visible_tile_coords", None) or {}
     chunk_cache = renderer.chunk_cache
-    tile_groups: dict[tuple[int, int], list[ChunkMesh]] = {}
+    tile_groups: dict[tuple[int, int, int], list[ChunkMesh]] = {}
     for tile_key_value in tile_keys:
         coords = tile_coords.get(tile_key_value)
         if not coords:
@@ -764,26 +766,26 @@ def visible_tile_mesh_groups(renderer) -> dict[tuple[int, int], list[ChunkMesh]]
     return tile_groups
 
 
-def visible_tile_chunk_groups(renderer) -> tuple[dict[tuple[int, int], list[tuple[int, int, ChunkMesh]]], int]:
+def visible_tile_chunk_groups(renderer) -> tuple[dict[tuple[int, int, int], list[tuple[int, int, int, ChunkMesh]]], int]:
     if not renderer._visible_chunk_coords:
         renderer._refresh_visible_chunk_coords()
     tile_keys = getattr(renderer, "_visible_tile_keys", None) or []
     tile_coords = getattr(renderer, "_visible_tile_coords", None) or {}
     chunk_cache = renderer.chunk_cache
-    tile_groups: dict[tuple[int, int], list[tuple[int, int, ChunkMesh]]] = {}
+    tile_groups: dict[tuple[int, int, int], list[tuple[int, int, int, ChunkMesh]]] = {}
     visible_count = 0
     for tile_key_value in tile_keys:
         coords = tile_coords.get(tile_key_value)
         if not coords:
             continue
-        chunks: list[tuple[int, int, ChunkMesh]] = []
-        for chunk_x, chunk_z in coords:
-            coord = (chunk_x, chunk_z)
+        chunks: list[tuple[int, int, int, ChunkMesh]] = []
+        for chunk_x, chunk_y, chunk_z in coords:
+            coord = (chunk_x, chunk_y, chunk_z)
             mesh = chunk_cache.get(coord)
             if mesh is None or mesh.vertex_count <= 0:
                 continue
             chunk_cache.move_to_end(coord)
-            chunks.append((chunk_x, chunk_z, mesh))
+            chunks.append((chunk_x, chunk_y, chunk_z, mesh))
         if chunks:
             tile_groups[tile_key_value] = chunks
             visible_count += len(chunks)
@@ -813,7 +815,7 @@ def build_tile_draw_batches(
         for mesh in meshes:
             if mesh.vertex_count <= 0:
                 continue
-            tile_groups.setdefault(tile_key(renderer, mesh.chunk_x, mesh.chunk_z), []).append(mesh)
+            tile_groups.setdefault(tile_key(renderer, mesh.chunk_x, mesh.chunk_z, getattr(mesh, "chunk_y", 0)), []).append(mesh)
 
     current_tile_keys = set(tile_groups.keys())
     stale_keys = [tile_key_value for tile_key_value in renderer._tile_render_batches if tile_key_value not in current_tile_keys]
@@ -906,7 +908,7 @@ def build_tile_draw_batches(
             renderer._tile_dirty_keys.discard(tile_key_value)
             continue
 
-        signature = tuple((mesh.chunk_x, mesh.chunk_z) for mesh in mature_meshes)
+        signature = tuple((mesh.chunk_x, getattr(mesh, "chunk_y", 0), mesh.chunk_z) for mesh in mature_meshes)
         batch_vertex_count = sum(mesh.vertex_count for mesh in mature_meshes)
         batch_bounds = merge_chunk_bounds(renderer, mature_meshes)
         if (
@@ -1117,30 +1119,31 @@ def visible_render_batches_indirect(
     return render_batches, render_encode_ms, command_count, merged_chunk_count, visible_chunk_count, visible_vertex_count
 
 
-def visible_chunks(renderer) -> list[tuple[int, int, ChunkMesh]]:
-    visible: list[tuple[int, int, ChunkMesh]] = []
+def visible_chunks(renderer) -> list[tuple[int, int, int, ChunkMesh]]:
+    visible: list[tuple[int, int, int, ChunkMesh]] = []
     if not renderer._visible_chunk_coords:
         renderer._refresh_visible_chunk_coords()
-    for chunk_x, chunk_z in renderer._visible_chunk_coords:
-        mesh = renderer.chunk_cache.get((chunk_x, chunk_z))
+    for chunk_x, chunk_y, chunk_z in renderer._visible_chunk_coords:
+        key = (chunk_x, chunk_y, chunk_z)
+        mesh = renderer.chunk_cache.get(key)
         if mesh is None:
             continue
-        renderer.chunk_cache.move_to_end((chunk_x, chunk_z))
-        visible.append((chunk_x, chunk_z, mesh))
+        renderer.chunk_cache.move_to_end(key)
+        visible.append((chunk_x, chunk_y, chunk_z, mesh))
     return visible
 
 
-def tile_key(renderer, chunk_x: int, chunk_z: int) -> tuple[int, int]:
+def tile_key(renderer, chunk_x: int, chunk_z: int, chunk_y: int = 0) -> tuple[int, int, int]:
     renderer_module = _renderer_module()
     merged_tile_size_chunks = int(renderer_module.MERGED_TILE_SIZE_CHUNKS)
-    return chunk_x // merged_tile_size_chunks, chunk_z // merged_tile_size_chunks
+    return chunk_x // merged_tile_size_chunks, int(chunk_y), chunk_z // merged_tile_size_chunks
 
 
-def tile_visible_mask(renderer, tile_key_value: tuple[int, int], tile_meshes: list[ChunkMesh]) -> int:
+def tile_visible_mask(renderer, tile_key_value: tuple[int, int, int], tile_meshes: list[ChunkMesh]) -> int:
     renderer_module = _renderer_module()
     merged_tile_size_chunks = int(renderer_module.MERGED_TILE_SIZE_CHUNKS)
     tile_origin_x = int(tile_key_value[0]) * merged_tile_size_chunks
-    tile_origin_z = int(tile_key_value[1]) * merged_tile_size_chunks
+    tile_origin_z = int(tile_key_value[2]) * merged_tile_size_chunks
     mask = 0
     for mesh in tile_meshes:
         local_x = int(mesh.chunk_x) - tile_origin_x
@@ -1155,101 +1158,15 @@ def visible_render_batches(
     encoder,
 ) -> tuple[list[tuple[wgpu.GPUBuffer, int, int]], float, int, int, int, int]:
     encode_start = time.perf_counter()
-    tile_groups, visible_count = visible_tile_chunk_groups(renderer)
-
+    visible = visible_chunks(renderer)
     render_batches: list[tuple[wgpu.GPUBuffer, int, int]] = []
-    merged_chunk_count = 0
-
-    current_tile_keys = set(tile_groups.keys())
-    stale_keys = [tile_key_value for tile_key_value in renderer._tile_render_batches if tile_key_value not in current_tile_keys]
-    for tile_key_value in stale_keys:
-        batch = renderer._tile_render_batches.pop(tile_key_value)
-        renderer._transient_render_buffers.append([batch.vertex_buffer])
-
-    renderer_module = _renderer_module()
-    merged_tile_min_age_seconds = float(renderer_module.MERGED_TILE_MIN_AGE_SECONDS)
-
-    merged_tile_max_chunks = int(renderer_module.MERGED_TILE_MAX_CHUNKS)
-    for tile_key_value in sorted(tile_groups):
-        tile_chunks = tile_groups[tile_key_value]
-        existing = renderer._tile_render_batches.get(tile_key_value)
-        tile_version = int(renderer._tile_versions.get(tile_key_value, 0))
-        tile_is_dirty = tile_key_value in renderer._tile_dirty_keys or (existing is not None and existing.source_version != tile_version)
-        current_visible_mask = int(getattr(renderer, "_visible_tile_masks", {}).get(tile_key_value, tile_visible_mask(renderer, tile_key_value, [mesh for _, _, mesh in tile_chunks])))
-        if (
-            existing is not None
-            and not tile_is_dirty
-            and existing.all_mature
-            and existing.chunk_count == len(tile_chunks)
-            and existing.visible_mask == current_visible_mask
-        ):
-            render_batches.append((existing.vertex_buffer, existing.vertex_count, 0))
-            merged_chunk_count += existing.chunk_count
+    visible_count = 0
+    visible_vertex_count = 0
+    for _, _, _, mesh in visible:
+        if mesh.vertex_count <= 0:
             continue
-
-        mature_chunks = sorted(
-            ((chunk_x, chunk_z, mesh) for chunk_x, chunk_z, mesh in tile_chunks if chunk_mesh_age(renderer, mesh) >= merged_tile_min_age_seconds),
-            key=lambda item: (item[0], item[1]),
-        )
-        immature_chunks = sorted(
-            ((chunk_x, chunk_z, mesh) for chunk_x, chunk_z, mesh in tile_chunks if chunk_mesh_age(renderer, mesh) < merged_tile_min_age_seconds),
-            key=lambda item: (item[0], item[1]),
-        )
-
-        if len(tile_chunks) == 1:
-            _, _, mesh = tile_chunks[0]
-            render_batches.append((mesh.vertex_buffer, mesh.vertex_count, mesh.vertex_offset))
-            renderer._tile_dirty_keys.discard(tile_key_value)
-            continue
-
-        if len(mature_chunks) < 2:
-            if existing is not None:
-                renderer._tile_render_batches.pop(tile_key_value, None)
-                renderer._transient_render_buffers.append([existing.vertex_buffer])
-            for _, _, mesh in immature_chunks:
-                render_batches.append((mesh.vertex_buffer, mesh.vertex_count, mesh.vertex_offset))
-            for _, _, mesh in mature_chunks:
-                render_batches.append((mesh.vertex_buffer, mesh.vertex_count, mesh.vertex_offset))
-            renderer._tile_dirty_keys.discard(tile_key_value)
-            continue
-
-        merged_chunk_count += len(mature_chunks)
-        batch_vertex_count = sum(mesh.vertex_count for _, _, mesh in mature_chunks)
-        signature = tuple((chunk_x, chunk_z) for chunk_x, chunk_z, _ in mature_chunks)
-        if (
-            existing is None
-            or tile_is_dirty
-            or existing.signature != signature
-            or existing.vertex_count != batch_vertex_count
-            or existing.chunk_count != len(mature_chunks)
-        ):
-            old_buffer = existing.vertex_buffer if existing is not None else None
-            merged_buffer = merge_tile_meshes(renderer, [mesh for _, _, mesh in mature_chunks], encoder)
-            renderer._tile_render_batches[tile_key_value] = ChunkRenderBatch(
-                signature=signature,
-                vertex_count=batch_vertex_count,
-                vertex_buffer=merged_buffer,
-                bounds=merge_chunk_bounds(renderer, [mesh for _, _, mesh in mature_chunks]),
-                chunk_count=len(mature_chunks),
-                complete_tile=(len(tile_chunks) == merged_tile_max_chunks and len(mature_chunks) == len(tile_chunks)),
-                all_mature=(len(mature_chunks) == len(tile_chunks)),
-                visible_mask=current_visible_mask,
-                source_version=tile_version,
-            )
-            renderer._tile_dirty_keys.discard(tile_key_value)
-            if old_buffer is not None:
-                renderer._transient_render_buffers.append([old_buffer])
-
-        batch = renderer._tile_render_batches[tile_key_value]
-        render_batches.append((batch.vertex_buffer, batch.vertex_count, 0))
-        for _, _, mesh in immature_chunks:
-            render_batches.append((mesh.vertex_buffer, mesh.vertex_count, mesh.vertex_offset))
-
-    while len(renderer._transient_render_buffers) > 3:
-        old_buffers = renderer._transient_render_buffers.pop(0)
-        for buffer in old_buffers:
-            buffer.destroy()
-
+        render_batches.append((mesh.vertex_buffer, mesh.vertex_count, mesh.vertex_offset))
+        visible_count += 1
+        visible_vertex_count += int(mesh.vertex_count)
     render_encode_ms = (time.perf_counter() - encode_start) * 1000.0
-    visible_vertex_count = sum(vertex_count for _, vertex_count, _ in render_batches)
-    return render_batches, render_encode_ms, len(render_batches), merged_chunk_count, visible_count, visible_vertex_count
+    return render_batches, render_encode_ms, len(render_batches), 0, visible_count, visible_vertex_count

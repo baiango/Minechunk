@@ -22,7 +22,7 @@ from typing import Optional
 import numpy as np
 
 from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
-from .terrain_kernels import expand_chunk_surface_to_voxel_grid
+from .terrain_kernels import fill_chunk_voxel_grid as cpu_fill_chunk_voxel_grid
 
 try:
     import Metal
@@ -99,28 +99,39 @@ inline float value_noise_2d(float x, float y, uint seed, float frequency) {
 }
 
 inline uint2 terrain_sample(float x, float z, uint seed, uint height_limit) {
-    float broad = value_noise_2d(x, z, seed + 11u, 0.0009765625f);
-    float ridge = value_noise_2d(x, z, seed + 23u, 0.00390625f);
-    float detail = value_noise_2d(x, z, seed + 47u, 0.010416667f);
+    constexpr float terrain_frequency_scale = 0.1f;
 
-    float height_f = 26.0f + broad * 18.0f + ridge * 14.0f + detail * 8.0f;
-    if (height_f < 4.0f) {
-        height_f = 4.0f;
-    }
+    float sample_x = x;
+    float sample_z = z;
+    float broad = value_noise_2d(sample_x, sample_z, seed + 11u, 0.0009765625f * terrain_frequency_scale);
+    float ridge = value_noise_2d(sample_x, sample_z, seed + 23u, 0.00390625f * terrain_frequency_scale);
+    float detail = value_noise_2d(sample_x, sample_z, seed + 47u, 0.010416667f * terrain_frequency_scale);
+    float micro = value_noise_2d(sample_x, sample_z, seed + 71u, 0.020833334f * terrain_frequency_scale);
+    float nano = value_noise_2d(sample_x, sample_z, seed + 97u, 0.041666668f * terrain_frequency_scale);
 
     uint upper_bound = height_limit - 1u;
     float upper_bound_f = float(upper_bound);
+    float normalized_height = 24.0f + broad * 11.0f + ridge * 8.0f + detail * 4.5f + micro * 1.75f + nano * 0.75f;
+    float height_scale = upper_bound > 0u ? upper_bound_f / 50.0f : 1.0f;
+    float height_f = normalized_height * height_scale;
+    if (height_f < 4.0f) {
+        height_f = 4.0f;
+    }
     if (height_f > upper_bound_f) {
         height_f = upper_bound_f;
     }
     uint height_i = uint(height_f);
 
+    uint sand_threshold = max(4u, uint(float(height_limit) * 0.18f));
+    uint stone_threshold = max(sand_threshold + 6u, uint(float(height_limit) * 0.58f));
+    uint snow_threshold = max(stone_threshold + 6u, uint(float(height_limit) * 0.82f));
+
     uint material = 4u;
-    if (height_i >= 90u) {
+    if (height_i >= snow_threshold) {
         material = 6u;
-    } else if (height_i <= 14u) {
+    } else if (height_i <= sand_threshold) {
         material = 5u;
-    } else if (height_i >= 70u && detail > 0.12f) {
+    } else if (height_i >= stone_threshold && (detail + micro * 0.5f + nano * 0.35f) > 0.10f) {
         material = 2u;
     }
     return uint2(height_i, material);
@@ -223,8 +234,8 @@ class MetalTerrainBackend:
         self,
         device=None,
         seed: int = 0,
-        chunk_size: int = 32,
-        height_limit: int = 128,
+        chunk_size: int = 64,
+        height_limit: int | None = None,
         chunks_per_poll: int = 128,
     ) -> None:
         if Metal is None:
@@ -244,7 +255,7 @@ class MetalTerrainBackend:
 
         self.seed = int(seed)
         self.chunk_size = int(chunk_size)
-        self.height_limit = int(height_limit)
+        self.height_limit = self.chunk_size if height_limit is None else int(height_limit)
         self.chunks_per_poll = max(1, int(chunks_per_poll))
         self.sample_size = self.chunk_size + 2
         self.cell_count = self.sample_size * self.sample_size
@@ -437,17 +448,9 @@ class MetalTerrainBackend:
         return job_id
 
     def chunk_voxel_grid(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
-        heights, materials = self.chunk_surface_grids(chunk_x, chunk_z)
         blocks = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint8)
         voxel_materials = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint32)
-        expand_chunk_surface_to_voxel_grid(
-            blocks,
-            voxel_materials,
-            heights,
-            materials,
-            self.chunk_size,
-            self.height_limit,
-        )
+        cpu_fill_chunk_voxel_grid(blocks, voxel_materials, int(chunk_x), int(chunk_z), self.chunk_size, self.seed, self.height_limit)
         return blocks, voxel_materials
 
     def _allocate_chunk_batch_resources(self, max_chunks: int) -> _ChunkMetalBatch:

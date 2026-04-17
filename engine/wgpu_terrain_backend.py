@@ -17,8 +17,8 @@ import numpy as np
 
 from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
 from .terrain_kernels import (
-    expand_chunk_surface_to_voxel_grid,
     fill_chunk_surface_grids as cpu_fill_chunk_surface_grids,
+    fill_chunk_voxel_grid as cpu_fill_chunk_voxel_grid,
     surface_profile_at as cpu_surface_profile_at,
 )
 
@@ -95,28 +95,39 @@ fn value_noise_2d(x: f32, y: f32, seed: u32, frequency: f32) -> f32 {
 }
 
 fn terrain_sample(x: f32, z: f32, seed: u32, height_limit: u32) -> vec2u {
-    let broad = value_noise_2d(x, z, seed + 11u, 0.0009765625);
-    let ridge = value_noise_2d(x, z, seed + 23u, 0.00390625);
-    let detail = value_noise_2d(x, z, seed + 47u, 0.010416667);
+    let terrain_frequency_scale = 0.1;
 
-    var height_f = 26.0 + broad * 18.0 + ridge * 14.0 + detail * 8.0;
-    if (height_f < 4.0) {
-        height_f = 4.0;
-    }
+    let sample_x = x;
+    let sample_z = z;
+    let broad = value_noise_2d(sample_x, sample_z, seed + 11u, 0.0009765625 * terrain_frequency_scale);
+    let ridge = value_noise_2d(sample_x, sample_z, seed + 23u, 0.00390625 * terrain_frequency_scale);
+    let detail = value_noise_2d(sample_x, sample_z, seed + 47u, 0.010416667 * terrain_frequency_scale);
+    let micro = value_noise_2d(sample_x, sample_z, seed + 71u, 0.020833334 * terrain_frequency_scale);
+    let nano = value_noise_2d(sample_x, sample_z, seed + 97u, 0.041666668 * terrain_frequency_scale);
 
     let upper_bound = height_limit - 1u;
     let upper_bound_f = f32(upper_bound);
+    let normalized_height = 24.0 + broad * 11.0 + ridge * 8.0 + detail * 4.5 + micro * 1.75 + nano * 0.75;
+    let height_scale = select(1.0, upper_bound_f / 50.0, upper_bound > 0u);
+    var height_f = normalized_height * height_scale;
+    if (height_f < 4.0) {
+        height_f = 4.0;
+    }
     if (height_f > upper_bound_f) {
         height_f = upper_bound_f;
     }
     let height_i = u32(height_f);
 
+    let sand_threshold = max(4u, u32(f32(height_limit) * 0.18));
+    let stone_threshold = max(sand_threshold + 6u, u32(f32(height_limit) * 0.58));
+    let snow_threshold = max(stone_threshold + 6u, u32(f32(height_limit) * 0.82));
+
     var material = 4u;
-    if (height_i >= 90u) {
+    if (height_i >= snow_threshold) {
         material = 6u;
-    } else if (height_i <= 14u) {
+    } else if (height_i <= sand_threshold) {
         material = 5u;
-    } else if (height_i >= 70u && detail > 0.12) {
+    } else if (height_i >= stone_threshold && (detail + micro * 0.5 + nano * 0.35) > 0.10) {
         material = 2u;
     }
     return vec2u(height_i, material);
@@ -378,10 +389,9 @@ class WgpuTerrainBackend:
         return job_id
 
     def chunk_voxel_grid(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
-        heights, materials = self.chunk_surface_grids(chunk_x, chunk_z)
         blocks = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint8)
         voxel_materials = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint32)
-        expand_chunk_surface_to_voxel_grid(blocks, voxel_materials, heights, materials, self.chunk_size, self.height_limit)
+        cpu_fill_chunk_voxel_grid(blocks, voxel_materials, int(chunk_x), int(chunk_z), self.chunk_size, self.seed, self.height_limit)
         return blocks, voxel_materials
 
     def _allocate_chunk_batch_resources(self, max_chunks: int) -> "_ChunkGpuBatch":

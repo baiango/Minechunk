@@ -630,13 +630,22 @@ def refresh_frame_breakdown_summary(renderer) -> None:
     if avg_wall_frame > 0.0:
         chunk_generation_per_s = avg_new_displayed_chunks / max(avg_wall_frame / 1000.0, 1e-9)
 
+    camera_x = float(renderer.camera.position[0])
+    camera_y = float(renderer.camera.position[1])
+    camera_z = float(renderer.camera.position[2])
+    camera_block_x = camera_x / max(renderer.world.block_size, 1e-9)
+    camera_block_y = camera_y / max(renderer.world.block_size, 1e-9)
+    camera_block_z = camera_z / max(renderer.world.block_size, 1e-9)
+
     lines = [
         f"FRAME BREAKDOWN @ DIMENSION {renderer.render_dimension_chunks}x{renderer.render_dimension_chunks} CHUNKS",
-        f"MOVE SPEED: {renderer._current_move_speed:5.1f} B/S",
+        f"MOVE SPEED: {renderer._current_move_speed / max(renderer.world.block_size, 1e-9):5.1f} B/S",
+        f"CAM POS M: {camera_x:7.2f} {camera_y:7.2f} {camera_z:7.2f}",
+        f"CAM POS B: {camera_block_x:7.1f} {camera_block_y:7.1f} {camera_block_z:7.1f}",
         f"RENDER BACKEND: {renderer.render_backend_label}",
         f"TERRAIN BACKEND: {renderer.world.terrain_backend_label()}",
         f"MESH BACKEND: {renderer.mesh_backend_label}",
-        f"CHUNK DIMS: {renderer_module.CHUNK_SIZE}x{renderer_module.WORLD_HEIGHT}x{renderer_module.CHUNK_SIZE}",
+        f"CHUNK DIMS: {renderer_module.CHUNK_SIZE}x{renderer_module.CHUNK_SIZE}x{renderer_module.CHUNK_SIZE}",
         f"BACKEND POLL SIZE: {renderer.terrain_batch_size}",
         f"MESH DRAIN SIZE: {renderer.mesh_batch_size}",
         f"MESH SLABS: {slab_count}  USED {slab_used_bytes / (1024.0 * 1024.0):4.1f} MIB  FREE {slab_free_bytes / (1024.0 * 1024.0):4.1f} MIB",

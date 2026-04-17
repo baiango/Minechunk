@@ -45,8 +45,17 @@ from .meshing_types import (
     MeshOutputSlab,
     PendingChunkMeshBatch,
 )
-from .voxel_world import CHUNK_SIZE, WORLD_HEIGHT, VoxelWorld
+from .world_constants import (
+    BLOCK_SIZE,
+    CHUNK_SIZE,
+    CHUNK_WORLD_SIZE,
+    VERTICAL_CHUNK_COUNT,
+    VERTICAL_CHUNK_RENDER_RADIUS,
+    VERTICAL_CHUNK_STACK_ENABLED,
+)
+from .voxel_world import VoxelWorld
 from .terrain_backend import ChunkSurfaceGpuBatch
+from .terrain_kernels import AIR
 
 try:
     profile  # type: ignore[name-defined]
@@ -65,18 +74,21 @@ class TerrainRenderer:
         seed: int = 1337,
         use_gpu_terrain: bool | None = None,
         use_gpu_meshing: bool | None = None,
-        terrain_batch_size: int = 256,
+        terrain_batch_size: int = DEFAULT_MESH_BATCH_SIZE,
         mesh_batch_size: int | None = None,
     ) -> None:
         default_use_gpu = _engine_mode_uses_gpu_path()
         self.use_gpu_terrain = default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)
         self.use_gpu_meshing = default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)
+        if VERTICAL_CHUNK_STACK_ENABLED:
+            self.use_gpu_terrain = False
+            self.use_gpu_meshing = False
         self.terrain_batch_size = max(1, int(terrain_batch_size))
         if mesh_batch_size is None:
             self.mesh_batch_size = max(1, int(self.terrain_batch_size))
         else:
             self.mesh_batch_size = max(1, int(mesh_batch_size))
-        self._pending_surface_gpu_batch_target_multiplier = 10
+        self._pending_surface_gpu_batch_target_multiplier = 2 if CHUNK_SIZE >= 64 else 10
         self.base_title = "Minechunk"
         self.engine_mode_label = engine_mode
         self.canvas = RenderCanvas(
@@ -131,7 +143,8 @@ class TerrainRenderer:
             )
         self._log_backend_diagnostics()
 
-        self.camera = Camera(position=[0.0, 200.0, 0.0], yaw=math.pi, pitch=-1.20)
+        spawn_y = self._default_camera_spawn_y()
+        self.camera = Camera(position=[0.0, spawn_y, 0.0], yaw=math.pi, pitch=-1.20)
         self.keys_down: set[str] = set()
         self.dragging = False
         self.last_pointer: tuple[float, float] | None = None
@@ -139,22 +152,23 @@ class TerrainRenderer:
         self.depth_texture = None
         self.depth_view = None
         self.depth_size = (0, 0)
-        # 512 blocks rounds up to a whole number of chunks.
-        self.chunk_radius = max(1, math.ceil(DEFAULT_RENDER_DISTANCE_BLOCKS / CHUNK_SIZE))
+        # Fixed target render radius in chunk units.
+        self.chunk_radius = max(1, int(DEFAULT_RENDER_DISTANCE_CHUNKS))
+        self.vertical_chunk_radius = max(0, int(VERTICAL_CHUNK_RENDER_RADIUS)) if VERTICAL_CHUNK_STACK_ENABLED else 0
         self.render_dimension_chunks = self.chunk_radius * 2 + 1
-        self.chunk_cache: OrderedDict[tuple[int, int], ChunkMesh] = OrderedDict()
-        self._visible_chunk_coords: list[tuple[int, int]] = []
-        self._visible_chunk_coord_set: set[tuple[int, int]] = set()
-        self._visible_chunk_origin: tuple[int, int] | None = None
+        self.chunk_cache: OrderedDict[tuple[int, int, int], ChunkMesh] = OrderedDict()
+        self._visible_chunk_coords: list[tuple[int, int, int]] = []
+        self._visible_chunk_coord_set: set[tuple[int, int, int]] = set()
+        self._visible_chunk_origin: tuple[int, int, int] | None = None
         self._visible_tile_keys: list[tuple[int, int]] = []
         self._visible_tile_coords: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
         self._visible_tile_masks: dict[tuple[int, int], int] = {}
-        self._visible_displayed_coords: set[tuple[int, int]] = set()
-        self._visible_missing_coords: set[tuple[int, int]] = set()
-        self._chunk_request_queue: deque[tuple[int, int]] = deque()
-        self._chunk_request_queue_origin: tuple[int, int] | None = None
+        self._visible_displayed_coords: set[tuple[int, int, int]] = set()
+        self._visible_missing_coords: set[tuple[int, int, int]] = set()
+        self._chunk_request_queue: deque[tuple[int, int, int]] = deque()
+        self._chunk_request_queue_origin: tuple[int, int, int] | None = None
         self._chunk_request_queue_dirty = True
-        self._pending_chunk_coords: set[tuple[int, int]] = set()
+        self._pending_chunk_coords: set[tuple[int, int, int]] = set()
         self._transient_render_buffers: list[list[wgpu.GPUBuffer]] = []
         self._tile_render_batches: dict[tuple[int, int], ChunkRenderBatch] = {}
         self._tile_dirty_keys: set[tuple[int, int]] = set()
@@ -177,11 +191,11 @@ class TerrainRenderer:
             MESH_OUTPUT_SLAB_MIN_BYTES,
             self._mesh_output_binding_alignment,
         )
-        self.use_gpu_indirect_render = True
+        self.use_gpu_indirect_render = False if VERTICAL_CHUNK_STACK_ENABLED else True
         self._mesh_draw_indirect_capacity = 0
         self._mesh_draw_indirect_buffer = None
         self._mesh_draw_indirect_array = np.empty((0, 4), dtype=np.uint32)
-        self.use_gpu_visibility_culling = True
+        self.use_gpu_visibility_culling = False if VERTICAL_CHUNK_STACK_ENABLED else True
         self._mesh_visibility_record_capacity = 0
         self._mesh_visibility_record_buffer = None
         self._mesh_visibility_record_array = np.empty(0, dtype=MESH_VISIBILITY_RECORD_DTYPE)
@@ -189,6 +203,10 @@ class TerrainRenderer:
         self.max_cached_chunks = MAX_CACHED_CHUNKS
         self._cache_capacity_warned = False
         self._current_move_speed = self.camera.move_speed
+        self.walk_mode = True
+        self._walk_velocity = [0.0, 0.0, 0.0]
+        self._camera_on_ground = False
+        self._jump_queued = False
         self.mesh_backend_label = (
             "Metal" if self._using_metal_meshing else ("Wgpu" if self.use_gpu_meshing else "CPU")
         )
@@ -201,10 +219,17 @@ class TerrainRenderer:
         self._pending_surface_gpu_batch_target_chunks = (
             max(self.mesh_batch_size, self.terrain_batch_size) * self._pending_surface_gpu_batch_target_multiplier
         )
-        self._async_voxel_mesh_batch_pool_limit = 48
-        self._gpu_mesh_async_inflight_limit = max(32, self.mesh_batch_size * 6)
-        self._gpu_mesh_async_finalize_budget = max(1, self.mesh_batch_size * 2)
-        self._metal_gpu_mesh_async_finalize_budget = max(1, min(2, self.mesh_batch_size))
+        self._async_voxel_mesh_batch_pool_limit = max(4, min(16, self.mesh_batch_size))
+        if self._using_metal_meshing:
+            self._gpu_mesh_async_inflight_limit = METAL_MESH_INFLIGHT_SLOTS
+            self._gpu_mesh_async_finalize_budget = max(1, min(4, self.mesh_batch_size))
+            self._metal_gpu_mesh_async_finalize_budget = 1
+        else:
+            self._gpu_mesh_async_inflight_limit = max(8, min(32, self.mesh_batch_size * 2))
+            self._gpu_mesh_async_finalize_budget = max(1, min(16, self.mesh_batch_size * 2))
+            self._metal_gpu_mesh_async_finalize_budget = max(1, min(2, self.mesh_batch_size))
+        self._mesh_output_upload_batch_bytes = max(self._mesh_output_min_slab_bytes, int(MESH_OUTPUT_UPLOAD_BATCH_BYTES))
+        self._device_lost = False
         self._pending_surface_gpu_batches_first_enqueued_at = 0.0
         self._pending_gpu_mesh_batches: deque[PendingChunkMeshBatch] = deque()
         self._gpu_mesh_deferred_buffer_cleanup: deque[tuple[int, list[wgpu.GPUBuffer]]] = deque()
@@ -255,7 +280,7 @@ class TerrainRenderer:
         self._last_new_displayed_chunks = 0
         self._last_chunk_stream_drained = 0
         self._last_frame_visible_batches = 0
-        self._last_displayed_chunk_coords: set[tuple[int, int]] = set()
+        self._last_displayed_chunk_coords: set[tuple[int, int, int]] = set()
         self._voxel_mesh_scratch_capacity = 0
         self._voxel_mesh_scratch_sample_size = 0
         self._voxel_mesh_scratch_height_limit = 0
@@ -659,6 +684,17 @@ class TerrainRenderer:
         self._disable_profiling()
         self.canvas.request_draw(self.draw_frame)
 
+    def _default_camera_spawn_y(self) -> float:
+        try:
+            surface_height_blocks = int(self.world.surface_height_at(0, 0))
+        except Exception:
+            surface_height_blocks = int(self.world.height // 2)
+        surface_y = float(surface_height_blocks) * BLOCK_SIZE
+        return max(
+            CAMERA_EYE_HEIGHT_METERS + 0.2,
+            min(float(self.world.height) * BLOCK_SIZE + CAMERA_HEADROOM_METERS, surface_y + CAMERA_EYE_HEIGHT_METERS),
+        )
+
     def run(self) -> None:
         try:
             loop.run()
@@ -707,6 +743,12 @@ class TerrainRenderer:
             self._toggle_profiling()
         if is_new_press and key in {"r"}:
             self.regenerate_world()
+        if is_new_press and key == "v":
+            self.walk_mode = not self.walk_mode
+            self._walk_velocity[:] = [0.0, 0.0, 0.0]
+            self._jump_queued = False
+        if is_new_press and key == "space":
+            self._jump_queued = True
 
     def _handle_key_up(self, event) -> None:
         self.keys_down.discard(self._normalize_key(event))
@@ -774,7 +816,7 @@ class TerrainRenderer:
             "  RENDER ENCODE: --.- MS",
             "  COMMAND FINISH: --.- MS",
             "  QUEUE SUBMIT: --.- MS",
-            f"CHUNK DIMS: {CHUNK_SIZE}x{WORLD_HEIGHT}x{CHUNK_SIZE}",
+            f"CHUNK DIMS: {CHUNK_SIZE}x{CHUNK_SIZE}x{CHUNK_SIZE}",
             f"BACKEND POLL SIZE: {self.terrain_batch_size}",
             f"MESH DRAIN SIZE: {self.mesh_batch_size}",
             f"PRESENT PACING: FPS {SWAPCHAIN_MAX_FPS}  VSYNC {'ON' if SWAPCHAIN_USE_VSYNC else 'OFF'}",
@@ -947,7 +989,7 @@ class TerrainRenderer:
                 file=sys.stderr,
             )
         self._log_backend_diagnostics()
-        self.camera.position[:] = [0.0, 200.0, 0.0]
+        self.camera.position[:] = [0.0, self._default_camera_spawn_y(), 0.0]
         self.camera.yaw = math.pi
         self.camera.pitch = -1.20
         self.camera.clamp_pitch()
@@ -971,7 +1013,121 @@ class TerrainRenderer:
         else:
             self._mesh_buffer_refs[key] = refs - 1
 
-    def _update_camera(self, dt: float) -> None:
+    def _player_extents(self) -> tuple[float, float, float]:
+        return (
+            float(PLAYER_COLLIDER_HALF_WIDTH_METERS),
+            float(PLAYER_EYE_OFFSET_METERS),
+            float(max(0.0, PLAYER_COLLIDER_HEIGHT_METERS - PLAYER_EYE_OFFSET_METERS)),
+        )
+
+    def _player_aabb(self, position: list[float]) -> tuple[float, float, float, float, float, float]:
+        half_width, eye_down, eye_up = self._player_extents()
+        return (
+            float(position[0]) - half_width,
+            float(position[1]) - eye_down,
+            float(position[2]) - half_width,
+            float(position[0]) + half_width,
+            float(position[1]) + eye_up,
+            float(position[2]) + half_width,
+        )
+
+    def _is_block_solid(self, bx: int, by: int, bz: int) -> bool:
+        if by < 0:
+            return True
+        return int(self.world.block_at(int(bx), int(by), int(bz))) != int(AIR)
+
+    def _resolve_collision_axis(self, position: list[float], axis: int, delta: float) -> bool:
+        if abs(delta) <= 1e-9:
+            return False
+        position[axis] += float(delta)
+        min_x, min_y, min_z, max_x, max_y, max_z = self._player_aabb(position)
+        eps = 1e-6
+        min_bx = int(math.floor(min_x / BLOCK_SIZE))
+        max_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
+        min_by = int(math.floor(min_y / BLOCK_SIZE))
+        max_by = int(math.floor((max_y - eps) / BLOCK_SIZE))
+        min_bz = int(math.floor(min_z / BLOCK_SIZE))
+        max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
+        collided = False
+        half_width, eye_down, eye_up = self._player_extents()
+        for by in range(min_by, max_by + 1):
+            for bz in range(min_bz, max_bz + 1):
+                for bx in range(min_bx, max_bx + 1):
+                    if not self._is_block_solid(bx, by, bz):
+                        continue
+                    collided = True
+                    block_min_x = float(bx) * BLOCK_SIZE
+                    block_min_y = float(by) * BLOCK_SIZE
+                    block_min_z = float(bz) * BLOCK_SIZE
+                    block_max_x = block_min_x + BLOCK_SIZE
+                    block_max_y = block_min_y + BLOCK_SIZE
+                    block_max_z = block_min_z + BLOCK_SIZE
+                    if axis == 0:
+                        if delta > 0.0:
+                            position[0] = min(position[0], block_min_x - half_width - eps)
+                        else:
+                            position[0] = max(position[0], block_max_x + half_width + eps)
+                    elif axis == 1:
+                        if delta > 0.0:
+                            position[1] = min(position[1], block_min_y - eye_up - eps)
+                        else:
+                            position[1] = max(position[1], block_max_y + eye_down + eps)
+                    else:
+                        if delta > 0.0:
+                            position[2] = min(position[2], block_min_z - half_width - eps)
+                        else:
+                            position[2] = max(position[2], block_max_z + half_width + eps)
+        return collided
+
+    def _position_is_clear(self, position: list[float]) -> bool:
+        min_x, min_y, min_z, max_x, max_y, max_z = self._player_aabb(position)
+        eps = 1e-6
+        min_bx = int(math.floor(min_x / BLOCK_SIZE))
+        max_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
+        min_by = int(math.floor(min_y / BLOCK_SIZE))
+        max_by = int(math.floor((max_y - eps) / BLOCK_SIZE))
+        min_bz = int(math.floor(min_z / BLOCK_SIZE))
+        max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
+        for by in range(min_by, max_by + 1):
+            for bz in range(min_bz, max_bz + 1):
+                for bx in range(min_bx, max_bx + 1):
+                    if self._is_block_solid(bx, by, bz):
+                        return False
+        return True
+
+    def _move_horizontal_with_step(self, position: list[float], axis: int, delta: float) -> bool:
+        if abs(delta) <= 1e-9:
+            return False
+        trial = [float(position[0]), float(position[1]), float(position[2])]
+        collided = self._resolve_collision_axis(trial, axis, delta)
+        if not collided:
+            position[:] = trial
+            return False
+        if not self.walk_mode or not self._camera_on_ground:
+            position[:] = trial
+            return True
+        stepped = [float(position[0]), float(position[1]), float(position[2])]
+        self._resolve_collision_axis(stepped, 1, float(PLAYER_STEP_HEIGHT_METERS))
+        if stepped[1] <= position[1] + 1e-5 or not self._position_is_clear(stepped):
+            position[:] = trial
+            return True
+        step_trial = [float(stepped[0]), float(stepped[1]), float(stepped[2])]
+        if self._resolve_collision_axis(step_trial, axis, delta):
+            position[:] = trial
+            return True
+        self._resolve_collision_axis(step_trial, 1, -float(PLAYER_GROUND_SNAP_METERS))
+        position[:] = step_trial
+        return False
+
+    def _snap_to_ground(self, position: list[float]) -> bool:
+        probe = [float(position[0]), float(position[1]), float(position[2])]
+        collided = self._resolve_collision_axis(probe, 1, -float(PLAYER_GROUND_SNAP_METERS))
+        if collided:
+            position[:] = probe
+            return True
+        return False
+
+    def _update_camera_fly(self, dt: float) -> None:
         sprinting = self._key_active("shift", "shiftleft", "shiftright")
         speed = SPRINT_FLY_SPEED if sprinting else self.camera.move_speed
         self._current_move_speed = float(speed)
@@ -1004,7 +1160,67 @@ class TerrainRenderer:
             self.camera.position[1] += move[1] * scale
             self.camera.position[2] += move[2] * scale
 
-        self.camera.position[1] = clamp(self.camera.position[1], 4.0, self.world.height + 48.0)
+    def _update_camera_walk(self, dt: float) -> None:
+        sprinting = self._key_active("shift", "shiftleft", "shiftright")
+        speed = WALK_SPRINT_SPEED if sprinting else self.camera.move_speed
+        self._current_move_speed = float(speed)
+
+        move_x = 0.0
+        move_z = 0.0
+        forward = flat_forward_vector(self.camera.yaw)
+        right = right_vector(self.camera.yaw)
+        if self._key_active("w", "arrowup"):
+            move_x += forward[0]
+            move_z += forward[2]
+        if self._key_active("s", "arrowdown"):
+            move_x -= forward[0]
+            move_z -= forward[2]
+        if self._key_active("d", "arrowright"):
+            move_x += right[0]
+            move_z += right[2]
+        if self._key_active("a", "arrowleft"):
+            move_x -= right[0]
+            move_z -= right[2]
+
+        move_len = math.sqrt(move_x * move_x + move_z * move_z)
+        if move_len > 0.0:
+            move_x /= move_len
+            move_z /= move_len
+        desired_dx = move_x * speed * dt
+        desired_dz = move_z * speed * dt
+
+        if self._camera_on_ground and self._jump_queued:
+            self._walk_velocity[1] = float(PLAYER_JUMP_SPEED_METERS)
+            self._camera_on_ground = False
+        self._jump_queued = False
+        self._walk_velocity[1] -= float(PLAYER_GRAVITY_METERS) * dt
+
+        position = [float(self.camera.position[0]), float(self.camera.position[1]), float(self.camera.position[2])]
+        self._move_horizontal_with_step(position, 0, desired_dx)
+        self._move_horizontal_with_step(position, 2, desired_dz)
+
+        if self._walk_velocity[1] <= 0.0:
+            self._camera_on_ground = self._snap_to_ground(position)
+
+        collided_y = self._resolve_collision_axis(position, 1, self._walk_velocity[1] * dt)
+        if collided_y:
+            if self._walk_velocity[1] <= 0.0:
+                self._camera_on_ground = True
+            self._walk_velocity[1] = 0.0
+        else:
+            self._camera_on_ground = False
+
+        self.camera.position[:] = position
+
+    def _update_camera(self, dt: float) -> None:
+        if self.walk_mode:
+            self._update_camera_walk(dt)
+        else:
+            self._update_camera_fly(dt)
+            self._walk_velocity[:] = [0.0, 0.0, 0.0]
+            self._camera_on_ground = False
+            self._jump_queued = False
+        self.camera.position[1] = clamp(self.camera.position[1], CAMERA_MIN_HEIGHT_METERS, self.world.height * BLOCK_SIZE + CAMERA_HEADROOM_METERS)
 
     def _ensure_depth_buffer(self) -> None:
         width, height = self.canvas.get_physical_size()
@@ -1028,43 +1244,62 @@ class TerrainRenderer:
         up = normalize3(cross3(right, forward))
         return right, up, forward
 
-    def _chunk_coords_in_view(self) -> list[tuple[int, int]]:
-        chunk_x = int(self.camera.position[0] // CHUNK_SIZE)
-        chunk_z = int(self.camera.position[2] // CHUNK_SIZE)
-        coords: list[tuple[int, int]] = []
-        for dz in range(-self.chunk_radius, self.chunk_radius + 1):
-            for dx in range(-self.chunk_radius, self.chunk_radius + 1):
-                coords.append((chunk_x + dx, chunk_z + dz))
+    def _chunk_coords_in_view_for_origin(self, origin: tuple[int, int, int]) -> list[tuple[int, int, int]]:
+        chunk_x = int(origin[0])
+        chunk_y = int(origin[1])
+        chunk_z = int(origin[2])
+        radius = int(self.chunk_radius)
+        radius_sq = radius * radius
+        coords: list[tuple[int, int, int]] = []
+        min_y = max(0, chunk_y - self.vertical_chunk_radius) if VERTICAL_CHUNK_STACK_ENABLED else 0
+        max_y = min(VERTICAL_CHUNK_COUNT - 1, chunk_y + self.vertical_chunk_radius) if VERTICAL_CHUNK_STACK_ENABLED else 0
+        if VERTICAL_CHUNK_STACK_ENABLED:
+            cy_order: list[int] = [chunk_y]
+            max_offset = max(chunk_y - min_y, max_y - chunk_y)
+            for offset in range(1, max_offset + 1):
+                up = chunk_y + offset
+                down = chunk_y - offset
+                if up <= max_y:
+                    cy_order.append(up)
+                if down >= min_y:
+                    cy_order.append(down)
+        else:
+            cy_order = [0]
+        for cy in cy_order:
+            for dz in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    if dx * dx + dz * dz > radius_sq:
+                        continue
+                    coords.append((chunk_x + dx, cy, chunk_z + dz))
         return coords
 
-    def _visible_chunk_bounds(self, origin: tuple[int, int]) -> tuple[int, int, int, int]:
-        radius = int(self.chunk_radius)
-        return (
-            int(origin[0] - radius),
-            int(origin[0] + radius),
-            int(origin[1] - radius),
-            int(origin[1] + radius),
+    def _chunk_coords_in_view(self) -> list[tuple[int, int, int]]:
+        origin = (
+            int(self.camera.position[0] // CHUNK_WORLD_SIZE),
+            max(0, min(VERTICAL_CHUNK_COUNT - 1, int(self.camera.position[1] // CHUNK_WORLD_SIZE))) if VERTICAL_CHUNK_STACK_ENABLED else 0,
+            int(self.camera.position[2] // CHUNK_WORLD_SIZE),
         )
+        return self._chunk_coords_in_view_for_origin(origin)
 
-    def _tile_key_for_chunk(self, chunk_x: int, chunk_z: int) -> tuple[int, int]:
+    def _tile_key_for_chunk(self, chunk_x: int, chunk_z: int, chunk_y: int = 0) -> tuple[int, int, int]:
         tile_size = int(MERGED_TILE_SIZE_CHUNKS)
-        return (int(chunk_x) // tile_size, int(chunk_z) // tile_size)
+        return (int(chunk_x) // tile_size, int(chunk_y), int(chunk_z) // tile_size)
 
-    def _tile_bit_for_chunk(self, chunk_x: int, chunk_z: int) -> tuple[tuple[int, int], int]:
+    def _tile_bit_for_chunk(self, chunk_x: int, chunk_z: int, chunk_y: int = 0) -> tuple[tuple[int, int, int], int]:
         tile_size = int(MERGED_TILE_SIZE_CHUNKS)
-        tile_key_value = self._tile_key_for_chunk(int(chunk_x), int(chunk_z))
+        tile_key_value = self._tile_key_for_chunk(int(chunk_x), int(chunk_z), int(chunk_y))
         local_x = int(chunk_x) - tile_key_value[0] * tile_size
-        local_z = int(chunk_z) - tile_key_value[1] * tile_size
+        local_z = int(chunk_z) - tile_key_value[2] * tile_size
         if 0 <= local_x < tile_size and 0 <= local_z < tile_size:
             return tile_key_value, 1 << (local_z * tile_size + local_x)
         return tile_key_value, 0
 
     def _rebuild_visible_tile_layout_from_coords(self) -> None:
-        tile_groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
-        tile_masks: dict[tuple[int, int], int] = {}
-        for chunk_x, chunk_z in self._visible_chunk_coords:
-            tile_key_value, tile_bit = self._tile_bit_for_chunk(int(chunk_x), int(chunk_z))
-            tile_groups.setdefault(tile_key_value, []).append((int(chunk_x), int(chunk_z)))
+        tile_groups: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
+        tile_masks: dict[tuple[int, int, int], int] = {}
+        for chunk_x, chunk_y, chunk_z in self._visible_chunk_coords:
+            tile_key_value, tile_bit = self._tile_bit_for_chunk(int(chunk_x), int(chunk_z), int(chunk_y))
+            tile_groups.setdefault(tile_key_value, []).append((int(chunk_x), int(chunk_y), int(chunk_z)))
             if tile_bit != 0:
                 tile_masks[tile_key_value] = int(tile_masks.get(tile_key_value, 0)) | int(tile_bit)
         self._visible_tile_keys = sorted(tile_groups)
@@ -1074,109 +1309,15 @@ class TerrainRenderer:
         }
         self._visible_tile_masks = tile_masks
 
-    def _apply_visible_chunk_coord_delta(self, new_origin: tuple[int, int]) -> bool:
-        old_origin = self._visible_chunk_origin
-        old_coords = self._visible_chunk_coord_set
-        if old_origin is None or not old_coords:
-            return False
-
-        dx = int(new_origin[0] - old_origin[0])
-        dz = int(new_origin[1] - old_origin[1])
-        if dx == 0 and dz == 0:
-            return True
-        if max(abs(dx), abs(dz)) > 4:
-            return False
-
-        old_min_x, old_max_x, old_min_z, old_max_z = self._visible_chunk_bounds(old_origin)
-        new_min_x, new_max_x, new_min_z, new_max_z = self._visible_chunk_bounds(new_origin)
-        leaving: set[tuple[int, int]] = set()
-        entering: set[tuple[int, int]] = set()
-
-        if dx > 0:
-            for chunk_x in range(old_min_x, min(old_max_x + 1, old_min_x + dx)):
-                for chunk_z in range(old_min_z, old_max_z + 1):
-                    leaving.add((chunk_x, chunk_z))
-            for chunk_x in range(max(old_max_x + 1, new_min_x), new_max_x + 1):
-                for chunk_z in range(new_min_z, new_max_z + 1):
-                    entering.add((chunk_x, chunk_z))
-        elif dx < 0:
-            step = -dx
-            for chunk_x in range(max(old_min_x, old_max_x - step + 1), old_max_x + 1):
-                for chunk_z in range(old_min_z, old_max_z + 1):
-                    leaving.add((chunk_x, chunk_z))
-            for chunk_x in range(new_min_x, min(new_max_x + 1, old_min_x)):
-                for chunk_z in range(new_min_z, new_max_z + 1):
-                    entering.add((chunk_x, chunk_z))
-
-        if dz > 0:
-            for chunk_z in range(old_min_z, min(old_max_z + 1, old_min_z + dz)):
-                for chunk_x in range(old_min_x, old_max_x + 1):
-                    leaving.add((chunk_x, chunk_z))
-            for chunk_z in range(max(old_max_z + 1, new_min_z), new_max_z + 1):
-                for chunk_x in range(new_min_x, new_max_x + 1):
-                    entering.add((chunk_x, chunk_z))
-        elif dz < 0:
-            step = -dz
-            for chunk_z in range(max(old_min_z, old_max_z - step + 1), old_max_z + 1):
-                for chunk_x in range(old_min_x, old_max_x + 1):
-                    leaving.add((chunk_x, chunk_z))
-            for chunk_z in range(new_min_z, min(new_max_z + 1, old_min_z)):
-                for chunk_x in range(new_min_x, new_max_x + 1):
-                    entering.add((chunk_x, chunk_z))
-
-        if not leaving and not entering:
-            return False
-
-        updated_coords = set(old_coords)
-        updated_coords.difference_update(leaving)
-        updated_coords.update(entering)
-
-        tile_groups = {
-            key: set(coords)
-            for key, coords in self._visible_tile_coords.items()
-        }
-        tile_masks = dict(self._visible_tile_masks)
-
-        for chunk_x, chunk_z in leaving:
-            tile_key_value, tile_bit = self._tile_bit_for_chunk(chunk_x, chunk_z)
-            coords = tile_groups.get(tile_key_value)
-            if coords is not None:
-                coords.discard((chunk_x, chunk_z))
-                if not coords:
-                    tile_groups.pop(tile_key_value, None)
-            if tile_bit != 0:
-                next_mask = int(tile_masks.get(tile_key_value, 0)) & ~int(tile_bit)
-                if next_mask != 0:
-                    tile_masks[tile_key_value] = next_mask
-                else:
-                    tile_masks.pop(tile_key_value, None)
-
-        for chunk_x, chunk_z in entering:
-            tile_key_value, tile_bit = self._tile_bit_for_chunk(chunk_x, chunk_z)
-            tile_groups.setdefault(tile_key_value, set()).add((chunk_x, chunk_z))
-            if tile_bit != 0:
-                tile_masks[tile_key_value] = int(tile_masks.get(tile_key_value, 0)) | int(tile_bit)
-
-        self._visible_chunk_origin = new_origin
-        self._visible_chunk_coord_set = updated_coords
-        self._visible_chunk_coords = list(updated_coords)
-        self._visible_tile_keys = sorted(tile_groups)
-        self._visible_tile_coords = {
-            key: tuple(sorted(coords))
-            for key, coords in tile_groups.items()
-        }
-        self._visible_tile_masks = tile_masks
-        self._visible_layout_version += 1
-        self._cached_tile_draw_batches.clear()
-        return True
+    def _apply_visible_chunk_coord_delta(self, new_origin: tuple[int, int, int]) -> bool:
+        return False
 
     def _refresh_visible_chunk_coords(self) -> None:
         new_origin = (
-            int(self.camera.position[0] // CHUNK_SIZE),
-            int(self.camera.position[2] // CHUNK_SIZE),
+            int(self.camera.position[0] // CHUNK_WORLD_SIZE),
+            max(0, min(VERTICAL_CHUNK_COUNT - 1, int(self.camera.position[1] // CHUNK_WORLD_SIZE))) if VERTICAL_CHUNK_STACK_ENABLED else 0,
+            int(self.camera.position[2] // CHUNK_WORLD_SIZE),
         )
-        if self._apply_visible_chunk_coord_delta(new_origin):
-            return
         self._visible_chunk_origin = new_origin
         self._visible_chunk_coords = self._chunk_coords_in_view()
         self._visible_chunk_coord_set = set(self._visible_chunk_coords)
@@ -1210,8 +1351,8 @@ class TerrainRenderer:
                 forward,
                 1.0 / math.tan(math.radians(90.0) * 0.5),
                 max(1.0, self.canvas.get_physical_size()[0] / max(1.0, float(self.canvas.get_physical_size()[1]))),
-                0.1,
-                1024.0,
+                max(0.02, 0.1 * BLOCK_SIZE),
+                max(128.0 * BLOCK_SIZE, DEFAULT_RENDER_DISTANCE_WORLD * 1.25),
                 LIGHT_DIRECTION,
             ),
         )
@@ -1320,6 +1461,12 @@ class TerrainRenderer:
         }
         return encoder, color_view, stats
 
+    def _is_device_lost_error(self, exc: Exception) -> bool:
+        text = str(exc)
+        if "Parent device is lost" in text or "device is lost" in text.lower():
+            return True
+        return exc.__class__.__name__ == "GPUValidationError" and "lost" in text.lower()
+
     def draw_frame(self) -> None:
         frame_start = time.perf_counter()
         now = frame_start
@@ -1376,7 +1523,13 @@ class TerrainRenderer:
             hud_profile.record_frame_breakdown_sample(self, "pending_chunk_requests", float(len(self._pending_chunk_coords)))
 
             hud_profile.refresh_frame_breakdown_summary(self)
-        except Exception:
+        except Exception as exc:
+            if self._is_device_lost_error(exc):
+                self._device_lost = True
+                print(f"Fatal: render device lost; stopping draw loop ({exc!s})", file=sys.stderr)
+                if profile_started_at is not None:
+                    hud_profile.profile_end_frame(self, profile_started_at, 0.0)
+                return
             try:
                 chunk_gen.service_background_gpu_work(self)
             except Exception:

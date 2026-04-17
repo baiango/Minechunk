@@ -222,9 +222,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let x1 = x0 + cell_size;
     let z0 = origin_z + f32(cell_z) * cell_size;
     let z1 = z0 + cell_size;
-    let y0 = f32(height);
-    let east_y = f32(east_height);
-    let south_y = f32(south_height);
+    let y0 = f32(height) * cell_size;
+    let east_y = f32(east_height) * cell_size;
+    let south_y = f32(south_height) * cell_size;
 
     let top = face_color(material, height, 1.0);
     let east = face_color(material, height, 0.80);
@@ -448,6 +448,7 @@ fn expand_main(@builtin(global_invocation_id) gid: vec3u) {
 VOXEL_MESH_BATCH_SHADER = """
 struct BatchParams {
     counts_and_flags: vec4u,
+    world_scale_and_pad: vec4f,
 }
 
 struct Vertex {
@@ -596,12 +597,13 @@ fn emit_voxel_faces(
         return;
     }
 
-    let x0 = origin_x + f32(local_x - 1u);
-    let x1 = x0 + 1.0;
-    let z0 = origin_z + f32(local_z - 1u);
-    let z1 = z0 + 1.0;
-    let y0 = f32(y);
-    let y1 = y0 + 1.0;
+    let block_scale = params.world_scale_and_pad.x;
+    let x0 = origin_x + f32(local_x - 1u) * block_scale;
+    let x1 = x0 + block_scale;
+    let z0 = origin_z + f32(local_z - 1u) * block_scale;
+    let z1 = z0 + block_scale;
+    let y0 = f32(y) * block_scale;
+    let y1 = y0 + block_scale;
 
     let material = materials.values[cell_index];
     let top = face_color(material, y, 1.0);
@@ -780,8 +782,9 @@ fn emit_main(
     }
     let column_base = chunk_offsets.values[chunk_index] + column_prefix;
     let origin = chunk_coords.values[chunk_index];
-    let origin_x = f32(origin.x * i32(params.counts_and_flags.w));
-    let origin_z = f32(origin.y * i32(params.counts_and_flags.w));
+    let chunk_world_size = f32(params.counts_and_flags.w) * params.world_scale_and_pad.x;
+    let origin_x = f32(origin.x) * chunk_world_size;
+    let origin_z = f32(origin.y) * chunk_world_size;
     emit_voxel_faces(column_base + prefix_offsets[y], chunk_base, sample_size, plane, local_x, local_z, y, height_limit, origin_x, origin_z);
 }
 """
