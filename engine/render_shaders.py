@@ -534,15 +534,63 @@ fn emit_vertex(position: vec3f, normal: vec3f, color: vec3f, slot: u32) {
     vertices.values[slot] = Vertex(vec4f(position, 1.0), vec4f(normal, 0.0), vec4f(color, 1.0));
 }
 
-fn emit_triangle_at(base: u32, a: vec3f, b: vec3f, c: vec3f, normal: vec3f, color: vec3f) {
-    emit_vertex(a, normal, color, base + 0u);
-    emit_vertex(b, normal, color, base + 1u);
-    emit_vertex(c, normal, color, base + 2u);
+fn emit_triangle_at(base: u32, a: vec3f, b: vec3f, c: vec3f, normal: vec3f, color_a: vec3f, color_b: vec3f, color_c: vec3f) {
+    emit_vertex(a, normal, color_a, base + 0u);
+    emit_vertex(b, normal, color_b, base + 1u);
+    emit_vertex(c, normal, color_c, base + 2u);
 }
 
-fn emit_quad_at(base: u32, p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f, normal: vec3f, color: vec3f) {
-    emit_triangle_at(base + 0u, p0, p1, p2, normal, color);
-    emit_triangle_at(base + 3u, p0, p2, p3, normal, color);
+fn emit_quad_at(base: u32, p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f, normal: vec3f, color0: vec3f, color1: vec3f, color2: vec3f, color3: vec3f) {
+    emit_triangle_at(base + 0u, p0, p1, p2, normal, color0, color1, color2);
+    emit_triangle_at(base + 3u, p0, p2, p3, normal, color0, color2, color3);
+}
+
+fn solid_at(chunk_base: u32, sample_size: u32, plane: u32, local_x: u32, local_z: u32, sample_y: i32, height_limit: u32) -> bool {
+    if (sample_y < 0 || sample_y >= i32(height_limit)) {
+        return false;
+    }
+    let idx = chunk_base + u32(sample_y) * plane + local_z * sample_size + local_x;
+    return blocks.values[idx] != 0u;
+}
+
+fn ambient_occlusion_factor(side1: bool, side2: bool, corner: bool) -> f32 {
+    var occlusion = 0u;
+    if (side1 && side2) {
+        occlusion = 3u;
+    } else {
+        occlusion = select(0u, 1u, side1) + select(0u, 1u, side2) + select(0u, 1u, corner);
+    }
+    if (occlusion == 0u) {
+        return 1.0;
+    }
+    if (occlusion == 1u) {
+        return 0.82;
+    }
+    if (occlusion == 2u) {
+        return 0.68;
+    }
+    return 0.54;
+}
+
+fn ao_y_plane(chunk_base: u32, sample_size: u32, plane: u32, local_x: u32, local_z: u32, sample_y: i32, dx: i32, dz: i32, height_limit: u32) -> f32 {
+    let side1 = solid_at(chunk_base, sample_size, plane, u32(i32(local_x) + dx), local_z, sample_y, height_limit);
+    let side2 = solid_at(chunk_base, sample_size, plane, local_x, u32(i32(local_z) + dz), sample_y, height_limit);
+    let corner = solid_at(chunk_base, sample_size, plane, u32(i32(local_x) + dx), u32(i32(local_z) + dz), sample_y, height_limit);
+    return ambient_occlusion_factor(side1, side2, corner);
+}
+
+fn ao_x_plane(chunk_base: u32, sample_size: u32, plane: u32, sample_x: u32, local_z: u32, y: i32, dy: i32, dz: i32, height_limit: u32) -> f32 {
+    let side1 = solid_at(chunk_base, sample_size, plane, sample_x, local_z, y + dy, height_limit);
+    let side2 = solid_at(chunk_base, sample_size, plane, sample_x, u32(i32(local_z) + dz), y, height_limit);
+    let corner = solid_at(chunk_base, sample_size, plane, sample_x, u32(i32(local_z) + dz), y + dy, height_limit);
+    return ambient_occlusion_factor(side1, side2, corner);
+}
+
+fn ao_z_plane(chunk_base: u32, sample_size: u32, plane: u32, local_x: u32, sample_z: u32, y: i32, dx: i32, dy: i32, height_limit: u32) -> f32 {
+    let side1 = solid_at(chunk_base, sample_size, plane, u32(i32(local_x) + dx), sample_z, y, height_limit);
+    let side2 = solid_at(chunk_base, sample_size, plane, local_x, sample_z, y + dy, height_limit);
+    let corner = solid_at(chunk_base, sample_size, plane, u32(i32(local_x) + dx), sample_z, y + dy, height_limit);
+    return ambient_occlusion_factor(side1, side2, corner);
 }
 
 fn voxel_face_count(
@@ -612,9 +660,14 @@ fn emit_voxel_faces(
     let south = face_color(material, y, 0.72);
     let north = face_color(material, y, 0.60);
     let bottom = face_color(material, y, 0.50);
+    let yi = i32(y);
     var face_base = base;
 
     if (y == height_limit - 1u || blocks.values[cell_index + plane] == 0u) {
+        let ao0 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi + 1, -1, -1, height_limit);
+        let ao1 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi + 1, 1, -1, height_limit);
+        let ao2 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi + 1, 1, 1, height_limit);
+        let ao3 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi + 1, -1, 1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y1, z0),
@@ -622,11 +675,18 @@ fn emit_voxel_faces(
             vec3f(x1, y1, z1),
             vec3f(x0, y1, z1),
             vec3f(0.0, 1.0, 0.0),
-            top,
+            top * ao0,
+            top * ao1,
+            top * ao2,
+            top * ao3,
         );
         face_base = face_base + 6u;
     }
     if (y == 0u || blocks.values[cell_index - plane] == 0u) {
+        let ao0 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi - 1, -1, -1, height_limit);
+        let ao1 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi - 1, -1, 1, height_limit);
+        let ao2 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi - 1, 1, 1, height_limit);
+        let ao3 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi - 1, 1, -1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y0, z0),
@@ -634,11 +694,18 @@ fn emit_voxel_faces(
             vec3f(x1, y0, z1),
             vec3f(x1, y0, z0),
             vec3f(0.0, -1.0, 0.0),
-            bottom,
+            bottom * ao0,
+            bottom * ao1,
+            bottom * ao2,
+            bottom * ao3,
         );
         face_base = face_base + 6u;
     }
     if (blocks.values[cell_index + 1u] == 0u) {
+        let ao0 = ao_x_plane(chunk_base, sample_size, plane, local_x + 1u, local_z, yi, -1, -1, height_limit);
+        let ao1 = ao_x_plane(chunk_base, sample_size, plane, local_x + 1u, local_z, yi, 1, -1, height_limit);
+        let ao2 = ao_x_plane(chunk_base, sample_size, plane, local_x + 1u, local_z, yi, 1, 1, height_limit);
+        let ao3 = ao_x_plane(chunk_base, sample_size, plane, local_x + 1u, local_z, yi, -1, 1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x1, y0, z0),
@@ -646,11 +713,18 @@ fn emit_voxel_faces(
             vec3f(x1, y1, z1),
             vec3f(x1, y0, z1),
             vec3f(1.0, 0.0, 0.0),
-            east,
+            east * ao0,
+            east * ao1,
+            east * ao2,
+            east * ao3,
         );
         face_base = face_base + 6u;
     }
     if (blocks.values[cell_index - 1u] == 0u) {
+        let ao0 = ao_x_plane(chunk_base, sample_size, plane, local_x - 1u, local_z, yi, -1, -1, height_limit);
+        let ao1 = ao_x_plane(chunk_base, sample_size, plane, local_x - 1u, local_z, yi, -1, 1, height_limit);
+        let ao2 = ao_x_plane(chunk_base, sample_size, plane, local_x - 1u, local_z, yi, 1, 1, height_limit);
+        let ao3 = ao_x_plane(chunk_base, sample_size, plane, local_x - 1u, local_z, yi, 1, -1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y0, z0),
@@ -658,11 +732,18 @@ fn emit_voxel_faces(
             vec3f(x0, y1, z1),
             vec3f(x0, y1, z0),
             vec3f(-1.0, 0.0, 0.0),
-            west,
+            west * ao0,
+            west * ao1,
+            west * ao2,
+            west * ao3,
         );
         face_base = face_base + 6u;
     }
     if (blocks.values[cell_index + sample_size] == 0u) {
+        let ao0 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z + 1u, yi, -1, -1, height_limit);
+        let ao1 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z + 1u, yi, 1, -1, height_limit);
+        let ao2 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z + 1u, yi, 1, 1, height_limit);
+        let ao3 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z + 1u, yi, -1, 1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y0, z1),
@@ -670,11 +751,18 @@ fn emit_voxel_faces(
             vec3f(x1, y1, z1),
             vec3f(x0, y1, z1),
             vec3f(0.0, 0.0, 1.0),
-            south,
+            south * ao0,
+            south * ao1,
+            south * ao2,
+            south * ao3,
         );
         face_base = face_base + 6u;
     }
     if (blocks.values[cell_index - sample_size] == 0u) {
+        let ao0 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z - 1u, yi, -1, -1, height_limit);
+        let ao1 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z - 1u, yi, -1, 1, height_limit);
+        let ao2 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z - 1u, yi, 1, 1, height_limit);
+        let ao3 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z - 1u, yi, 1, -1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y0, z0),
@@ -682,7 +770,10 @@ fn emit_voxel_faces(
             vec3f(x1, y1, z0),
             vec3f(x1, y0, z0),
             vec3f(0.0, 0.0, -1.0),
-            north,
+            north * ao0,
+            north * ao1,
+            north * ao2,
+            north * ao3,
         );
     }
 }

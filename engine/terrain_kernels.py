@@ -624,7 +624,7 @@ def _emit_voxel_face(
 
 
 @njit(cache=True, fastmath=True)
-def _emit_quad_components(
+def _emit_quad_components_ao(
     vertices: np.ndarray,
     vertex_index: int,
     p0x: float, p0y: float, p0z: float,
@@ -632,7 +632,10 @@ def _emit_quad_components(
     p2x: float, p2y: float, p2z: float,
     p3x: float, p3y: float, p3z: float,
     nx: float, ny: float, nz: float,
-    cr: float, cg: float, cb: float,
+    c0r: float, c0g: float, c0b: float,
+    c1r: float, c1g: float, c1b: float,
+    c2r: float, c2g: float, c2b: float,
+    c3r: float, c3g: float, c3b: float,
 ) -> int:
     row = vertices[vertex_index]
     row[0] = p0x
@@ -643,9 +646,9 @@ def _emit_quad_components(
     row[5] = ny
     row[6] = nz
     row[7] = 0.0
-    row[8] = cr
-    row[9] = cg
-    row[10] = cb
+    row[8] = c0r
+    row[9] = c0g
+    row[10] = c0b
     row[11] = 1.0
     vertex_index += 1
 
@@ -658,9 +661,9 @@ def _emit_quad_components(
     row[5] = ny
     row[6] = nz
     row[7] = 0.0
-    row[8] = cr
-    row[9] = cg
-    row[10] = cb
+    row[8] = c1r
+    row[9] = c1g
+    row[10] = c1b
     row[11] = 1.0
     vertex_index += 1
 
@@ -673,9 +676,9 @@ def _emit_quad_components(
     row[5] = ny
     row[6] = nz
     row[7] = 0.0
-    row[8] = cr
-    row[9] = cg
-    row[10] = cb
+    row[8] = c2r
+    row[9] = c2g
+    row[10] = c2b
     row[11] = 1.0
     vertex_index += 1
 
@@ -688,9 +691,9 @@ def _emit_quad_components(
     row[5] = ny
     row[6] = nz
     row[7] = 0.0
-    row[8] = cr
-    row[9] = cg
-    row[10] = cb
+    row[8] = c0r
+    row[9] = c0g
+    row[10] = c0b
     row[11] = 1.0
     vertex_index += 1
 
@@ -703,9 +706,9 @@ def _emit_quad_components(
     row[5] = ny
     row[6] = nz
     row[7] = 0.0
-    row[8] = cr
-    row[9] = cg
-    row[10] = cb
+    row[8] = c2r
+    row[9] = c2g
+    row[10] = c2b
     row[11] = 1.0
     vertex_index += 1
 
@@ -718,13 +721,99 @@ def _emit_quad_components(
     row[5] = ny
     row[6] = nz
     row[7] = 0.0
-    row[8] = cr
-    row[9] = cg
-    row[10] = cb
+    row[8] = c3r
+    row[9] = c3g
+    row[10] = c3b
     row[11] = 1.0
     vertex_index += 1
 
     return vertex_index
+
+
+@njit(cache=True, fastmath=True)
+def _solid_at_with_boundaries(
+    blocks: np.ndarray,
+    local_x: int,
+    local_z: int,
+    sample_y: int,
+    height_limit: int,
+    top_boundary: np.ndarray,
+    bottom_boundary: np.ndarray,
+) -> int:
+    if sample_y < 0:
+        return int(bottom_boundary[local_z, local_x] != 0)
+    if sample_y >= height_limit:
+        return int(top_boundary[local_z, local_x] != 0)
+    return int(blocks[sample_y, local_z, local_x] != 0)
+
+
+@njit(cache=True, fastmath=True)
+def _ambient_occlusion_factor(side1: int, side2: int, corner: int) -> float:
+    if side1 != 0 and side2 != 0:
+        occlusion = 3
+    else:
+        occlusion = side1 + side2 + corner
+    if occlusion <= 0:
+        return 1.0
+    if occlusion == 1:
+        return 0.82
+    if occlusion == 2:
+        return 0.68
+    return 0.54
+
+
+@njit(cache=True, fastmath=True)
+def _ao_y_plane(
+    blocks: np.ndarray,
+    local_x: int,
+    local_z: int,
+    sample_y: int,
+    dx: int,
+    dz: int,
+    height_limit: int,
+    top_boundary: np.ndarray,
+    bottom_boundary: np.ndarray,
+) -> float:
+    side1 = _solid_at_with_boundaries(blocks, local_x + dx, local_z, sample_y, height_limit, top_boundary, bottom_boundary)
+    side2 = _solid_at_with_boundaries(blocks, local_x, local_z + dz, sample_y, height_limit, top_boundary, bottom_boundary)
+    corner = _solid_at_with_boundaries(blocks, local_x + dx, local_z + dz, sample_y, height_limit, top_boundary, bottom_boundary)
+    return _ambient_occlusion_factor(side1, side2, corner)
+
+
+@njit(cache=True, fastmath=True)
+def _ao_x_plane(
+    blocks: np.ndarray,
+    sample_x: int,
+    local_z: int,
+    y: int,
+    dy: int,
+    dz: int,
+    height_limit: int,
+    top_boundary: np.ndarray,
+    bottom_boundary: np.ndarray,
+) -> float:
+    side1 = _solid_at_with_boundaries(blocks, sample_x, local_z, y + dy, height_limit, top_boundary, bottom_boundary)
+    side2 = _solid_at_with_boundaries(blocks, sample_x, local_z + dz, y, height_limit, top_boundary, bottom_boundary)
+    corner = _solid_at_with_boundaries(blocks, sample_x, local_z + dz, y + dy, height_limit, top_boundary, bottom_boundary)
+    return _ambient_occlusion_factor(side1, side2, corner)
+
+
+@njit(cache=True, fastmath=True)
+def _ao_z_plane(
+    blocks: np.ndarray,
+    local_x: int,
+    sample_z: int,
+    y: int,
+    dx: int,
+    dy: int,
+    height_limit: int,
+    top_boundary: np.ndarray,
+    bottom_boundary: np.ndarray,
+) -> float:
+    side1 = _solid_at_with_boundaries(blocks, local_x + dx, sample_z, y, height_limit, top_boundary, bottom_boundary)
+    side2 = _solid_at_with_boundaries(blocks, local_x, sample_z, y + dy, height_limit, top_boundary, bottom_boundary)
+    corner = _solid_at_with_boundaries(blocks, local_x + dx, sample_z, y + dy, height_limit, top_boundary, bottom_boundary)
+    return _ambient_occlusion_factor(side1, side2, corner)
 
 
 @njit(cache=True, fastmath=True)
@@ -856,7 +945,11 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                 bottom_b = cb * 0.50
 
                 if row_above[local_x] == 0:
-                    vertex_index = _emit_quad_components(
+                    ao0 = _ao_y_plane(blocks, local_x, local_z, y + 1, -1, -1, height_limit, top_boundary, bottom_boundary)
+                    ao1 = _ao_y_plane(blocks, local_x, local_z, y + 1, 1, -1, height_limit, top_boundary, bottom_boundary)
+                    ao2 = _ao_y_plane(blocks, local_x, local_z, y + 1, 1, 1, height_limit, top_boundary, bottom_boundary)
+                    ao3 = _ao_y_plane(blocks, local_x, local_z, y + 1, -1, 1, height_limit, top_boundary, bottom_boundary)
+                    vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
                         x0, y1, z0,
@@ -864,11 +957,18 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         x1, y1, z1,
                         x0, y1, z1,
                         0.0, 1.0, 0.0,
-                        top_r, top_g, top_b,
+                        top_r * ao0, top_g * ao0, top_b * ao0,
+                        top_r * ao1, top_g * ao1, top_b * ao1,
+                        top_r * ao2, top_g * ao2, top_b * ao2,
+                        top_r * ao3, top_g * ao3, top_b * ao3,
                     )
 
                 if row_below[local_x] == 0:
-                    vertex_index = _emit_quad_components(
+                    ao0 = _ao_y_plane(blocks, local_x, local_z, y - 1, -1, -1, height_limit, top_boundary, bottom_boundary)
+                    ao1 = _ao_y_plane(blocks, local_x, local_z, y - 1, -1, 1, height_limit, top_boundary, bottom_boundary)
+                    ao2 = _ao_y_plane(blocks, local_x, local_z, y - 1, 1, 1, height_limit, top_boundary, bottom_boundary)
+                    ao3 = _ao_y_plane(blocks, local_x, local_z, y - 1, 1, -1, height_limit, top_boundary, bottom_boundary)
+                    vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
                         x0, y0, z0,
@@ -876,11 +976,18 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         x1, y0, z1,
                         x1, y0, z0,
                         0.0, -1.0, 0.0,
-                        bottom_r, bottom_g, bottom_b,
+                        bottom_r * ao0, bottom_g * ao0, bottom_b * ao0,
+                        bottom_r * ao1, bottom_g * ao1, bottom_b * ao1,
+                        bottom_r * ao2, bottom_g * ao2, bottom_b * ao2,
+                        bottom_r * ao3, bottom_g * ao3, bottom_b * ao3,
                     )
 
                 if row[local_x + 1] == 0:
-                    vertex_index = _emit_quad_components(
+                    ao0 = _ao_x_plane(blocks, local_x + 1, local_z, y, -1, -1, height_limit, top_boundary, bottom_boundary)
+                    ao1 = _ao_x_plane(blocks, local_x + 1, local_z, y, 1, -1, height_limit, top_boundary, bottom_boundary)
+                    ao2 = _ao_x_plane(blocks, local_x + 1, local_z, y, 1, 1, height_limit, top_boundary, bottom_boundary)
+                    ao3 = _ao_x_plane(blocks, local_x + 1, local_z, y, -1, 1, height_limit, top_boundary, bottom_boundary)
+                    vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
                         x1, y0, z0,
@@ -888,11 +995,18 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         x1, y1, z1,
                         x1, y0, z1,
                         1.0, 0.0, 0.0,
-                        east_r, east_g, east_b,
+                        east_r * ao0, east_g * ao0, east_b * ao0,
+                        east_r * ao1, east_g * ao1, east_b * ao1,
+                        east_r * ao2, east_g * ao2, east_b * ao2,
+                        east_r * ao3, east_g * ao3, east_b * ao3,
                     )
 
                 if row[local_x - 1] == 0:
-                    vertex_index = _emit_quad_components(
+                    ao0 = _ao_x_plane(blocks, local_x - 1, local_z, y, -1, -1, height_limit, top_boundary, bottom_boundary)
+                    ao1 = _ao_x_plane(blocks, local_x - 1, local_z, y, -1, 1, height_limit, top_boundary, bottom_boundary)
+                    ao2 = _ao_x_plane(blocks, local_x - 1, local_z, y, 1, 1, height_limit, top_boundary, bottom_boundary)
+                    ao3 = _ao_x_plane(blocks, local_x - 1, local_z, y, 1, -1, height_limit, top_boundary, bottom_boundary)
+                    vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
                         x0, y0, z0,
@@ -900,11 +1014,18 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         x0, y1, z1,
                         x0, y1, z0,
                         -1.0, 0.0, 0.0,
-                        west_r, west_g, west_b,
+                        west_r * ao0, west_g * ao0, west_b * ao0,
+                        west_r * ao1, west_g * ao1, west_b * ao1,
+                        west_r * ao2, west_g * ao2, west_b * ao2,
+                        west_r * ao3, west_g * ao3, west_b * ao3,
                     )
 
                 if row_south[local_x] == 0:
-                    vertex_index = _emit_quad_components(
+                    ao0 = _ao_z_plane(blocks, local_x, local_z + 1, y, -1, -1, height_limit, top_boundary, bottom_boundary)
+                    ao1 = _ao_z_plane(blocks, local_x, local_z + 1, y, 1, -1, height_limit, top_boundary, bottom_boundary)
+                    ao2 = _ao_z_plane(blocks, local_x, local_z + 1, y, 1, 1, height_limit, top_boundary, bottom_boundary)
+                    ao3 = _ao_z_plane(blocks, local_x, local_z + 1, y, -1, 1, height_limit, top_boundary, bottom_boundary)
+                    vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
                         x0, y0, z1,
@@ -912,11 +1033,18 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         x1, y1, z1,
                         x0, y1, z1,
                         0.0, 0.0, 1.0,
-                        south_r, south_g, south_b,
+                        south_r * ao0, south_g * ao0, south_b * ao0,
+                        south_r * ao1, south_g * ao1, south_b * ao1,
+                        south_r * ao2, south_g * ao2, south_b * ao2,
+                        south_r * ao3, south_g * ao3, south_b * ao3,
                     )
 
                 if row_north[local_x] == 0:
-                    vertex_index = _emit_quad_components(
+                    ao0 = _ao_z_plane(blocks, local_x, local_z - 1, y, -1, -1, height_limit, top_boundary, bottom_boundary)
+                    ao1 = _ao_z_plane(blocks, local_x, local_z - 1, y, -1, 1, height_limit, top_boundary, bottom_boundary)
+                    ao2 = _ao_z_plane(blocks, local_x, local_z - 1, y, 1, 1, height_limit, top_boundary, bottom_boundary)
+                    ao3 = _ao_z_plane(blocks, local_x, local_z - 1, y, 1, -1, height_limit, top_boundary, bottom_boundary)
+                    vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
                         x0, y0, z0,
@@ -924,7 +1052,10 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         x1, y1, z0,
                         x1, y0, z0,
                         0.0, 0.0, -1.0,
-                        north_r, north_g, north_b,
+                        north_r * ao0, north_g * ao0, north_b * ao0,
+                        north_r * ao1, north_g * ao1, north_b * ao1,
+                        north_r * ao2, north_g * ao2, north_b * ao2,
+                        north_r * ao3, north_g * ao3, north_b * ao3,
                     )
 
                 x0 = x1
