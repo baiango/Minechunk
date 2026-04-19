@@ -8,7 +8,7 @@ from .world_constants import BLOCK_SIZE
 
 
 try:
-    from numba import njit
+    from numba import njit, prange
 except Exception:  # pragma: no cover - fallback for environments without numba
     def njit(*args, **kwargs):
         if args and callable(args[0]) and len(args) == 1 and not kwargs:
@@ -19,6 +19,8 @@ except Exception:  # pragma: no cover - fallback for environments without numba
 
         return decorator
 
+    prange = range
+
 
 AIR = 0
 BEDROCK = 1
@@ -27,6 +29,10 @@ DIRT = 3
 GRASS = 4
 SAND = 5
 SNOW = 6
+
+_MATERIAL_COLOR_R = (0.0, 0.24, 0.42, 0.47, 0.31, 0.78, 0.95)
+_MATERIAL_COLOR_G = (0.0, 0.22, 0.40, 0.31, 0.68, 0.71, 0.97)
+_MATERIAL_COLOR_B = (0.0, 0.20, 0.38, 0.18, 0.24, 0.49, 0.98)
 
 MAX_FACES_PER_CELL = 5
 VERTICES_PER_FACE = 6
@@ -186,7 +192,7 @@ def surface_profile_at(
     return height_i, GRASS
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _clamp01(value: float) -> float:
     if value < 0.0:
         return 0.0
@@ -246,7 +252,7 @@ def _should_carve_cave(
     return False
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _terrain_material_from_surface_profile(
     world_x: int,
     world_y: int,
@@ -294,7 +300,7 @@ def terrain_block_material_at(
     )
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, parallel=True)
 def fill_chunk_surface_grids(
     heights: np.ndarray,
     materials: np.ndarray,
@@ -307,16 +313,16 @@ def fill_chunk_surface_grids(
     sample_size = chunk_size + 2
     origin_x = chunk_x * chunk_size - 1
     origin_z = chunk_z * chunk_size - 1
+    total_columns = sample_size * sample_size
 
-    for local_z in range(sample_size):
+    for column_index in prange(total_columns):
+        local_z = column_index // sample_size
+        local_x = column_index - local_z * sample_size
         world_z = origin_z + local_z
-        row_offset = local_z * sample_size
-        for local_x in range(sample_size):
-            world_x = origin_x + local_x
-            height, material = surface_profile_at(float(world_x), float(world_z), seed, height_limit)
-            cell_index = row_offset + local_x
-            heights[cell_index] = height
-            materials[cell_index] = material
+        world_x = origin_x + local_x
+        height, material = surface_profile_at(float(world_x), float(world_z), seed, height_limit)
+        heights[column_index] = height
+        materials[column_index] = material
 
 
 @njit(cache=True, fastmath=True)
@@ -499,7 +505,7 @@ def build_chunk_vertex_array(
     return vertices, vertex_index
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, parallel=True)
 def fill_chunk_voxel_grid(
     blocks: np.ndarray,
     materials: np.ndarray,
@@ -512,30 +518,32 @@ def fill_chunk_voxel_grid(
     sample_size = chunk_size + 2
     origin_x = chunk_x * chunk_size - 1
     origin_z = chunk_z * chunk_size - 1
+    total_columns = sample_size * sample_size
 
-    for local_z in range(sample_size):
+    for column_index in prange(total_columns):
+        local_z = column_index // sample_size
+        local_x = column_index - local_z * sample_size
         world_z = origin_z + local_z
-        for local_x in range(sample_size):
-            world_x = origin_x + local_x
-            surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, height_limit)
-            solid_limit = min(height_limit, int(surface_height))
-            for y in range(solid_limit):
-                material = _terrain_material_from_surface_profile(
-                    world_x,
-                    y,
-                    world_z,
-                    int(surface_height),
-                    int(surface_material),
-                    seed,
-                    height_limit,
-                )
-                if material == AIR:
-                    continue
-                blocks[y, local_z, local_x] = 1
-                materials[y, local_z, local_x] = material
+        world_x = origin_x + local_x
+        surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, height_limit)
+        solid_limit = min(height_limit, int(surface_height))
+        for y in range(solid_limit):
+            material = _terrain_material_from_surface_profile(
+                world_x,
+                y,
+                world_z,
+                int(surface_height),
+                int(surface_material),
+                seed,
+                height_limit,
+            )
+            if material == AIR:
+                continue
+            blocks[y, local_z, local_x] = 1
+            materials[y, local_z, local_x] = material
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, parallel=True)
 def fill_stacked_chunk_voxel_grid(
     blocks: np.ndarray,
     materials: np.ndarray,
@@ -551,34 +559,37 @@ def fill_stacked_chunk_voxel_grid(
     origin_z = chunk_z * chunk_size - 1
     origin_y = chunk_y * chunk_size
     local_height = blocks.shape[0]
+    fill_start_y = max(origin_y, 0)
+    fill_top_y = min(origin_y + local_height, world_height_limit)
+    total_columns = sample_size * sample_size
 
-    for local_z in range(sample_size):
+    for column_index in prange(total_columns):
+        local_z = column_index // sample_size
+        local_x = column_index - local_z * sample_size
         world_z = origin_z + local_z
-        for local_x in range(sample_size):
-            world_x = origin_x + local_x
-            surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
-            fill_start_y = max(origin_y, 0)
-            fill_end_y = min(origin_y + local_height, world_height_limit, int(surface_height))
-            if fill_end_y <= fill_start_y:
+        world_x = origin_x + local_x
+        surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
+        fill_end_y = min(fill_top_y, int(surface_height))
+        if fill_end_y <= fill_start_y:
+            continue
+        for world_y in range(fill_start_y, fill_end_y):
+            local_y = world_y - origin_y
+            material = _terrain_material_from_surface_profile(
+                world_x,
+                world_y,
+                world_z,
+                int(surface_height),
+                int(surface_material),
+                seed,
+                world_height_limit,
+            )
+            if material == AIR:
                 continue
-            for world_y in range(fill_start_y, fill_end_y):
-                local_y = world_y - origin_y
-                material = _terrain_material_from_surface_profile(
-                    world_x,
-                    world_y,
-                    world_z,
-                    int(surface_height),
-                    int(surface_material),
-                    seed,
-                    world_height_limit,
-                )
-                if material == AIR:
-                    continue
-                blocks[local_y, local_z, local_x] = 1
-                materials[local_y, local_z, local_x] = material
+            blocks[local_y, local_z, local_x] = 1
+            materials[local_y, local_z, local_x] = material
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, parallel=True)
 def fill_stacked_chunk_vertical_neighbor_planes(
     top_plane: np.ndarray,
     bottom_plane: np.ndarray,
@@ -594,39 +605,43 @@ def fill_stacked_chunk_vertical_neighbor_planes(
     origin_z = chunk_z * chunk_size - 1
     top_world_y = chunk_y * chunk_size + chunk_size
     bottom_world_y = chunk_y * chunk_size - 1
+    top_in_bounds = 0 <= top_world_y < world_height_limit
+    bottom_in_bounds = 0 <= bottom_world_y < world_height_limit
+    total_columns = sample_size * sample_size
 
-    for local_z in range(sample_size):
+    for column_index in prange(total_columns):
+        local_z = column_index // sample_size
+        local_x = column_index - local_z * sample_size
         world_z = origin_z + local_z
-        for local_x in range(sample_size):
-            world_x = origin_x + local_x
-            surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
-            solid_surface_height = int(surface_height)
-            solid_surface_material = int(surface_material)
-            if 0 <= top_world_y < world_height_limit and top_world_y < solid_surface_height:
-                if _terrain_material_from_surface_profile(
-                    world_x,
-                    top_world_y,
-                    world_z,
-                    solid_surface_height,
-                    solid_surface_material,
-                    seed,
-                    world_height_limit,
-                ) != AIR:
-                    top_plane[local_z, local_x] = 1
-            if 0 <= bottom_world_y < world_height_limit and bottom_world_y < solid_surface_height:
-                if _terrain_material_from_surface_profile(
-                    world_x,
-                    bottom_world_y,
-                    world_z,
-                    solid_surface_height,
-                    solid_surface_material,
-                    seed,
-                    world_height_limit,
-                ) != AIR:
-                    bottom_plane[local_z, local_x] = 1
+        world_x = origin_x + local_x
+        surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
+        solid_surface_height = int(surface_height)
+        solid_surface_material = int(surface_material)
+        if top_in_bounds and top_world_y < solid_surface_height:
+            if _terrain_material_from_surface_profile(
+                world_x,
+                top_world_y,
+                world_z,
+                solid_surface_height,
+                solid_surface_material,
+                seed,
+                world_height_limit,
+            ) != AIR:
+                top_plane[local_z, local_x] = 1
+        if bottom_in_bounds and bottom_world_y < solid_surface_height:
+            if _terrain_material_from_surface_profile(
+                world_x,
+                bottom_world_y,
+                world_z,
+                solid_surface_height,
+                solid_surface_material,
+                seed,
+                world_height_limit,
+            ) != AIR:
+                bottom_plane[local_z, local_x] = 1
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, parallel=True)
 def fill_stacked_chunk_voxel_grid_with_neighbor_planes(
     blocks: np.ndarray,
     materials: np.ndarray,
@@ -640,63 +655,97 @@ def fill_stacked_chunk_voxel_grid_with_neighbor_planes(
     world_height_limit: int,
 ) -> None:
     sample_size = chunk_size + 2
+    probe_heights = np.empty(sample_size * sample_size, dtype=np.uint32)
+    probe_materials = np.empty(sample_size * sample_size, dtype=np.uint32)
+    fill_chunk_surface_grids(
+        probe_heights,
+        probe_materials,
+        chunk_x,
+        chunk_z,
+        chunk_size,
+        seed,
+        world_height_limit,
+    )
+    fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface(
+        blocks,
+        materials,
+        top_plane,
+        bottom_plane,
+        probe_heights,
+        probe_materials,
+        chunk_x,
+        chunk_y,
+        chunk_z,
+        chunk_size,
+        seed,
+        world_height_limit,
+    )
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface(
+    blocks: np.ndarray,
+    materials: np.ndarray,
+    top_plane: np.ndarray,
+    bottom_plane: np.ndarray,
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+    chunk_size: int,
+    seed: int,
+    world_height_limit: int,
+) -> None:
+    sample_size = chunk_size + 2
     origin_x = chunk_x * chunk_size - 1
     origin_z = chunk_z * chunk_size - 1
     origin_y = chunk_y * chunk_size
     local_height = blocks.shape[0]
+    fill_start_y = max(origin_y, 0)
+    fill_top_y = min(origin_y + local_height, world_height_limit)
     top_world_y = origin_y + local_height
     bottom_world_y = origin_y - 1
+    top_in_bounds = 0 <= top_world_y < world_height_limit
+    bottom_in_bounds = 0 <= bottom_world_y < world_height_limit
+    total_columns = sample_size * sample_size
 
-    for local_z in range(sample_size):
+    for column_index in prange(total_columns):
+        local_z = column_index // sample_size
+        local_x = column_index - local_z * sample_size
         world_z = origin_z + local_z
-        for local_x in range(sample_size):
-            world_x = origin_x + local_x
-            surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
-            solid_surface_height = int(surface_height)
-            solid_surface_material = int(surface_material)
+        world_x = origin_x + local_x
+        solid_surface_height = int(surface_heights[column_index])
+        solid_surface_material = int(surface_materials[column_index])
 
-            fill_start_y = max(origin_y, 0)
-            fill_end_y = min(origin_y + local_height, world_height_limit, solid_surface_height)
-            if fill_end_y > fill_start_y:
-                for world_y in range(fill_start_y, fill_end_y):
-                    local_y = world_y - origin_y
-                    material = _terrain_material_from_surface_profile(
-                        world_x,
-                        world_y,
-                        world_z,
-                        solid_surface_height,
-                        solid_surface_material,
-                        seed,
-                        world_height_limit,
-                    )
-                    if material == AIR:
-                        continue
-                    blocks[local_y, local_z, local_x] = 1
-                    materials[local_y, local_z, local_x] = material
+        fill_end_y = min(fill_top_y, solid_surface_height)
+        stone_limit = solid_surface_height - 4
+        dirt_limit = solid_surface_height - 1
+        if fill_end_y > fill_start_y:
+            block_column = blocks[:, local_z, local_x]
+            material_column = materials[:, local_z, local_x]
+            for world_y in range(fill_start_y, fill_end_y):
+                if _should_carve_cave(world_x, world_y, world_z, solid_surface_height, seed, world_height_limit):
+                    continue
+                local_y = world_y - origin_y
+                if world_y == 0:
+                    material = BEDROCK
+                elif world_y < stone_limit:
+                    material = STONE
+                elif world_y < dirt_limit:
+                    material = DIRT
+                else:
+                    material = solid_surface_material
+                block_column[local_y] = 1
+                material_column[local_y] = material
 
-            if 0 <= top_world_y < world_height_limit and top_world_y < solid_surface_height:
-                if _terrain_material_from_surface_profile(
-                    world_x,
-                    top_world_y,
-                    world_z,
-                    solid_surface_height,
-                    solid_surface_material,
-                    seed,
-                    world_height_limit,
-                ) != AIR:
-                    top_plane[local_z, local_x] = 1
+        if top_in_bounds and top_world_y < solid_surface_height:
+            if not _should_carve_cave(world_x, top_world_y, world_z, solid_surface_height, seed, world_height_limit):
+                top_plane[local_z, local_x] = 1
 
-            if 0 <= bottom_world_y < world_height_limit and bottom_world_y < solid_surface_height:
-                if _terrain_material_from_surface_profile(
-                    world_x,
-                    bottom_world_y,
-                    world_z,
-                    solid_surface_height,
-                    solid_surface_material,
-                    seed,
-                    world_height_limit,
-                ) != AIR:
-                    bottom_plane[local_z, local_x] = 1
+        if bottom_in_bounds and bottom_world_y < solid_surface_height:
+            if not _should_carve_cave(world_x, bottom_world_y, world_z, solid_surface_height, seed, world_height_limit):
+                bottom_plane[local_z, local_x] = 1
 
 
 @njit(cache=True, fastmath=True)
@@ -868,7 +917,7 @@ def _emit_quad_components_ao(
     return vertex_index
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _solid_at_with_boundaries(
     blocks: np.ndarray,
     local_x: int,
@@ -885,7 +934,7 @@ def _solid_at_with_boundaries(
     return int(blocks[sample_y, local_z, local_x] != 0)
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _ambient_occlusion_factor(side1: int, side2: int, corner: int) -> float:
     if side1 != 0 and side2 != 0:
         occlusion = 3
@@ -900,57 +949,45 @@ def _ambient_occlusion_factor(side1: int, side2: int, corner: int) -> float:
     return 0.54
 
 
-@njit(cache=True, fastmath=True)
-def _ao_y_plane(
-    blocks: np.ndarray,
+@njit(cache=True, fastmath=True, inline="always")
+def _ao_y_from_plane(
+    plane: np.ndarray,
     local_x: int,
     local_z: int,
-    sample_y: int,
     dx: int,
     dz: int,
-    height_limit: int,
-    top_boundary: np.ndarray,
-    bottom_boundary: np.ndarray,
 ) -> float:
-    side1 = _solid_at_with_boundaries(blocks, local_x + dx, local_z, sample_y, height_limit, top_boundary, bottom_boundary)
-    side2 = _solid_at_with_boundaries(blocks, local_x, local_z + dz, sample_y, height_limit, top_boundary, bottom_boundary)
-    corner = _solid_at_with_boundaries(blocks, local_x + dx, local_z + dz, sample_y, height_limit, top_boundary, bottom_boundary)
+    side1 = int(plane[local_z, local_x + dx] != 0)
+    side2 = int(plane[local_z + dz, local_x] != 0)
+    corner = int(plane[local_z + dz, local_x + dx] != 0)
     return _ambient_occlusion_factor(side1, side2, corner)
 
 
-@njit(cache=True, fastmath=True)
-def _ao_x_plane(
-    blocks: np.ndarray,
+@njit(cache=True, fastmath=True, inline="always")
+def _ao_x_from_planes(
+    current_plane: np.ndarray,
+    neighbor_y_plane: np.ndarray,
     sample_x: int,
     local_z: int,
-    y: int,
-    dy: int,
     dz: int,
-    height_limit: int,
-    top_boundary: np.ndarray,
-    bottom_boundary: np.ndarray,
 ) -> float:
-    side1 = _solid_at_with_boundaries(blocks, sample_x, local_z, y + dy, height_limit, top_boundary, bottom_boundary)
-    side2 = _solid_at_with_boundaries(blocks, sample_x, local_z + dz, y, height_limit, top_boundary, bottom_boundary)
-    corner = _solid_at_with_boundaries(blocks, sample_x, local_z + dz, y + dy, height_limit, top_boundary, bottom_boundary)
+    side1 = int(neighbor_y_plane[local_z, sample_x] != 0)
+    side2 = int(current_plane[local_z + dz, sample_x] != 0)
+    corner = int(neighbor_y_plane[local_z + dz, sample_x] != 0)
     return _ambient_occlusion_factor(side1, side2, corner)
 
 
-@njit(cache=True, fastmath=True)
-def _ao_z_plane(
-    blocks: np.ndarray,
+@njit(cache=True, fastmath=True, inline="always")
+def _ao_z_from_planes(
+    current_plane: np.ndarray,
+    neighbor_y_plane: np.ndarray,
     local_x: int,
     sample_z: int,
-    y: int,
     dx: int,
-    dy: int,
-    height_limit: int,
-    top_boundary: np.ndarray,
-    bottom_boundary: np.ndarray,
 ) -> float:
-    side1 = _solid_at_with_boundaries(blocks, local_x + dx, sample_z, y, height_limit, top_boundary, bottom_boundary)
-    side2 = _solid_at_with_boundaries(blocks, local_x, sample_z, y + dy, height_limit, top_boundary, bottom_boundary)
-    corner = _solid_at_with_boundaries(blocks, local_x + dx, sample_z, y + dy, height_limit, top_boundary, bottom_boundary)
+    side1 = int(current_plane[sample_z, local_x + dx] != 0)
+    side2 = int(neighbor_y_plane[sample_z, local_x] != 0)
+    corner = int(neighbor_y_plane[sample_z, local_x + dx] != 0)
     return _ambient_occlusion_factor(side1, side2, corner)
 
 
@@ -984,6 +1021,8 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
     for y in range(height_limit):
         plane = blocks[y]
         mat_plane = materials[y]
+        plane_above = blocks[y + 1] if y < last_y else top_boundary
+        plane_below = blocks[y - 1] if y > 0 else bottom_boundary
         y0 = origin_y + float(y) * step
         y1 = y0 + step
 
@@ -993,14 +1032,8 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
             row_mat = mat_plane[local_z]
             row_north = plane[local_z - 1]
             row_south = plane[local_z + 1]
-            if y < last_y:
-                row_above = blocks[y + 1][local_z]
-            else:
-                row_above = top_boundary[local_z]
-            if y > 0:
-                row_below = blocks[y - 1][local_z]
-            else:
-                row_below = bottom_boundary[local_z]
+            row_above = plane_above[local_z]
+            row_below = plane_below[local_z]
             z1 = z0 + step
 
             x0 = origin_x
@@ -1010,32 +1043,22 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                     continue
 
                 x1 = x0 + step
+                top_empty = row_above[local_x] == 0
+                bottom_empty = row_below[local_x] == 0
+                east_empty = row[local_x + 1] == 0
+                west_empty = row[local_x - 1] == 0
+                south_empty = row_south[local_x] == 0
+                north_empty = row_north[local_x] == 0
+                if not (top_empty or bottom_empty or east_empty or west_empty or south_empty or north_empty):
+                    x0 = x1
+                    continue
+
                 material = int(row_mat[local_x])
 
-                if material == BEDROCK:
-                    cr = 0.24
-                    cg = 0.22
-                    cb = 0.20
-                elif material == STONE:
-                    cr = 0.42
-                    cg = 0.40
-                    cb = 0.38
-                elif material == DIRT:
-                    cr = 0.47
-                    cg = 0.31
-                    cb = 0.18
-                elif material == GRASS:
-                    cr = 0.31
-                    cg = 0.68
-                    cb = 0.24
-                elif material == SAND:
-                    cr = 0.78
-                    cg = 0.71
-                    cb = 0.49
-                elif material == SNOW:
-                    cr = 0.95
-                    cg = 0.97
-                    cb = 0.98
+                if 0 <= material <= SNOW:
+                    cr = _MATERIAL_COLOR_R[material]
+                    cg = _MATERIAL_COLOR_G[material]
+                    cb = _MATERIAL_COLOR_B[material]
                 else:
                     if y <= 14:
                         cr = 0.78
@@ -1058,35 +1081,14 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         cg = 0.54
                         cb = 0.22
 
-                top_r = cr
-                top_g = cg
-                top_b = cb
-
-                east_r = cr * 0.80
-                east_g = cg * 0.80
-                east_b = cb * 0.80
-
-                west_r = cr * 0.64
-                west_g = cg * 0.64
-                west_b = cb * 0.64
-
-                south_r = cr * 0.72
-                south_g = cg * 0.72
-                south_b = cb * 0.72
-
-                north_r = cr * 0.60
-                north_g = cg * 0.60
-                north_b = cb * 0.60
-
-                bottom_r = cr * 0.50
-                bottom_g = cg * 0.50
-                bottom_b = cb * 0.50
-
-                if row_above[local_x] == 0:
-                    ao0 = _ao_y_plane(blocks, local_x, local_z, y + 1, -1, -1, height_limit, top_boundary, bottom_boundary)
-                    ao1 = _ao_y_plane(blocks, local_x, local_z, y + 1, 1, -1, height_limit, top_boundary, bottom_boundary)
-                    ao2 = _ao_y_plane(blocks, local_x, local_z, y + 1, 1, 1, height_limit, top_boundary, bottom_boundary)
-                    ao3 = _ao_y_plane(blocks, local_x, local_z, y + 1, -1, 1, height_limit, top_boundary, bottom_boundary)
+                if top_empty:
+                    top_r = cr
+                    top_g = cg
+                    top_b = cb
+                    ao0 = _ao_y_from_plane(plane_above, local_x, local_z, -1, -1)
+                    ao1 = _ao_y_from_plane(plane_above, local_x, local_z, 1, -1)
+                    ao2 = _ao_y_from_plane(plane_above, local_x, local_z, 1, 1)
+                    ao3 = _ao_y_from_plane(plane_above, local_x, local_z, -1, 1)
                     vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
@@ -1101,11 +1103,14 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         top_r * ao3, top_g * ao3, top_b * ao3,
                     )
 
-                if row_below[local_x] == 0:
-                    ao0 = _ao_y_plane(blocks, local_x, local_z, y - 1, -1, -1, height_limit, top_boundary, bottom_boundary)
-                    ao1 = _ao_y_plane(blocks, local_x, local_z, y - 1, -1, 1, height_limit, top_boundary, bottom_boundary)
-                    ao2 = _ao_y_plane(blocks, local_x, local_z, y - 1, 1, 1, height_limit, top_boundary, bottom_boundary)
-                    ao3 = _ao_y_plane(blocks, local_x, local_z, y - 1, 1, -1, height_limit, top_boundary, bottom_boundary)
+                if bottom_empty:
+                    bottom_r = cr * 0.50
+                    bottom_g = cg * 0.50
+                    bottom_b = cb * 0.50
+                    ao0 = _ao_y_from_plane(plane_below, local_x, local_z, -1, -1)
+                    ao1 = _ao_y_from_plane(plane_below, local_x, local_z, -1, 1)
+                    ao2 = _ao_y_from_plane(plane_below, local_x, local_z, 1, 1)
+                    ao3 = _ao_y_from_plane(plane_below, local_x, local_z, 1, -1)
                     vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
@@ -1120,11 +1125,15 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         bottom_r * ao3, bottom_g * ao3, bottom_b * ao3,
                     )
 
-                if row[local_x + 1] == 0:
-                    ao0 = _ao_x_plane(blocks, local_x + 1, local_z, y, -1, -1, height_limit, top_boundary, bottom_boundary)
-                    ao1 = _ao_x_plane(blocks, local_x + 1, local_z, y, 1, -1, height_limit, top_boundary, bottom_boundary)
-                    ao2 = _ao_x_plane(blocks, local_x + 1, local_z, y, 1, 1, height_limit, top_boundary, bottom_boundary)
-                    ao3 = _ao_x_plane(blocks, local_x + 1, local_z, y, -1, 1, height_limit, top_boundary, bottom_boundary)
+                if east_empty:
+                    east_r = cr * 0.80
+                    east_g = cg * 0.80
+                    east_b = cb * 0.80
+                    sample_x = local_x + 1
+                    ao0 = _ao_x_from_planes(plane, plane_below, sample_x, local_z, -1)
+                    ao1 = _ao_x_from_planes(plane, plane_above, sample_x, local_z, -1)
+                    ao2 = _ao_x_from_planes(plane, plane_above, sample_x, local_z, 1)
+                    ao3 = _ao_x_from_planes(plane, plane_below, sample_x, local_z, 1)
                     vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
@@ -1139,11 +1148,15 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         east_r * ao3, east_g * ao3, east_b * ao3,
                     )
 
-                if row[local_x - 1] == 0:
-                    ao0 = _ao_x_plane(blocks, local_x - 1, local_z, y, -1, -1, height_limit, top_boundary, bottom_boundary)
-                    ao1 = _ao_x_plane(blocks, local_x - 1, local_z, y, -1, 1, height_limit, top_boundary, bottom_boundary)
-                    ao2 = _ao_x_plane(blocks, local_x - 1, local_z, y, 1, 1, height_limit, top_boundary, bottom_boundary)
-                    ao3 = _ao_x_plane(blocks, local_x - 1, local_z, y, 1, -1, height_limit, top_boundary, bottom_boundary)
+                if west_empty:
+                    west_r = cr * 0.64
+                    west_g = cg * 0.64
+                    west_b = cb * 0.64
+                    sample_x = local_x - 1
+                    ao0 = _ao_x_from_planes(plane, plane_below, sample_x, local_z, -1)
+                    ao1 = _ao_x_from_planes(plane, plane_below, sample_x, local_z, 1)
+                    ao2 = _ao_x_from_planes(plane, plane_above, sample_x, local_z, 1)
+                    ao3 = _ao_x_from_planes(plane, plane_above, sample_x, local_z, -1)
                     vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
@@ -1158,11 +1171,15 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         west_r * ao3, west_g * ao3, west_b * ao3,
                     )
 
-                if row_south[local_x] == 0:
-                    ao0 = _ao_z_plane(blocks, local_x, local_z + 1, y, -1, -1, height_limit, top_boundary, bottom_boundary)
-                    ao1 = _ao_z_plane(blocks, local_x, local_z + 1, y, 1, -1, height_limit, top_boundary, bottom_boundary)
-                    ao2 = _ao_z_plane(blocks, local_x, local_z + 1, y, 1, 1, height_limit, top_boundary, bottom_boundary)
-                    ao3 = _ao_z_plane(blocks, local_x, local_z + 1, y, -1, 1, height_limit, top_boundary, bottom_boundary)
+                if south_empty:
+                    south_r = cr * 0.72
+                    south_g = cg * 0.72
+                    south_b = cb * 0.72
+                    sample_z = local_z + 1
+                    ao0 = _ao_z_from_planes(plane, plane_below, local_x, sample_z, -1)
+                    ao1 = _ao_z_from_planes(plane, plane_below, local_x, sample_z, 1)
+                    ao2 = _ao_z_from_planes(plane, plane_above, local_x, sample_z, 1)
+                    ao3 = _ao_z_from_planes(plane, plane_above, local_x, sample_z, -1)
                     vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,
@@ -1177,11 +1194,15 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         south_r * ao3, south_g * ao3, south_b * ao3,
                     )
 
-                if row_north[local_x] == 0:
-                    ao0 = _ao_z_plane(blocks, local_x, local_z - 1, y, -1, -1, height_limit, top_boundary, bottom_boundary)
-                    ao1 = _ao_z_plane(blocks, local_x, local_z - 1, y, -1, 1, height_limit, top_boundary, bottom_boundary)
-                    ao2 = _ao_z_plane(blocks, local_x, local_z - 1, y, 1, 1, height_limit, top_boundary, bottom_boundary)
-                    ao3 = _ao_z_plane(blocks, local_x, local_z - 1, y, 1, -1, height_limit, top_boundary, bottom_boundary)
+                if north_empty:
+                    north_r = cr * 0.60
+                    north_g = cg * 0.60
+                    north_b = cb * 0.60
+                    sample_z = local_z - 1
+                    ao0 = _ao_z_from_planes(plane, plane_below, local_x, sample_z, -1)
+                    ao1 = _ao_z_from_planes(plane, plane_above, local_x, sample_z, -1)
+                    ao2 = _ao_z_from_planes(plane, plane_above, local_x, sample_z, 1)
+                    ao3 = _ao_z_from_planes(plane, plane_below, local_x, sample_z, 1)
                     vertex_index = _emit_quad_components_ao(
                         vertices,
                         vertex_index,

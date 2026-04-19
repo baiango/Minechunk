@@ -26,6 +26,7 @@ class ChunkVoxelResult:
     source: str = ""
     top_boundary: np.ndarray | None = None
     bottom_boundary: np.ndarray | None = None
+    is_empty: bool = False
 
 
 @dataclass(frozen=True)

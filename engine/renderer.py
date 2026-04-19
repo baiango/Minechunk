@@ -182,9 +182,20 @@ class TerrainRenderer:
         self._visible_chunk_coords: list[tuple[int, int, int]] = []
         self._visible_chunk_coord_set: set[tuple[int, int, int]] = set()
         self._visible_chunk_origin: tuple[int, int, int] | None = None
-        self._visible_tile_keys: list[tuple[int, int]] = []
-        self._visible_tile_coords: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
-        self._visible_tile_masks: dict[tuple[int, int], int] = {}
+        self._visible_tile_keys: list[tuple[int, int, int]] = []
+        self._visible_tile_key_set: set[tuple[int, int, int]] = set()
+        self._visible_tile_coords: dict[tuple[int, int, int], tuple[tuple[int, int, int], ...]] = {}
+        self._visible_tile_masks: dict[tuple[int, int, int], int] = {}
+        self._visible_tile_dirty_keys: set[tuple[int, int, int]] = set()
+        self._visible_layout_template_cache: dict[tuple[int, int, int, int, int, int], tuple] = {}
+        self._visible_rel_xz_order_cache: dict[tuple[int], tuple[tuple[int, int], ...]] = {}
+        self._visible_tile_mesh_slots: dict[tuple[int, int, int], list[ChunkMesh | None]] = {}
+        self._visible_tile_active_meshes: dict[tuple[int, int, int], tuple[ChunkMesh, ...]] = {}
+        self._visible_tile_slot_index_cache: dict[tuple[int, int, int], dict[tuple[int, int, int], int]] = {}
+        self._visible_rel_coord_to_tile_slot: dict[tuple[int, int, int], tuple[tuple[int, int, int], int]] = {}
+        self._visible_rel_tile_slot_sizes: dict[tuple[int, int, int], int] = {}
+        self._visible_tile_base: tuple[int, int, int] = (0, 0, 0)
+        self._shared_empty_chunk_vertex_buffer = None
         self._visible_displayed_coords: set[tuple[int, int, int]] = set()
         self._visible_missing_coords: set[tuple[int, int, int]] = set()
         self._chunk_request_target_coords: set[tuple[int, int, int]] = set()
@@ -192,14 +203,16 @@ class TerrainRenderer:
         self._chunk_request_queue_origin: tuple[int, int, int] | None = None
         self._chunk_request_queue_view_signature: tuple | None = None
         self._chunk_request_queue_dirty = True
+        self._chunk_request_view_stride = max(1, int(MERGED_TILE_SIZE_CHUNKS) // 2)
         self._pending_chunk_coords: set[tuple[int, int, int]] = set()
         self._transient_render_buffers: list[list[wgpu.GPUBuffer]] = []
         self._tile_render_batches: dict[tuple[int, int], ChunkRenderBatch] = {}
         self._tile_dirty_keys: set[tuple[int, int]] = set()
         self._tile_versions: dict[tuple[int, int], int] = {}
         self._visible_layout_version = 0
+        self._visible_tile_mutation_version = 0
         self._tile_mutation_version = 0
-        self._cached_tile_draw_batches: dict[tuple[int, int, int], tuple[list[ChunkDrawBatch], int, int, int]] = {}
+        self._cached_tile_draw_batches: dict[tuple[int, int, int], tuple[float, list[ChunkDrawBatch], int, int, int]] = {}
         self._cached_visible_render_batches: dict[tuple[int, int, int], tuple[float, list[tuple[wgpu.GPUBuffer, int, int, int]], int, int, int, int]] = {}
         self._mesh_buffer_refs: dict[int, int] = {}
         self._mesh_output_slabs: OrderedDict[int, MeshOutputSlab] = OrderedDict()
@@ -1247,48 +1260,117 @@ class TerrainRenderer:
         self._solid_block_cache[key] = bool(is_solid)
         return bool(is_solid)
 
+    def _resolve_small_downward_snap(self, position: list[float], delta: float) -> bool:
+        if delta >= 0.0 or delta < -BLOCK_SIZE * 1.01:
+            return False
+        eps = 1e-6
+        half_width, eye_down, _ = self._player_extents()
+        min_x = float(position[0]) - half_width
+        max_x = float(position[0]) + half_width
+        min_z = float(position[2]) - half_width
+        max_z = float(position[2]) + half_width
+        target_min_y = float(position[1]) + float(delta) - eye_down
+        probe_by = int(math.floor(target_min_y / BLOCK_SIZE))
+        min_bx = int(math.floor(min_x / BLOCK_SIZE))
+        max_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
+        min_bz = int(math.floor(min_z / BLOCK_SIZE))
+        max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
+        for bz in range(min_bz, max_bz + 1):
+            for bx in range(min_bx, max_bx + 1):
+                if self._is_block_solid(bx, probe_by, bz):
+                    position[1] = (float(probe_by) + 1.0) * BLOCK_SIZE + eye_down + eps
+                    return True
+        return False
+
     def _resolve_collision_axis(self, position: list[float], axis: int, delta: float) -> bool:
         if abs(delta) <= 1e-9:
             return False
+
+        eps = 1e-6
+        old_position = [float(position[0]), float(position[1]), float(position[2])]
+        old_min_x, old_min_y, old_min_z, old_max_x, old_max_y, old_max_z = self._player_aabb(old_position)
         position[axis] += float(delta)
         min_x, min_y, min_z, max_x, max_y, max_z = self._player_aabb(position)
-        eps = 1e-6
+        half_width, eye_down, eye_up = self._player_extents()
+
+        if axis == 0:
+            min_by = int(math.floor(min_y / BLOCK_SIZE))
+            max_by = int(math.floor((max_y - eps) / BLOCK_SIZE))
+            min_bz = int(math.floor(min_z / BLOCK_SIZE))
+            max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
+            if delta > 0.0:
+                start_bx = int(math.floor((old_max_x - eps) / BLOCK_SIZE)) + 1
+                end_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
+                for bx in range(start_bx, end_bx + 1):
+                    for by in range(min_by, max_by + 1):
+                        for bz in range(min_bz, max_bz + 1):
+                            if self._is_block_solid(bx, by, bz):
+                                position[0] = float(bx) * BLOCK_SIZE - half_width - eps
+                                return True
+            else:
+                start_bx = int(math.floor(old_min_x / BLOCK_SIZE)) - 1
+                end_bx = int(math.floor(min_x / BLOCK_SIZE))
+                for bx in range(start_bx, end_bx - 1, -1):
+                    for by in range(min_by, max_by + 1):
+                        for bz in range(min_bz, max_bz + 1):
+                            if self._is_block_solid(bx, by, bz):
+                                position[0] = (float(bx) + 1.0) * BLOCK_SIZE + half_width + eps
+                                return True
+            return False
+
+        if axis == 1:
+            if delta < 0.0:
+                snap_probe = [float(old_position[0]), float(old_position[1]), float(old_position[2])]
+                if self._resolve_small_downward_snap(snap_probe, delta):
+                    position[1] = snap_probe[1]
+                    return True
+            min_bx = int(math.floor(min_x / BLOCK_SIZE))
+            max_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
+            min_bz = int(math.floor(min_z / BLOCK_SIZE))
+            max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
+            if delta > 0.0:
+                start_by = int(math.floor((old_max_y - eps) / BLOCK_SIZE)) + 1
+                end_by = int(math.floor((max_y - eps) / BLOCK_SIZE))
+                for by in range(start_by, end_by + 1):
+                    for bz in range(min_bz, max_bz + 1):
+                        for bx in range(min_bx, max_bx + 1):
+                            if self._is_block_solid(bx, by, bz):
+                                position[1] = float(by) * BLOCK_SIZE - eye_up - eps
+                                return True
+            else:
+                start_by = int(math.floor(old_min_y / BLOCK_SIZE)) - 1
+                end_by = int(math.floor(min_y / BLOCK_SIZE))
+                for by in range(start_by, end_by - 1, -1):
+                    for bz in range(min_bz, max_bz + 1):
+                        for bx in range(min_bx, max_bx + 1):
+                            if self._is_block_solid(bx, by, bz):
+                                position[1] = (float(by) + 1.0) * BLOCK_SIZE + eye_down + eps
+                                return True
+            return False
+
         min_bx = int(math.floor(min_x / BLOCK_SIZE))
         max_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
         min_by = int(math.floor(min_y / BLOCK_SIZE))
         max_by = int(math.floor((max_y - eps) / BLOCK_SIZE))
-        min_bz = int(math.floor(min_z / BLOCK_SIZE))
-        max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
-        collided = False
-        half_width, eye_down, eye_up = self._player_extents()
-        for by in range(min_by, max_by + 1):
-            for bz in range(min_bz, max_bz + 1):
-                for bx in range(min_bx, max_bx + 1):
-                    if not self._is_block_solid(bx, by, bz):
-                        continue
-                    collided = True
-                    block_min_x = float(bx) * BLOCK_SIZE
-                    block_min_y = float(by) * BLOCK_SIZE
-                    block_min_z = float(bz) * BLOCK_SIZE
-                    block_max_x = block_min_x + BLOCK_SIZE
-                    block_max_y = block_min_y + BLOCK_SIZE
-                    block_max_z = block_min_z + BLOCK_SIZE
-                    if axis == 0:
-                        if delta > 0.0:
-                            position[0] = min(position[0], block_min_x - half_width - eps)
-                        else:
-                            position[0] = max(position[0], block_max_x + half_width + eps)
-                    elif axis == 1:
-                        if delta > 0.0:
-                            position[1] = min(position[1], block_min_y - eye_up - eps)
-                        else:
-                            position[1] = max(position[1], block_max_y + eye_down + eps)
-                    else:
-                        if delta > 0.0:
-                            position[2] = min(position[2], block_min_z - half_width - eps)
-                        else:
-                            position[2] = max(position[2], block_max_z + half_width + eps)
-        return collided
+        if delta > 0.0:
+            start_bz = int(math.floor((old_max_z - eps) / BLOCK_SIZE)) + 1
+            end_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
+            for bz in range(start_bz, end_bz + 1):
+                for by in range(min_by, max_by + 1):
+                    for bx in range(min_bx, max_bx + 1):
+                        if self._is_block_solid(bx, by, bz):
+                            position[2] = float(bz) * BLOCK_SIZE - half_width - eps
+                            return True
+        else:
+            start_bz = int(math.floor(old_min_z / BLOCK_SIZE)) - 1
+            end_bz = int(math.floor(min_z / BLOCK_SIZE))
+            for bz in range(start_bz, end_bz - 1, -1):
+                for by in range(min_by, max_by + 1):
+                    for bx in range(min_bx, max_bx + 1):
+                        if self._is_block_solid(bx, by, bz):
+                            position[2] = (float(bz) + 1.0) * BLOCK_SIZE + half_width + eps
+                            return True
+        return False
 
     def _position_is_clear(self, position: list[float]) -> bool:
         min_x, min_y, min_z, max_x, max_y, max_z = self._player_aabb(position)
@@ -1410,19 +1492,28 @@ class TerrainRenderer:
         self._walk_velocity[1] -= float(PLAYER_GRAVITY_METERS) * dt
 
         position = [float(self.camera.position[0]), float(self.camera.position[1]), float(self.camera.position[2])]
-        self._move_horizontal_with_step(position, 0, desired_dx)
-        self._move_horizontal_with_step(position, 2, desired_dz)
+        if desired_dx != 0.0:
+            self._move_horizontal_with_step(position, 0, desired_dx)
+        if desired_dz != 0.0:
+            self._move_horizontal_with_step(position, 2, desired_dz)
 
-        if self._walk_velocity[1] <= 0.0:
-            self._camera_on_ground = self._snap_to_ground(position)
-
-        collided_y = self._resolve_collision_axis(position, 1, self._walk_velocity[1] * dt)
-        if collided_y:
-            if self._walk_velocity[1] <= 0.0:
+        vertical_delta = self._walk_velocity[1] * dt
+        if vertical_delta <= 0.0:
+            snap_delta = min(vertical_delta, -float(PLAYER_GROUND_SNAP_METERS))
+            collided_y = self._resolve_small_downward_snap(position, snap_delta)
+            if not collided_y:
+                collided_y = self._resolve_collision_axis(position, 1, snap_delta)
+            if collided_y:
                 self._camera_on_ground = True
-            self._walk_velocity[1] = 0.0
+                self._walk_velocity[1] = 0.0
+            else:
+                self._camera_on_ground = False
         else:
-            self._camera_on_ground = False
+            collided_y = self._resolve_collision_axis(position, 1, vertical_delta)
+            if collided_y:
+                self._walk_velocity[1] = 0.0
+            else:
+                self._camera_on_ground = False
 
         self.camera.position[:] = position
 
@@ -1459,33 +1550,151 @@ class TerrainRenderer:
         up = normalize3(cross3(right, forward))
         return right, up, forward
 
-    def _chunk_coords_in_view_for_origin(self, origin: tuple[int, int, int]) -> list[tuple[int, int, int]]:
-        chunk_x = int(origin[0])
-        chunk_y = int(origin[1])
-        chunk_z = int(origin[2])
+    def _build_visible_layout_template(
+        self,
+        origin_mod_x: int,
+        origin_mod_z: int,
+    ) -> tuple[
+        tuple[tuple[int, int, int], ...],
+        tuple[tuple[int, int, int], ...],
+        tuple[int, ...],
+        dict[tuple[int, int, int], tuple[tuple[int, int, int], int]],
+        dict[tuple[int, int, int], int],
+    ]:
+        tile_size = int(MERGED_TILE_SIZE_CHUNKS)
         radius = int(self.chunk_radius)
+        vertical_radius = int(self.vertical_chunk_radius) if VERTICAL_CHUNK_STACK_ENABLED else 0
+        template_key = (
+            radius,
+            vertical_radius,
+            tile_size,
+            int(origin_mod_x),
+            int(origin_mod_z),
+            1 if VERTICAL_CHUNK_STACK_ENABLED else 0,
+        )
+        cached = self._visible_layout_template_cache.get(template_key)
+        if cached is not None:
+            return cached
+
         radius_sq = radius * radius
-        coords: list[tuple[int, int, int]] = []
-        min_y = max(0, chunk_y - self.vertical_chunk_radius) if VERTICAL_CHUNK_STACK_ENABLED else 0
-        max_y = min(VERTICAL_CHUNK_COUNT - 1, chunk_y + self.vertical_chunk_radius) if VERTICAL_CHUNK_STACK_ENABLED else 0
+        min_rel_y = -vertical_radius if VERTICAL_CHUNK_STACK_ENABLED else 0
+        max_rel_y = vertical_radius if VERTICAL_CHUNK_STACK_ENABLED else 0
         if VERTICAL_CHUNK_STACK_ENABLED:
-            cy_order: list[int] = [chunk_y]
-            max_offset = max(chunk_y - min_y, max_y - chunk_y)
+            cy_order: list[int] = [0]
+            max_offset = max(-min_rel_y, max_rel_y)
             for offset in range(1, max_offset + 1):
-                up = chunk_y + offset
-                down = chunk_y - offset
-                if up <= max_y:
+                up = offset
+                down = -offset
+                if up <= max_rel_y:
                     cy_order.append(up)
-                if down >= min_y:
+                if down >= min_rel_y:
                     cy_order.append(down)
         else:
             cy_order = [0]
-        for cy in cy_order:
-            for dz in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    if dx * dx + dz * dz > radius_sq:
-                        continue
-                    coords.append((chunk_x + dx, cy, chunk_z + dz))
+
+        rel_coords: list[tuple[int, int, int]] = []
+        rel_tile_keys: list[tuple[int, int, int]] = []
+        rel_tile_masks: dict[tuple[int, int, int], int] = {}
+        rel_coord_to_tile_slot: dict[tuple[int, int, int], tuple[tuple[int, int, int], int]] = {}
+        rel_tile_slot_sizes: dict[tuple[int, int, int], int] = {}
+        base_tile_x = int(origin_mod_x) // tile_size
+        base_tile_z = int(origin_mod_z) // tile_size
+
+        rel_xz_order = self._visible_rel_xz_order_cache.get((radius,))
+        if rel_xz_order is None:
+            rel_xz = [
+                (dx, dz)
+                for dz in range(-radius, radius + 1)
+                for dx in range(-radius, radius + 1)
+                if dx * dx + dz * dz <= radius_sq
+            ]
+            rel_xz.sort(key=lambda delta: (delta[0] * delta[0] + delta[1] * delta[1], abs(delta[1]), abs(delta[0]), delta[1], delta[0]))
+            rel_xz_order = tuple(rel_xz)
+            self._visible_rel_xz_order_cache[(radius,)] = rel_xz_order
+
+        for rel_y in cy_order:
+            for dx, dz in rel_xz_order:
+                rel_coord = (dx, rel_y, dz)
+                rel_coords.append(rel_coord)
+                abs_x = int(origin_mod_x) + dx
+                abs_z = int(origin_mod_z) + dz
+                tile_x = abs_x // tile_size
+                tile_z = abs_z // tile_size
+                local_x = abs_x - tile_x * tile_size
+                local_z = abs_z - tile_z * tile_size
+                rel_tile_key = (tile_x - base_tile_x, rel_y, tile_z - base_tile_z)
+                slot_index = int(rel_tile_slot_sizes.get(rel_tile_key, 0))
+                if slot_index == 0:
+                    rel_tile_keys.append(rel_tile_key)
+                rel_coord_to_tile_slot[rel_coord] = (rel_tile_key, slot_index)
+                rel_tile_slot_sizes[rel_tile_key] = slot_index + 1
+                if 0 <= local_x < tile_size and 0 <= local_z < tile_size:
+                    rel_tile_masks[rel_tile_key] = int(rel_tile_masks.get(rel_tile_key, 0)) | int(1 << (local_z * tile_size + local_x))
+
+        rel_tile_mask_values = tuple(int(rel_tile_masks.get(rel_tile_key, 0)) for rel_tile_key in rel_tile_keys)
+        template = (
+            tuple(rel_coords),
+            tuple(rel_tile_keys),
+            rel_tile_mask_values,
+            rel_coord_to_tile_slot,
+            rel_tile_slot_sizes,
+        )
+        self._visible_layout_template_cache[template_key] = template
+        return template
+
+    def _tile_layout_in_view_for_origin(
+        self,
+        origin: tuple[int, int, int],
+    ) -> tuple[
+        tuple[tuple[int, int, int], ...],
+        list[tuple[int, int, int]],
+        dict[tuple[int, int, int], int],
+        dict[tuple[int, int, int], tuple[tuple[int, int, int], int]],
+        dict[tuple[int, int, int], int],
+        tuple[int, int, int],
+    ]:
+        chunk_x = int(origin[0])
+        chunk_y = int(origin[1])
+        chunk_z = int(origin[2])
+        tile_size = int(MERGED_TILE_SIZE_CHUNKS)
+        rel_coords, rel_tile_keys, rel_tile_mask_values, rel_coord_to_tile_slot, rel_tile_slot_sizes = self._build_visible_layout_template(
+            chunk_x % tile_size,
+            chunk_z % tile_size,
+        )
+        base_tile_x = chunk_x // tile_size
+        base_tile_z = chunk_z // tile_size
+        tile_base = (base_tile_x, chunk_y, base_tile_z)
+        visible_tile_keys: list[tuple[int, int, int]] = []
+        visible_tile_masks: dict[tuple[int, int, int], int] = {}
+        append_visible_tile_key = visible_tile_keys.append
+        for index, (tx, ty, tz) in enumerate(rel_tile_keys):
+            tile_key_value = (base_tile_x + tx, chunk_y + ty, base_tile_z + tz)
+            append_visible_tile_key(tile_key_value)
+            mask_value = int(rel_tile_mask_values[index])
+            if mask_value != 0:
+                visible_tile_masks[tile_key_value] = mask_value
+        return rel_coords, visible_tile_keys, visible_tile_masks, rel_coord_to_tile_slot, rel_tile_slot_sizes, tile_base
+
+    def _chunk_coords_and_tile_layout_in_view_for_origin(
+        self,
+        origin: tuple[int, int, int],
+    ) -> tuple[
+        list[tuple[int, int, int]],
+        list[tuple[int, int, int]],
+        dict[tuple[int, int, int], int],
+        dict[tuple[int, int, int], tuple[tuple[int, int, int], int]],
+        dict[tuple[int, int, int], int],
+        tuple[int, int, int],
+    ]:
+        rel_coords, visible_tile_keys, visible_tile_masks, rel_coord_to_tile_slot, rel_tile_slot_sizes, tile_base = self._tile_layout_in_view_for_origin(origin)
+        chunk_x = int(origin[0])
+        chunk_y = int(origin[1])
+        chunk_z = int(origin[2])
+        coords = [(chunk_x + dx, chunk_y + dy, chunk_z + dz) for dx, dy, dz in rel_coords]
+        return coords, visible_tile_keys, visible_tile_masks, rel_coord_to_tile_slot, rel_tile_slot_sizes, tile_base
+
+    def _chunk_coords_in_view_for_origin(self, origin: tuple[int, int, int]) -> list[tuple[int, int, int]]:
+        coords, _, _, _, _, _ = self._chunk_coords_and_tile_layout_in_view_for_origin(origin)
         return coords
 
     def _chunk_coords_in_view(self) -> list[tuple[int, int, int]]:
@@ -1509,23 +1718,65 @@ class TerrainRenderer:
             return tile_key_value, 1 << (local_z * tile_size + local_x)
         return tile_key_value, 0
 
+    def _visible_tile_slot_info_for_coord(
+        self,
+        coord: tuple[int, int, int],
+    ) -> tuple[tuple[int, int, int], int, list[ChunkMesh | None]] | None:
+        origin = self._visible_chunk_origin
+        if origin is None:
+            return None
+        rel_coord = (
+            int(coord[0]) - int(origin[0]),
+            int(coord[1]) - int(origin[1]),
+            int(coord[2]) - int(origin[2]),
+        )
+        rel_slot = self._visible_rel_coord_to_tile_slot.get(rel_coord)
+        if rel_slot is None:
+            return None
+        rel_tile_key, slot_index = rel_slot
+        tile_base = self._visible_tile_base
+        tile_key_value = (
+            int(tile_base[0]) + int(rel_tile_key[0]),
+            int(tile_base[1]) + int(rel_tile_key[1]),
+            int(tile_base[2]) + int(rel_tile_key[2]),
+        )
+        slots = self._visible_tile_mesh_slots.get(tile_key_value)
+        if slots is None:
+            slot_count = int(self._visible_rel_tile_slot_sizes.get(rel_tile_key, 0))
+            if slot_count <= 0:
+                return None
+            slots = [None] * slot_count
+            self._visible_tile_mesh_slots[tile_key_value] = slots
+        return tile_key_value, int(slot_index), slots
+
     def _rebuild_visible_tile_layout_from_coords(self) -> None:
-        tile_groups: dict[tuple[int, int, int], list[tuple[int, int, int]]] = {}
-        tile_masks: dict[tuple[int, int, int], int] = {}
-        for chunk_x, chunk_y, chunk_z in self._visible_chunk_coords:
-            tile_key_value, tile_bit = self._tile_bit_for_chunk(int(chunk_x), int(chunk_z), int(chunk_y))
-            tile_groups.setdefault(tile_key_value, []).append((int(chunk_x), int(chunk_y), int(chunk_z)))
-            if tile_bit != 0:
-                tile_masks[tile_key_value] = int(tile_masks.get(tile_key_value, 0)) | int(tile_bit)
-        self._visible_tile_keys = sorted(tile_groups)
-        self._visible_tile_coords = {
-            key: tuple(sorted(coords))
-            for key, coords in tile_groups.items()
-        }
-        self._visible_tile_masks = tile_masks
+        origin = self._visible_chunk_origin if self._visible_chunk_origin is not None else (0, 0, 0)
+        (
+            _,
+            self._visible_tile_keys,
+            self._visible_tile_masks,
+            self._visible_rel_coord_to_tile_slot,
+            self._visible_rel_tile_slot_sizes,
+            self._visible_tile_base,
+        ) = self._tile_layout_in_view_for_origin(origin)
+        self._visible_tile_coords = {}
 
     def _apply_visible_chunk_coord_delta(self, new_origin: tuple[int, int, int]) -> bool:
-        return False
+        old_origin = self._visible_chunk_origin
+        if old_origin is None or not self._visible_chunk_coords:
+            return False
+        dx = int(new_origin[0]) - int(old_origin[0])
+        dy = int(new_origin[1]) - int(old_origin[1])
+        dz = int(new_origin[2]) - int(old_origin[2])
+        if dx == 0 and dy == 0 and dz == 0:
+            return True
+        shifted_coords = [
+            (chunk_x + dx, chunk_y + dy, chunk_z + dz)
+            for chunk_x, chunk_y, chunk_z in self._visible_chunk_coords
+        ]
+        self._visible_chunk_coords = shifted_coords
+        self._visible_chunk_coord_set = set(shifted_coords)
+        return True
 
     @profile
     def _refresh_visible_chunk_coords(self) -> None:
@@ -1534,11 +1785,82 @@ class TerrainRenderer:
             max(0, min(VERTICAL_CHUNK_COUNT - 1, int(self.camera.position[1] // CHUNK_WORLD_SIZE))) if VERTICAL_CHUNK_STACK_ENABLED else 0,
             int(self.camera.position[2] // CHUNK_WORLD_SIZE),
         )
+        previous_origin = self._visible_chunk_origin
+        (
+            rel_coords,
+            self._visible_tile_keys,
+            self._visible_tile_masks,
+            self._visible_rel_coord_to_tile_slot,
+            self._visible_rel_tile_slot_sizes,
+            self._visible_tile_base,
+        ) = self._tile_layout_in_view_for_origin(new_origin)
+
+        shifted_visible_coords = False
+        if previous_origin is not None and self._visible_chunk_coords:
+            dx = int(new_origin[0]) - int(previous_origin[0])
+            dy = int(new_origin[1]) - int(previous_origin[1])
+            dz = int(new_origin[2]) - int(previous_origin[2])
+            if dx == 0 and dy == 0 and dz == 0:
+                shifted_visible_coords = True
+            else:
+                visible_coords = self._visible_chunk_coords
+                visible_coord_set = self._visible_chunk_coord_set
+                if visible_coord_set and len(visible_coord_set) == len(visible_coords):
+                    shifted_coords = [(chunk_x + dx, chunk_y + dy, chunk_z + dz) for chunk_x, chunk_y, chunk_z in visible_coords]
+                    self._visible_chunk_coords = shifted_coords
+                    self._visible_chunk_coord_set = {(chunk_x + dx, chunk_y + dy, chunk_z + dz) for chunk_x, chunk_y, chunk_z in visible_coord_set}
+                    shifted_visible_coords = True
         self._visible_chunk_origin = new_origin
-        self._visible_chunk_coords = self._chunk_coords_in_view()
-        self._visible_chunk_coord_set = set(self._visible_chunk_coords)
-        self._rebuild_visible_tile_layout_from_coords()
+
+        if shifted_visible_coords:
+            visible_coords = self._visible_chunk_coords
+            visible_coord_set = self._visible_chunk_coord_set
+        else:
+            origin_x = int(new_origin[0])
+            origin_y = int(new_origin[1])
+            origin_z = int(new_origin[2])
+            visible_coords = [(origin_x + dx, origin_y + dy, origin_z + dz) for dx, dy, dz in rel_coords]
+            self._visible_chunk_coords = visible_coords
+            visible_coord_set = set(visible_coords)
+            self._visible_chunk_coord_set = visible_coord_set
+
+        self._visible_tile_coords = {}
+        self._visible_tile_key_set = set(self._visible_tile_keys)
+        # Keep visible slot arrays lazy. The direct render path only needs per-tile
+        # active meshes, so eagerly allocating and filling slot arrays here just
+        # duplicates bookkeeping on every origin hop.
+        self._visible_tile_mesh_slots = {}
+        self._visible_tile_active_meshes = {}
+        self._visible_tile_slot_index_cache = {}
+
+        chunk_cache = self.chunk_cache
+        displayed_coords = visible_coord_set.intersection(chunk_cache.keys())
+        chunk_cache_getitem = chunk_cache.__getitem__
+
+        tile_size = int(MERGED_TILE_SIZE_CHUNKS)
+        visible_tile_active_meshes: dict[tuple[int, int, int], list[ChunkMesh]] = {}
+
+        for coord in displayed_coords:
+            mesh = chunk_cache_getitem(coord)
+            if mesh.vertex_count <= 0:
+                continue
+            tile_key_value = (int(coord[0]) // tile_size, int(coord[1]), int(coord[2]) // tile_size)
+            active_list = visible_tile_active_meshes.get(tile_key_value)
+            if active_list is None:
+                active_list = []
+                visible_tile_active_meshes[tile_key_value] = active_list
+            active_list.append(mesh)
+
+        self._visible_tile_active_meshes = visible_tile_active_meshes
+        active_tile_key_set = set(visible_tile_active_meshes)
+        self._visible_active_tile_keys = [tile_key_value for tile_key_value in self._visible_tile_keys if tile_key_value in active_tile_key_set]
+
+        self._visible_prefetched_displayed_coords = displayed_coords
+        self._visible_tile_dirty_keys = {
+            key for key in self._tile_dirty_keys if key in self._visible_tile_key_set
+        }
         self._visible_layout_version += 1
+        self._visible_tile_mutation_version += 1
         self._cached_tile_draw_batches.clear()
         self._cached_visible_render_batches.clear()
 
@@ -1618,11 +1940,18 @@ class TerrainRenderer:
         return (uv_x, uv_y), strength
 
     def _draw_visible_batches_to_pass(self, render_pass, visible_batches, use_gpu_visibility: bool, use_indirect: bool) -> None:
+        current_vertex_buffer = None
+        current_binding_offset = None
+        set_vertex_buffer = render_pass.set_vertex_buffer
         if use_gpu_visibility or use_indirect:
             indirect_buffer = self._mesh_draw_indirect_buffer
             assert indirect_buffer is not None
+            draw_indirect = render_pass.draw_indirect
             for vertex_buffer, binding_offset, batch_start, batch_count in visible_batches:
-                render_pass.set_vertex_buffer(0, vertex_buffer, binding_offset)
+                if vertex_buffer is not current_vertex_buffer or binding_offset != current_binding_offset:
+                    set_vertex_buffer(0, vertex_buffer, binding_offset)
+                    current_vertex_buffer = vertex_buffer
+                    current_binding_offset = binding_offset
                 if wgpu_native_multi_draw_indirect is not None and batch_count > 1:
                     wgpu_native_multi_draw_indirect(
                         render_pass,
@@ -1633,11 +1962,15 @@ class TerrainRenderer:
                     continue
                 for batch_index in range(batch_count):
                     indirect_offset = (batch_start + batch_index) * INDIRECT_DRAW_COMMAND_STRIDE
-                    render_pass.draw_indirect(indirect_buffer, indirect_offset)
+                    draw_indirect(indirect_buffer, indirect_offset)
         else:
+            draw = render_pass.draw
             for vertex_buffer, binding_offset, vertex_count, first_vertex in visible_batches:
-                render_pass.set_vertex_buffer(0, vertex_buffer, binding_offset)
-                render_pass.draw(vertex_count, 1, first_vertex, 0)
+                if vertex_buffer is not current_vertex_buffer or binding_offset != current_binding_offset:
+                    set_vertex_buffer(0, vertex_buffer, binding_offset)
+                    current_vertex_buffer = vertex_buffer
+                    current_binding_offset = binding_offset
+                draw(vertex_count, 1, first_vertex, 0)
 
     @profile
     def _submit_render(self):

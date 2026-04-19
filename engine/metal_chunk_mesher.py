@@ -17,6 +17,13 @@ from . import mesh_cache_helpers as mesh_cache
 from .terrain_backend import ChunkVoxelResult
 
 
+try:
+    profile  # type: ignore[name-defined]
+except NameError:  # pragma: no cover - only used outside kernprof
+    def profile(func):
+        return func
+
+
 _MESHER_CACHE_INIT_LOCK = threading.Lock()
 _ASYNC_STATE_INIT_LOCK = threading.Lock()
 

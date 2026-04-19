@@ -74,13 +74,20 @@ class MeshBufferAllocation:
 class ChunkRenderBatch:
     signature: tuple[tuple[int, int, int], ...]
     vertex_count: int
-    vertex_buffer: wgpu.GPUBuffer
+    vertex_buffer: wgpu.GPUBuffer | None
     bounds: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     chunk_count: int = 0
     complete_tile: bool = False
     all_mature: bool = False
     visible_mask: int = 0
     source_version: int = 0
+    cached_draw_batches: tuple[ChunkDrawBatch, ...] = field(default_factory=tuple)
+    cached_render_batches: tuple[tuple[wgpu.GPUBuffer, int, int, int], ...] = field(default_factory=tuple)
+    next_refresh_at: float = 0.0
+    visible_chunk_count: int = 0
+    merged_chunk_count: int = 0
+    visible_vertex_count: int = 0
+    owns_vertex_buffer: bool = False
 
 
 @dataclass

@@ -10,6 +10,7 @@ from .terrain_kernels import (
     fill_chunk_surface_grids,
     fill_stacked_chunk_voxel_grid,
     fill_stacked_chunk_voxel_grid_with_neighbor_planes,
+    fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface,
     fill_chunk_voxel_grid,
     surface_profile_at as sample_surface_profile_at,
 )
@@ -45,6 +46,13 @@ class CpuTerrainBackend:
         self._pending_voxel_jobs: deque[_PendingChunkJob] = deque()
         self._next_job_id = 1
         self._next_voxel_job_id = 1
+        sample_size = self.chunk_size + 2
+        cell_count = sample_size * sample_size
+        local_height = self.chunk_size if VERTICAL_CHUNK_STACK_ENABLED else self.height
+        self._empty_voxel_blocks = np.zeros((local_height, sample_size, sample_size), dtype=np.uint8)
+        self._empty_voxel_materials = np.zeros((local_height, sample_size, sample_size), dtype=np.uint32)
+        self._surface_probe_heights = np.empty(cell_count, dtype=np.uint32)
+        self._surface_probe_materials = np.empty(cell_count, dtype=np.uint32)
 
     @profile
     def surface_profile_at(self, x: int, z: int) -> tuple[int, int]:
@@ -149,24 +157,44 @@ class CpuTerrainBackend:
                 chunk_x, chunk_y, chunk_z = job.chunk_coords[job.cursor]
                 top_boundary = None
                 bottom_boundary = None
+                is_empty_chunk = False
                 if VERTICAL_CHUNK_STACK_ENABLED:
                     local_height = self.chunk_size
-                    blocks = np.zeros((local_height, sample_size, sample_size), dtype=np.uint8)
-                    materials = np.zeros((local_height, sample_size, sample_size), dtype=np.uint32)
-                    top_boundary = np.zeros((sample_size, sample_size), dtype=np.uint8)
-                    bottom_boundary = np.zeros((sample_size, sample_size), dtype=np.uint8)
-                    fill_stacked_chunk_voxel_grid_with_neighbor_planes(
-                        blocks,
-                        materials,
-                        top_boundary,
-                        bottom_boundary,
+                    origin_y = int(chunk_y) * self.chunk_size
+                    probe_heights = self._surface_probe_heights
+                    probe_materials = self._surface_probe_materials
+                    fill_chunk_surface_grids(
+                        probe_heights,
+                        probe_materials,
                         int(chunk_x),
-                        int(chunk_y),
                         int(chunk_z),
                         self.chunk_size,
                         self.seed,
                         self.height,
                     )
+                    is_empty_chunk = int(probe_heights.max()) <= origin_y
+                    if is_empty_chunk:
+                        blocks = self._empty_voxel_blocks
+                        materials = self._empty_voxel_materials
+                    else:
+                        blocks = np.zeros((local_height, sample_size, sample_size), dtype=np.uint8)
+                        materials = np.zeros((local_height, sample_size, sample_size), dtype=np.uint32)
+                        top_boundary = np.zeros((sample_size, sample_size), dtype=np.uint8)
+                        bottom_boundary = np.zeros((sample_size, sample_size), dtype=np.uint8)
+                        fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface(
+                            blocks,
+                            materials,
+                            top_boundary,
+                            bottom_boundary,
+                            probe_heights,
+                            probe_materials,
+                            int(chunk_x),
+                            int(chunk_y),
+                            int(chunk_z),
+                            self.chunk_size,
+                            self.seed,
+                            self.height,
+                        )
                 else:
                     blocks, materials = self.chunk_voxel_grid(chunk_x, chunk_y, chunk_z)
                 ready.append(
@@ -179,6 +207,7 @@ class CpuTerrainBackend:
                         source="cpu",
                         top_boundary=top_boundary,
                         bottom_boundary=bottom_boundary,
+                        is_empty=is_empty_chunk,
                     )
                 )
                 job.cursor += 1
