@@ -525,6 +525,7 @@ def clear_tile_render_batches(renderer) -> None:
     renderer._tile_versions.clear()
     renderer._tile_mutation_version += 1
     renderer._cached_tile_draw_batches.clear()
+    renderer._cached_visible_render_batches.clear()
 
 
 def mark_tile_dirty(renderer, chunk_x: int, chunk_z: int, chunk_y: int = 0) -> None:
@@ -533,6 +534,7 @@ def mark_tile_dirty(renderer, chunk_x: int, chunk_z: int, chunk_y: int = 0) -> N
     renderer._tile_versions[key] = int(renderer._tile_versions.get(key, 0)) + 1
     renderer._tile_mutation_version += 1
     renderer._cached_tile_draw_batches.clear()
+    renderer._cached_visible_render_batches.clear()
 
 
 def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
@@ -798,7 +800,7 @@ def build_tile_draw_batches(
     encoder,
     *,
     age_gate: bool,
-) -> tuple[list[ChunkDrawBatch], int, int, int]:
+) -> tuple[list[ChunkDrawBatch], int, int, int, float]:
     renderer_module = _renderer_module()
     merged_tile_min_age_seconds = float(renderer_module.MERGED_TILE_MIN_AGE_SECONDS)
 
@@ -808,7 +810,7 @@ def build_tile_draw_batches(
         cached = renderer._cached_tile_draw_batches.get(cache_key)
         if cached is not None and not renderer._tile_dirty_keys:
             cached_batches, cached_merged, cached_visible, cached_vertices = cached
-            return list(cached_batches), cached_merged, cached_visible, cached_vertices
+            return list(cached_batches), cached_merged, cached_visible, cached_vertices, 0.0
         tile_groups = visible_tile_mesh_groups(renderer)
     else:
         tile_groups: dict[tuple[int, int], list[ChunkMesh]] = {}
@@ -826,6 +828,7 @@ def build_tile_draw_batches(
     draw_batches: list[ChunkDrawBatch] = []
     merged_chunk_count = 0
     visible_chunk_count = 0
+    next_refresh_at = 0.0
 
     merged_tile_max_chunks = int(renderer_module.MERGED_TILE_MAX_CHUNKS)
     for tile_key_value in sorted(tile_groups):
@@ -863,6 +866,10 @@ def build_tile_draw_batches(
             (mesh for mesh in tile_meshes if chunk_mesh_age(renderer, mesh) < merged_tile_min_age_seconds),
             key=lambda mesh: (mesh.chunk_x, mesh.chunk_z),
         )
+        if age_gate and immature_meshes:
+            tile_next_refresh = min(float(mesh.created_at) + merged_tile_min_age_seconds for mesh in immature_meshes)
+            if next_refresh_at <= 0.0 or tile_next_refresh < next_refresh_at:
+                next_refresh_at = tile_next_refresh
 
         if len(tile_meshes) == 1:
             mesh = tile_meshes[0]
@@ -977,7 +984,7 @@ def build_tile_draw_batches(
             visible_chunk_count,
             visible_vertex_count,
         )
-    return draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count
+    return draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count, next_refresh_at
 
 
 def ensure_mesh_draw_indirect_scratch(renderer, command_capacity: int) -> None:
@@ -1031,7 +1038,7 @@ def build_gpu_visibility_records(
     renderer,
     encoder,
 ) -> tuple[list[tuple[wgpu.GPUBuffer, int, int, int]], int, int, int, int]:
-    draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count = build_tile_draw_batches(
+    draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count, _ = build_tile_draw_batches(
         renderer,
         None,
         encoder,
@@ -1080,7 +1087,7 @@ def visible_render_batches_indirect(
     encoder,
 ) -> tuple[list[tuple[wgpu.GPUBuffer, int, int, int]], float, int, int, int, int]:
     encode_start = time.perf_counter()
-    draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count = build_tile_draw_batches(
+    draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count, _ = build_tile_draw_batches(
         renderer,
         None,
         encoder,
@@ -1156,17 +1163,35 @@ def tile_visible_mask(renderer, tile_key_value: tuple[int, int, int], tile_meshe
 def visible_render_batches(
     renderer,
     encoder,
-) -> tuple[list[tuple[wgpu.GPUBuffer, int, int]], float, int, int, int, int]:
+) -> tuple[list[tuple[wgpu.GPUBuffer, int, int, int]], float, int, int, int, int]:
+    cache_key = (int(renderer._visible_layout_version), int(renderer._tile_mutation_version), 1)
+    now = time.perf_counter()
+    cached_entry = renderer._cached_visible_render_batches.get(cache_key)
+    if cached_entry is not None and not renderer._tile_dirty_keys:
+        cached_until, cached_batches, cached_draw_calls, cached_merged, cached_visible, cached_vertices = cached_entry
+        if cached_until <= 0.0 or now < cached_until:
+            return list(cached_batches), 0.0, cached_draw_calls, cached_merged, cached_visible, cached_vertices
+
     encode_start = time.perf_counter()
-    visible = visible_chunks(renderer)
-    render_batches: list[tuple[wgpu.GPUBuffer, int, int]] = []
-    visible_count = 0
-    visible_vertex_count = 0
-    for _, _, _, mesh in visible:
-        if mesh.vertex_count <= 0:
+    draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count, next_refresh_at = build_tile_draw_batches(
+        renderer,
+        None,
+        encoder,
+        age_gate=True,
+    )
+    render_batches: list[tuple[wgpu.GPUBuffer, int, int, int]] = []
+    for batch in draw_batches:
+        if batch.vertex_count <= 0:
             continue
-        render_batches.append((mesh.vertex_buffer, mesh.vertex_count, mesh.vertex_offset))
-        visible_count += 1
-        visible_vertex_count += int(mesh.vertex_count)
+        render_batches.append((batch.vertex_buffer, batch.binding_offset, int(batch.vertex_count), int(batch.first_vertex)))
     render_encode_ms = (time.perf_counter() - encode_start) * 1000.0
-    return render_batches, render_encode_ms, len(render_batches), 0, visible_count, visible_vertex_count
+    if not renderer._tile_dirty_keys:
+        renderer._cached_visible_render_batches[cache_key] = (
+            float(next_refresh_at),
+            list(render_batches),
+            len(render_batches),
+            merged_chunk_count,
+            visible_chunk_count,
+            visible_vertex_count,
+        )
+    return render_batches, render_encode_ms, len(render_batches), merged_chunk_count, visible_chunk_count, visible_vertex_count

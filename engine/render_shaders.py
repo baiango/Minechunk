@@ -10,6 +10,7 @@ VOXEL_SURFACE_EXPAND_BIND_GROUP_CACHE_LIMIT = render_consts.VOXEL_SURFACE_EXPAND
 
 HUD_FONT_SCALE = render_consts.HUD_FONT_SCALE
 HUD_FONT_CHAR_WIDTH = render_consts.HUD_FONT_CHAR_WIDTH
+VOLUMETRIC_LIGHTING_SAMPLES = render_consts.VOLUMETRIC_LIGHTING_SAMPLES
 HUD_FONT_CHAR_HEIGHT = render_consts.HUD_FONT_CHAR_HEIGHT
 HUD_PANEL_PADDING = render_consts.HUD_PANEL_PADDING
 HUD_LINE_SPACING = render_consts.HUD_LINE_SPACING
@@ -346,6 +347,176 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     let diffuse = max(dot(input.normal, light), 0.0);
     let brightness = 0.32 + 0.68 * diffuse;
     return vec4f(input.color * brightness, 1.0);
+}
+"""
+
+
+OCCLUSION_MASK_SHADER = """
+struct CameraUniform {
+    position: vec4f,
+    right: vec4f,
+    up: vec4f,
+    forward: vec4f,
+    proj: vec4f,
+}
+
+struct VertexInput {
+    @location(0) position: vec4f,
+    @location(1) normal: vec4f,
+    @location(2) color: vec4f,
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+}
+
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    let world = input.position.xyz;
+    let to_point = world - camera.position.xyz;
+    let view_x = dot(to_point, camera.right.xyz);
+    let view_y = dot(to_point, camera.up.xyz);
+    let view_z = dot(to_point, camera.forward.xyz);
+
+    if (view_z <= camera.proj.z) {
+        out.position = vec4f(2.0, 2.0, 2.0, 1.0);
+        return out;
+    }
+
+    let focal = camera.proj.x;
+    let aspect = camera.proj.y;
+    let near = camera.proj.z;
+    let far = camera.proj.w;
+    let clip_x = view_x * focal / aspect;
+    let clip_y = view_y * focal;
+    let clip_z = view_z * (far / (far - near)) - (near * far) / (far - near);
+    out.position = vec4f(clip_x, clip_y, clip_z, view_z);
+    return out;
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4f {
+    return vec4f(0.0, 0.0, 0.0, 1.0);
+}
+"""
+
+
+RADIAL_BLUR_SHADER = """
+struct RadialBlurParams {
+    light_uv_and_density: vec4f,
+    weight_decay_exposure_strength: vec4f,
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f,
+}
+
+@group(0) @binding(0) var occlusion_tex: texture_2d<f32>;
+@group(0) @binding(1) var occlusion_sampler: sampler;
+@group(0) @binding(2) var<uniform> params: RadialBlurParams;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2f, 3>(
+        vec2f(-1.0, -3.0),
+        vec2f(-1.0, 1.0),
+        vec2f(3.0, 1.0),
+    );
+    var out: VertexOutput;
+    let pos = positions[vertex_index];
+    out.position = vec4f(pos, 0.0, 1.0);
+    out.uv = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+    let light_uv = params.light_uv_and_density.xy;
+    let density = params.light_uv_and_density.z;
+    let weight = params.light_uv_and_density.w;
+    let decay = params.weight_decay_exposure_strength.x;
+    let exposure = params.weight_decay_exposure_strength.y;
+    let strength = params.weight_decay_exposure_strength.z;
+    let samples = u32(max(params.weight_decay_exposure_strength.w, 1.0));
+
+    var coord = input.uv;
+    let delta = (coord - light_uv) * density / f32(samples);
+    var illumination_decay = 1.0;
+    var accumulated = 0.0;
+    for (var i: u32 = 0u; i < samples; i = i + 1u) {
+        coord = coord - delta;
+        let sample_value = textureSample(occlusion_tex, occlusion_sampler, coord).r;
+        accumulated = accumulated + sample_value * illumination_decay * weight;
+        illumination_decay = illumination_decay * decay;
+    }
+
+    let source_visibility = textureSample(occlusion_tex, occlusion_sampler, input.uv).r;
+    let light_visibility = textureSample(occlusion_tex, occlusion_sampler, clamp(light_uv, vec2f(0.0, 0.0), vec2f(1.0, 1.0))).r;
+    let radial_dist = distance(input.uv, light_uv);
+    let sun_falloff = pow(clamp(1.0 - radial_dist / 1.35, 0.0, 1.0), 1.25);
+    let sun_halo = pow(clamp(1.0 - radial_dist / 0.42, 0.0, 1.0), 2.0);
+    let sun_core = pow(clamp(1.0 - radial_dist / 0.20, 0.0, 1.0), 6.0);
+    let haze_bias = 0.10;
+    let shafts = max((accumulated - haze_bias) * exposure * strength, 0.0) * source_visibility * sun_falloff;
+    let sun_visibility = max(light_visibility, source_visibility * 0.35);
+    let sun_disc = sun_visibility * strength * (sun_halo * 0.22 + sun_core * 0.45);
+    return vec4f(vec3f(shafts + sun_disc), 1.0);
+}
+"""
+
+
+COMPOSITE_SHADER = """
+struct CompositeParams {
+    light_uv_and_density: vec4f,
+    weight_decay_exposure_strength: vec4f,
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f,
+}
+
+@group(0) @binding(0) var scene_tex: texture_2d<f32>;
+@group(0) @binding(1) var shafts_tex: texture_2d<f32>;
+@group(0) @binding(2) var linear_sampler: sampler;
+@group(0) @binding(3) var occlusion_tex: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> params: CompositeParams;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2f, 3>(
+        vec2f(-1.0, -3.0),
+        vec2f(-1.0, 1.0),
+        vec2f(3.0, 1.0),
+    );
+    var out: VertexOutput;
+    let pos = positions[vertex_index];
+    out.position = vec4f(pos, 0.0, 1.0);
+    out.uv = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+    let scene = textureSample(scene_tex, linear_sampler, input.uv).rgb;
+    let shafts = textureSample(shafts_tex, linear_sampler, input.uv).rgb;
+    let combined_shafts = scene + shafts * (vec3f(1.0, 1.0, 1.0) - scene);
+
+    let light_uv = params.light_uv_and_density.xy;
+    let strength = params.weight_decay_exposure_strength.z;
+    let light_sample_uv = clamp(light_uv, vec2f(0.0, 0.0), vec2f(1.0, 1.0));
+    let light_visibility = textureSample(occlusion_tex, linear_sampler, light_sample_uv).r;
+    let radial_dist = distance(input.uv, light_uv);
+    let sun_halo = pow(clamp(1.0 - radial_dist / 0.24, 0.0, 1.0), 2.4);
+    let sun_core = pow(clamp(1.0 - radial_dist / 0.085, 0.0, 1.0), 7.0);
+    let sun_term = max(light_visibility, 0.35) * strength * (sun_halo * 0.35 + sun_core * 0.95);
+    let sun_color = vec3f(1.0, 0.96, 0.86);
+    let combined = combined_shafts + sun_color * sun_term * (vec3f(1.0, 1.0, 1.0) - combined_shafts);
+    return vec4f(combined, 1.0);
 }
 """
 

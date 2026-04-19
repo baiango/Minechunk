@@ -379,6 +379,7 @@ class MetalTerrainBackend:
         )
         self._write_buffer_bytes(self._params_buffer, payload)
 
+    @profile
     def surface_profile_at(self, x: int, z: int) -> tuple[int, int]:
         self._write_params(
             sample_origin_x=float(x),
@@ -404,6 +405,7 @@ class MetalTerrainBackend:
         material = int(self._buffer_uint32_view(self._single_materials_buffer, 1)[0])
         return height, material
 
+    @profile
     def fill_chunk_surface_grids(
         self,
         heights: np.ndarray,
@@ -434,12 +436,14 @@ class MetalTerrainBackend:
         heights[:] = self._buffer_uint32_view(self._grid_heights_buffer, self.cell_count)
         materials[:] = self._buffer_uint32_view(self._grid_materials_buffer, self.cell_count)
 
+    @profile
     def chunk_surface_grids(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
         heights = np.empty(self.cell_count, dtype=np.uint32)
         materials = np.empty(self.cell_count, dtype=np.uint32)
         self.fill_chunk_surface_grids(heights, materials, chunk_x, chunk_z)
         return heights, materials
 
+    @profile
     def request_chunk_surface_batch(self, chunks: list[tuple[int, int]]) -> int:
         job_id = self._next_job_id
         self._next_job_id += 1
@@ -447,6 +451,7 @@ class MetalTerrainBackend:
             self._pending_jobs.appendleft(list(chunks))
         return job_id
 
+    @profile
     def chunk_voxel_grid(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
         blocks = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint8)
         voxel_materials = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint32)
@@ -553,6 +558,7 @@ class MetalTerrainBackend:
         if batch.command_buffer is not None:
             batch.command_buffer.waitUntilCompleted()
 
+    @profile
     def poll_ready_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         ready: list[ChunkSurfaceResult] = []
         self._reclaim_batch_slots()
@@ -615,6 +621,7 @@ class MetalTerrainBackend:
     def request_chunk_voxel_batch(self, chunks: list[tuple[int, int]]) -> int:
         return self.request_chunk_surface_batch(chunks)
 
+    @profile
     def poll_ready_chunk_voxel_batches(self) -> list[ChunkVoxelResult]:
         ready: list[ChunkVoxelResult] = []
         for surface_result in self.poll_ready_chunk_surface_batches():
@@ -645,12 +652,14 @@ class MetalTerrainBackend:
     def has_pending_chunk_voxel_batches(self) -> bool:
         return self.has_pending_chunk_surface_batches()
 
+    @profile
     def flush_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         ready: list[ChunkSurfaceResult] = []
         while self.has_pending_chunk_surface_batches():
             ready.extend(self.poll_ready_chunk_surface_batches())
         return ready
 
+    @profile
     def flush_chunk_voxel_batches(self) -> list[ChunkVoxelResult]:
         ready: list[ChunkVoxelResult] = []
         while self.has_pending_chunk_voxel_batches():

@@ -24,6 +24,8 @@ class ChunkVoxelResult:
     materials: np.ndarray
     chunk_y: int = 0
     source: str = ""
+    top_boundary: np.ndarray | None = None
+    bottom_boundary: np.ndarray | None = None
 
 
 @dataclass(frozen=True)

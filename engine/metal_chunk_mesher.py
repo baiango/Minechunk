@@ -219,7 +219,8 @@ class MetalChunkMesher:
     def _i32_view(buffer, count: int) -> np.ndarray:
         return np.frombuffer(buffer.contents().as_buffer(count * 4), dtype=np.int32, count=count)
 
-    def submit_chunk_mesh_batch(
+@profile
+def submit_chunk_mesh_batch(
         self,
         renderer,
         chunk_results: list[ChunkVoxelResult],
@@ -417,6 +418,7 @@ class MetalChunkMesher:
         return resources
 
 
+@profile
 def _get_renderer_async_state_lock(renderer) -> threading.Lock:
     lock = getattr(renderer, "_metal_chunk_mesher_async_lock", None)
     if lock is not None:
@@ -429,6 +431,7 @@ def _get_renderer_async_state_lock(renderer) -> threading.Lock:
         return lock
 
 
+@profile
 def _ensure_renderer_async_state(renderer) -> None:
     lock = _get_renderer_async_state_lock(renderer)
     with lock:
@@ -442,6 +445,7 @@ def _ensure_renderer_async_state(renderer) -> None:
             setattr(renderer, "_metal_gpu_mesh_async_errors", deque())
 
 
+@profile
 def shutdown_renderer_async_state(renderer) -> None:
     completed_queue = getattr(renderer, "_metal_completed_gpu_mesh_batches", None)
     if completed_queue is not None:
@@ -477,6 +481,7 @@ def shutdown_renderer_async_state(renderer) -> None:
                 pass
 
 
+@profile
 def _register_pending_gpu_mesh_batch(renderer, resources: AsyncVoxelMeshBatchResources) -> None:
     _ensure_renderer_async_state(renderer)
     lock = _get_renderer_async_state_lock(renderer)
@@ -485,6 +490,7 @@ def _register_pending_gpu_mesh_batch(renderer, resources: AsyncVoxelMeshBatchRes
         pending.append(resources)
 
 
+@profile
 def _complete_gpu_mesh_batch(
     renderer,
     resources: AsyncVoxelMeshBatchResources,
@@ -566,6 +572,7 @@ def _start_background_mesher_init(renderer, metal_device, key: tuple[int, int, i
     return pending
 
 
+@profile
 def prewarm_metal_chunk_mesher(renderer) -> None:
     try:
         get_metal_chunk_mesher(renderer, block=False)
@@ -573,6 +580,7 @@ def prewarm_metal_chunk_mesher(renderer) -> None:
         return
 
 
+@profile
 def get_metal_chunk_mesher(renderer, *, block: bool = False, timeout: float | None = None) -> MetalChunkMesher | None:
     metal_device = _resolve_metal_device(renderer)
     if metal_device is None:
@@ -630,6 +638,7 @@ def get_metal_chunk_mesher(renderer, *, block: bool = False, timeout: float | No
                 return current
 
 
+@profile
 def submit_chunk_mesh_batch_async(
     renderer,
     chunk_results: list[ChunkVoxelResult],
@@ -641,6 +650,7 @@ def submit_chunk_mesh_batch_async(
     return mesher.submit_chunk_mesh_batch(renderer, chunk_results, on_complete)
 
 
+@profile
 def make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVoxelResult]):
     if not chunk_results:
         return []
@@ -661,6 +671,7 @@ def make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVoxelRe
 
 
 
+@profile
 def _build_completed_meshes_from_resources(renderer, resources: AsyncVoxelMeshBatchResources) -> list[object]:
     slot = resources.slot
     mesher = resources.mesher
@@ -720,6 +731,7 @@ def _build_completed_meshes_from_resources(renderer, resources: AsyncVoxelMeshBa
     return meshes
 
 
+@profile
 def _append_completed_meshes_to_renderer(renderer, meshes: list[object]) -> None:
     if not meshes or getattr(renderer, "_device_lost", False):
         return
@@ -812,6 +824,7 @@ def _append_completed_meshes_to_renderer(renderer, meshes: list[object]) -> None
         mesh_cache.store_chunk_meshes(renderer, chunk_meshes)
 
 
+@profile
 def process_gpu_buffer_cleanup(renderer) -> None:
     _ensure_renderer_async_state(renderer)
     cleanup_queue = getattr(renderer, "_metal_gpu_buffer_cleanup_queue")
@@ -823,6 +836,7 @@ def process_gpu_buffer_cleanup(renderer) -> None:
         destroy_async_voxel_mesh_batch_resources(resources)
 
 
+@profile
 def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> int:
     _ensure_renderer_async_state(renderer)
     process_gpu_buffer_cleanup(renderer)

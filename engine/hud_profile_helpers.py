@@ -419,14 +419,26 @@ def profile_average_fps(renderer) -> float:
 
 def record_frame_breakdown_sample(renderer, name: str, value: float) -> None:
     samples = renderer.frame_breakdown_samples.get(name)
-    if samples is not None:
-        samples.append(value)
+    if samples is None:
+        return
+    sample_sums = getattr(renderer, "frame_breakdown_sample_sums", None)
+    if sample_sums is None:
+        sample_sums = {key: float(sum(existing_samples)) for key, existing_samples in renderer.frame_breakdown_samples.items()}
+        renderer.frame_breakdown_sample_sums = sample_sums
+    if samples.maxlen is not None and len(samples) >= samples.maxlen:
+        sample_sums[name] -= float(samples[0])
+    value_f = float(value)
+    samples.append(value_f)
+    sample_sums[name] += value_f
 
 
 def frame_breakdown_average(renderer, name: str) -> float:
     samples = renderer.frame_breakdown_samples.get(name)
     if not samples:
         return 0.0
+    sample_sums = getattr(renderer, "frame_breakdown_sample_sums", None)
+    if sample_sums is not None:
+        return float(sample_sums.get(name, 0.0)) / max(1, len(samples))
     return sum(samples) / len(samples)
 
 
@@ -588,9 +600,15 @@ def refresh_profile_summary(renderer, now: float) -> None:
     renderer.profile_window_frame_times = []
 
 
-def refresh_frame_breakdown_summary(renderer) -> None:
+def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
     if not renderer.profiling_enabled:
         return
+    if now is None:
+        now = time.perf_counter()
+    next_refresh = float(getattr(renderer, "_frame_breakdown_next_refresh", 0.0))
+    if renderer.frame_breakdown_vertex_count > 0 and now < next_refresh:
+        return
+    renderer._frame_breakdown_next_refresh = float(now) + 0.2
     renderer_module = _renderer_module()
     avg_world_update = frame_breakdown_average(renderer, "world_update")
     avg_visibility_lookup = frame_breakdown_average(renderer, "visibility_lookup")

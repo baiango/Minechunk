@@ -12,6 +12,16 @@ MAX_VERTICES_PER_CHUNK = render_consts.MAX_VERTICES_PER_CHUNK
 VERTEX_STRIDE = render_consts.VERTEX_STRIDE
 LIGHT_DIRECTION = render_consts.LIGHT_DIRECTION
 DEPTH_FORMAT = render_consts.DEPTH_FORMAT
+POSTPROCESS_SCENE_FORMAT = render_consts.POSTPROCESS_SCENE_FORMAT
+POSTPROCESS_OCCLUSION_FORMAT = render_consts.POSTPROCESS_OCCLUSION_FORMAT
+POSTPROCESS_SHAFT_FORMAT = render_consts.POSTPROCESS_SHAFT_FORMAT
+VOLUMETRIC_LIGHTING_ENABLED = render_consts.VOLUMETRIC_LIGHTING_ENABLED
+VOLUMETRIC_LIGHTING_SAMPLES = render_consts.VOLUMETRIC_LIGHTING_SAMPLES
+VOLUMETRIC_LIGHTING_DENSITY = render_consts.VOLUMETRIC_LIGHTING_DENSITY
+VOLUMETRIC_LIGHTING_WEIGHT = render_consts.VOLUMETRIC_LIGHTING_WEIGHT
+VOLUMETRIC_LIGHTING_DECAY = render_consts.VOLUMETRIC_LIGHTING_DECAY
+VOLUMETRIC_LIGHTING_EXPOSURE = render_consts.VOLUMETRIC_LIGHTING_EXPOSURE
+VOLUMETRIC_LIGHTING_STRENGTH = render_consts.VOLUMETRIC_LIGHTING_STRENGTH
 ENGINE_MODE_CPU = render_consts.ENGINE_MODE_CPU
 ENGINE_MODE_WGPU = render_consts.ENGINE_MODE_WGPU
 ENGINE_MODE_METAL = render_consts.ENGINE_MODE_METAL
@@ -74,3 +84,9 @@ class Camera:
 engine_mode = ENGINE_MODE_METAL
 chunk_prep_request_budget_cap = 8 if engine_mode != ENGINE_MODE_CPU else 2
 chunk_prep_bootstrap_displayed_ratio_threshold = 0.05
+chunk_prep_use_screen_border_raycast = False
+chunk_prep_screen_raycast_max_distance_world = DEFAULT_RENDER_DISTANCE_WORLD
+chunk_prep_screen_raycast_pixel_stride = 32
+chunk_prep_screen_raycast_max_rays = 256
+chunk_prep_screen_raycast_position_quantize_world = BLOCK_SIZE * 8.0
+chunk_prep_screen_raycast_angle_quantize_radians = 0.08

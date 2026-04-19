@@ -247,17 +247,17 @@ def _should_carve_cave(
 
 
 @njit(cache=True, fastmath=True)
-def terrain_block_material_at(
+def _terrain_material_from_surface_profile(
     world_x: int,
     world_y: int,
     world_z: int,
+    surface_height: int,
+    surface_material: int,
     seed: int,
     world_height_limit: int,
 ) -> int:
     if world_y < 0 or world_y >= world_height_limit:
         return AIR
-
-    surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
     if world_y >= surface_height:
         return AIR
     if _should_carve_cave(world_x, world_y, world_z, surface_height, seed, world_height_limit):
@@ -269,6 +269,29 @@ def terrain_block_material_at(
     if world_y < surface_height - 1:
         return DIRT
     return surface_material
+
+
+@njit(cache=True, fastmath=True)
+def terrain_block_material_at(
+    world_x: int,
+    world_y: int,
+    world_z: int,
+    seed: int,
+    world_height_limit: int,
+) -> int:
+    if world_y < 0 or world_y >= world_height_limit:
+        return AIR
+
+    surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
+    return _terrain_material_from_surface_profile(
+        world_x,
+        world_y,
+        world_z,
+        int(surface_height),
+        int(surface_material),
+        seed,
+        world_height_limit,
+    )
 
 
 @njit(cache=True, fastmath=True)
@@ -494,8 +517,18 @@ def fill_chunk_voxel_grid(
         world_z = origin_z + local_z
         for local_x in range(sample_size):
             world_x = origin_x + local_x
-            for y in range(height_limit):
-                material = terrain_block_material_at(world_x, y, world_z, seed, height_limit)
+            surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, height_limit)
+            solid_limit = min(height_limit, int(surface_height))
+            for y in range(solid_limit):
+                material = _terrain_material_from_surface_profile(
+                    world_x,
+                    y,
+                    world_z,
+                    int(surface_height),
+                    int(surface_material),
+                    seed,
+                    height_limit,
+                )
                 if material == AIR:
                     continue
                 blocks[y, local_z, local_x] = 1
@@ -523,9 +556,22 @@ def fill_stacked_chunk_voxel_grid(
         world_z = origin_z + local_z
         for local_x in range(sample_size):
             world_x = origin_x + local_x
-            for local_y in range(local_height):
-                world_y = origin_y + local_y
-                material = terrain_block_material_at(world_x, world_y, world_z, seed, world_height_limit)
+            surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
+            fill_start_y = max(origin_y, 0)
+            fill_end_y = min(origin_y + local_height, world_height_limit, int(surface_height))
+            if fill_end_y <= fill_start_y:
+                continue
+            for world_y in range(fill_start_y, fill_end_y):
+                local_y = world_y - origin_y
+                material = _terrain_material_from_surface_profile(
+                    world_x,
+                    world_y,
+                    world_z,
+                    int(surface_height),
+                    int(surface_material),
+                    seed,
+                    world_height_limit,
+                )
                 if material == AIR:
                     continue
                 blocks[local_y, local_z, local_x] = 1
@@ -553,11 +599,103 @@ def fill_stacked_chunk_vertical_neighbor_planes(
         world_z = origin_z + local_z
         for local_x in range(sample_size):
             world_x = origin_x + local_x
-            if 0 <= top_world_y < world_height_limit:
-                if terrain_block_material_at(world_x, top_world_y, world_z, seed, world_height_limit) != AIR:
+            surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
+            solid_surface_height = int(surface_height)
+            solid_surface_material = int(surface_material)
+            if 0 <= top_world_y < world_height_limit and top_world_y < solid_surface_height:
+                if _terrain_material_from_surface_profile(
+                    world_x,
+                    top_world_y,
+                    world_z,
+                    solid_surface_height,
+                    solid_surface_material,
+                    seed,
+                    world_height_limit,
+                ) != AIR:
                     top_plane[local_z, local_x] = 1
-            if 0 <= bottom_world_y < world_height_limit:
-                if terrain_block_material_at(world_x, bottom_world_y, world_z, seed, world_height_limit) != AIR:
+            if 0 <= bottom_world_y < world_height_limit and bottom_world_y < solid_surface_height:
+                if _terrain_material_from_surface_profile(
+                    world_x,
+                    bottom_world_y,
+                    world_z,
+                    solid_surface_height,
+                    solid_surface_material,
+                    seed,
+                    world_height_limit,
+                ) != AIR:
+                    bottom_plane[local_z, local_x] = 1
+
+
+@njit(cache=True, fastmath=True)
+def fill_stacked_chunk_voxel_grid_with_neighbor_planes(
+    blocks: np.ndarray,
+    materials: np.ndarray,
+    top_plane: np.ndarray,
+    bottom_plane: np.ndarray,
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+    chunk_size: int,
+    seed: int,
+    world_height_limit: int,
+) -> None:
+    sample_size = chunk_size + 2
+    origin_x = chunk_x * chunk_size - 1
+    origin_z = chunk_z * chunk_size - 1
+    origin_y = chunk_y * chunk_size
+    local_height = blocks.shape[0]
+    top_world_y = origin_y + local_height
+    bottom_world_y = origin_y - 1
+
+    for local_z in range(sample_size):
+        world_z = origin_z + local_z
+        for local_x in range(sample_size):
+            world_x = origin_x + local_x
+            surface_height, surface_material = surface_profile_at(float(world_x), float(world_z), seed, world_height_limit)
+            solid_surface_height = int(surface_height)
+            solid_surface_material = int(surface_material)
+
+            fill_start_y = max(origin_y, 0)
+            fill_end_y = min(origin_y + local_height, world_height_limit, solid_surface_height)
+            if fill_end_y > fill_start_y:
+                for world_y in range(fill_start_y, fill_end_y):
+                    local_y = world_y - origin_y
+                    material = _terrain_material_from_surface_profile(
+                        world_x,
+                        world_y,
+                        world_z,
+                        solid_surface_height,
+                        solid_surface_material,
+                        seed,
+                        world_height_limit,
+                    )
+                    if material == AIR:
+                        continue
+                    blocks[local_y, local_z, local_x] = 1
+                    materials[local_y, local_z, local_x] = material
+
+            if 0 <= top_world_y < world_height_limit and top_world_y < solid_surface_height:
+                if _terrain_material_from_surface_profile(
+                    world_x,
+                    top_world_y,
+                    world_z,
+                    solid_surface_height,
+                    solid_surface_material,
+                    seed,
+                    world_height_limit,
+                ) != AIR:
+                    top_plane[local_z, local_x] = 1
+
+            if 0 <= bottom_world_y < world_height_limit and bottom_world_y < solid_surface_height:
+                if _terrain_material_from_surface_profile(
+                    world_x,
+                    bottom_world_y,
+                    world_z,
+                    solid_surface_height,
+                    solid_surface_material,
+                    seed,
+                    world_height_limit,
+                ) != AIR:
                     bottom_plane[local_z, local_x] = 1
 
 

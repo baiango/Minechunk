@@ -217,6 +217,7 @@ def destroy_async_voxel_mesh_batch_resources(resources) -> None:
             pass
 
 
+@profile
 def acquire_async_voxel_mesh_batch_resources(renderer, sample_size: int, height_limit: int, chunk_count: int):
     target_chunk_count = max(1, int(chunk_count))
     pool_size = len(renderer._async_voxel_mesh_batch_pool)
@@ -228,6 +229,7 @@ def acquire_async_voxel_mesh_batch_resources(renderer, sample_size: int, height_
     return create_async_voxel_mesh_batch_resources(renderer, sample_size, height_limit, target_chunk_count)
 
 
+@profile
 def release_async_voxel_mesh_batch_resources(renderer, resources) -> None:
     if len(renderer._async_voxel_mesh_batch_pool) >= renderer._async_voxel_mesh_batch_pool_limit:
         destroy_async_voxel_mesh_batch_resources(resources)
@@ -249,6 +251,7 @@ def schedule_gpu_buffer_cleanup(renderer, buffers: list[wgpu.GPUBuffer], frames:
         renderer._gpu_mesh_deferred_buffer_cleanup.append((max(1, int(frames)), list(buffers)))
 
 
+@profile
 def process_gpu_buffer_cleanup(renderer) -> None:
     if renderer._gpu_mesh_deferred_buffer_cleanup:
         next_queue: deque[tuple[int, list[wgpu.GPUBuffer]]] = deque()
@@ -345,6 +348,7 @@ def pending_surface_gpu_batches_chunk_count(renderer) -> int:
     return int(renderer._pending_surface_gpu_batches_chunk_total)
 
 
+@profile
 def enqueue_surface_gpu_batches_for_meshing(renderer, surface_batches: list[ChunkSurfaceGpuBatch]) -> None:
     if not surface_batches:
         return
@@ -359,6 +363,7 @@ def enqueue_surface_gpu_batches_for_meshing(renderer, surface_batches: list[Chun
     renderer._pending_surface_gpu_batches_chunk_total += chunk_total
 
 
+@profile
 def drain_pending_surface_gpu_batches_to_meshing(renderer) -> None:
     if not renderer._pending_surface_gpu_batches:
         renderer._pending_surface_gpu_batches_chunk_total = 0
@@ -392,6 +397,7 @@ def drain_pending_surface_gpu_batches_to_meshing(renderer) -> None:
         make_chunk_mesh_batches_from_surface_gpu_batches(renderer, submit_batches)
 
 
+@profile
 def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
     renderer,
     chunk_coords: list[tuple[int, int]],
@@ -485,6 +491,7 @@ def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
     )
 
 
+@profile
 def read_chunk_mesh_batch_metadata(renderer, chunk_totals_buffer, chunk_offsets_buffer, chunk_count: int, *, include_offsets: bool = False):
     if chunk_count <= 0:
         empty = np.empty(0, dtype=np.uint32)
@@ -518,6 +525,7 @@ def read_chunk_mesh_batch_metadata(renderer, chunk_totals_buffer, chunk_offsets_
     return totals, offsets
 
 
+@profile
 def make_chunk_mesh_batch_from_voxels(
     renderer,
     chunk_results: list[ChunkVoxelResult],
@@ -600,6 +608,7 @@ def make_chunk_mesh_batch_from_voxels(
     )
 
 
+@profile
 def make_chunk_mesh_batch_from_gpu_buffers(
     renderer,
     chunk_coords: list[tuple[int, int]],
@@ -773,6 +782,7 @@ def make_chunk_mesh_batch_from_gpu_buffers(
     return meshes
 
 
+@profile
 def make_chunk_mesh_batch_from_surface_gpu_batch(
     renderer,
     surface_batch: ChunkSurfaceGpuBatch,

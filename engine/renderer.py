@@ -12,8 +12,11 @@ from . import hud_profile_helpers as hud_profile
 from . import mesh_cache_helpers as mesh_cache
 from .renderer_config import *
 from .render_shaders import (
+    COMPOSITE_SHADER,
     GPU_VISIBILITY_SHADER,
     HUD_SHADER,
+    OCCLUSION_MASK_SHADER,
+    RADIAL_BLUR_SHADER,
     RENDER_SHADER,
     TILE_MERGE_SHADER,
     VOXEL_MESH_BATCH_SHADER,
@@ -22,6 +25,7 @@ from .render_shaders import (
 from .render_utils import (
     clamp,
     cross3,
+    dot3,
     flat_forward_vector,
     forward_vector,
     normalize3,
@@ -152,6 +156,24 @@ class TerrainRenderer:
         self.depth_texture = None
         self.depth_view = None
         self.depth_size = (0, 0)
+        self.volumetric_lighting_enabled = bool(VOLUMETRIC_LIGHTING_ENABLED)
+        self._postprocess_size = (0, 0)
+        self.scene_color_texture = None
+        self.scene_color_view = None
+        self.occlusion_mask_texture = None
+        self.occlusion_mask_view = None
+        self.volumetric_shaft_texture = None
+        self.volumetric_shaft_view = None
+        self.postprocess_sampler = None
+        self.radial_blur_params_buffer = None
+        self.radial_blur_bind_group_layout = None
+        self.radial_blur_pipeline = None
+        self.radial_blur_bind_group = None
+        self.composite_bind_group_layout = None
+        self.composite_pipeline = None
+        self.composite_bind_group = None
+        self.scene_render_pipeline = None
+        self.occlusion_mask_pipeline = None
         # Fixed target render radius in chunk units.
         self.chunk_radius = max(1, int(DEFAULT_RENDER_DISTANCE_CHUNKS))
         self.vertical_chunk_radius = max(0, int(VERTICAL_CHUNK_RENDER_RADIUS)) if VERTICAL_CHUNK_STACK_ENABLED else 0
@@ -165,8 +187,10 @@ class TerrainRenderer:
         self._visible_tile_masks: dict[tuple[int, int], int] = {}
         self._visible_displayed_coords: set[tuple[int, int, int]] = set()
         self._visible_missing_coords: set[tuple[int, int, int]] = set()
+        self._chunk_request_target_coords: set[tuple[int, int, int]] = set()
         self._chunk_request_queue: deque[tuple[int, int, int]] = deque()
         self._chunk_request_queue_origin: tuple[int, int, int] | None = None
+        self._chunk_request_queue_view_signature: tuple | None = None
         self._chunk_request_queue_dirty = True
         self._pending_chunk_coords: set[tuple[int, int, int]] = set()
         self._transient_render_buffers: list[list[wgpu.GPUBuffer]] = []
@@ -176,6 +200,7 @@ class TerrainRenderer:
         self._visible_layout_version = 0
         self._tile_mutation_version = 0
         self._cached_tile_draw_batches: dict[tuple[int, int, int], tuple[list[ChunkDrawBatch], int, int, int]] = {}
+        self._cached_visible_render_batches: dict[tuple[int, int, int], tuple[float, list[tuple[wgpu.GPUBuffer, int, int, int]], int, int, int, int]] = {}
         self._mesh_buffer_refs: dict[int, int] = {}
         self._mesh_output_slabs: OrderedDict[int, MeshOutputSlab] = OrderedDict()
         self._mesh_allocations: dict[int, MeshBufferAllocation] = {}
@@ -240,6 +265,7 @@ class TerrainRenderer:
         self.profiling_enabled = False
         self.profile_window_start = 0.0
         self.profile_next_report = 0.0
+        self._frame_breakdown_next_refresh = 0.0
         self.profile_window_cpu_ms = 0.0
         self.profile_window_frames = 0
         self.profile_window_frame_times: list[float] = []
@@ -270,11 +296,14 @@ class TerrainRenderer:
             "pending_chunk_requests": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "voxel_mesh_backlog": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
         }
+        self.frame_breakdown_sample_sums: dict[str, float] = {name: 0.0 for name in self.frame_breakdown_samples}
         self.frame_breakdown_lines: list[str] = []
         self.frame_breakdown_vertex_bytes = b""
         self.frame_breakdown_vertex_count = 0
         self.frame_breakdown_vertex_buffer = None
         self.frame_breakdown_vertex_buffer_capacity = 0
+        self._frame_breakdown_next_refresh = 0.0
+        self._solid_block_cache: dict[tuple[int, int, int], bool] = {}
         self._last_frame_draw_calls = 0
         self._last_frame_merged_batches = 0
         self._last_new_displayed_chunks = 0
@@ -310,6 +339,18 @@ class TerrainRenderer:
         self._tile_merge_dummy_buffer = self.device.create_buffer(
             size=VERTEX_STRIDE,
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
+        )
+        self.radial_blur_params_buffer = self.device.create_buffer(
+            size=32,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        self.postprocess_sampler = self.device.create_sampler(
+            address_mode_u="clamp-to-edge",
+            address_mode_v="clamp-to-edge",
+            address_mode_w="clamp-to-edge",
+            mag_filter="linear",
+            min_filter="linear",
+            mipmap_filter="linear",
         )
 
         self.voxel_mesh_count_bind_group_layout = self.device.create_bind_group_layout(
@@ -545,6 +586,54 @@ class TerrainRenderer:
                 }
             ],
         )
+        self.radial_blur_bind_group_layout = self.device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "sampler": {"type": "filtering"},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+            ],
+        )
+        self.composite_bind_group_layout = self.device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "sampler": {"type": "filtering"},
+                },
+                {
+                    "binding": 3,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+                },
+                {
+                    "binding": 4,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+            ],
+        )
 
         if self.tile_merge_bind_group_layout is not None:
             try:
@@ -630,6 +719,105 @@ class TerrainRenderer:
                 "depth_compare": "less",
             },
         )
+        self.scene_render_pipeline = self.device.create_render_pipeline(
+            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.render_bind_group_layout]),
+            vertex={
+                "module": self.device.create_shader_module(code=RENDER_SHADER),
+                "entry_point": "vs_main",
+                "buffers": [
+                    {
+                        "array_stride": VERTEX_STRIDE,
+                        "step_mode": "vertex",
+                        "attributes": [
+                            {"shader_location": 0, "offset": 0, "format": "float32x4"},
+                            {"shader_location": 1, "offset": 16, "format": "float32x4"},
+                            {"shader_location": 2, "offset": 32, "format": "float32x4"},
+                        ],
+                    }
+                ],
+            },
+            fragment={
+                "module": self.device.create_shader_module(code=RENDER_SHADER),
+                "entry_point": "fs_main",
+                "targets": [{"format": POSTPROCESS_SCENE_FORMAT}],
+            },
+            primitive={
+                "topology": "triangle-list",
+                "cull_mode": "none",
+            },
+            depth_stencil={
+                "format": DEPTH_FORMAT,
+                "depth_write_enabled": True,
+                "depth_compare": "less",
+            },
+        )
+        self.occlusion_mask_pipeline = self.device.create_render_pipeline(
+            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.render_bind_group_layout]),
+            vertex={
+                "module": self.device.create_shader_module(code=OCCLUSION_MASK_SHADER),
+                "entry_point": "vs_main",
+                "buffers": [
+                    {
+                        "array_stride": VERTEX_STRIDE,
+                        "step_mode": "vertex",
+                        "attributes": [
+                            {"shader_location": 0, "offset": 0, "format": "float32x4"},
+                            {"shader_location": 1, "offset": 16, "format": "float32x4"},
+                            {"shader_location": 2, "offset": 32, "format": "float32x4"},
+                        ],
+                    }
+                ],
+            },
+            fragment={
+                "module": self.device.create_shader_module(code=OCCLUSION_MASK_SHADER),
+                "entry_point": "fs_main",
+                "targets": [{"format": POSTPROCESS_OCCLUSION_FORMAT}],
+            },
+            primitive={
+                "topology": "triangle-list",
+                "cull_mode": "none",
+            },
+            depth_stencil={
+                "format": DEPTH_FORMAT,
+                "depth_write_enabled": True,
+                "depth_compare": "less",
+            },
+        )
+        self.radial_blur_pipeline = self.device.create_render_pipeline(
+            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.radial_blur_bind_group_layout]),
+            vertex={
+                "module": self.device.create_shader_module(code=RADIAL_BLUR_SHADER),
+                "entry_point": "vs_main",
+                "buffers": [],
+            },
+            fragment={
+                "module": self.device.create_shader_module(code=RADIAL_BLUR_SHADER),
+                "entry_point": "fs_main",
+                "targets": [{"format": POSTPROCESS_SHAFT_FORMAT}],
+            },
+            primitive={
+                "topology": "triangle-list",
+                "cull_mode": "none",
+            },
+        )
+        self.composite_pipeline = self.device.create_render_pipeline(
+            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.composite_bind_group_layout]),
+            vertex={
+                "module": self.device.create_shader_module(code=COMPOSITE_SHADER),
+                "entry_point": "vs_main",
+                "buffers": [],
+            },
+            fragment={
+                "module": self.device.create_shader_module(code=COMPOSITE_SHADER),
+                "entry_point": "fs_main",
+                "targets": [{"format": self.color_format}],
+            },
+            primitive={
+                "topology": "triangle-list",
+                "cull_mode": "none",
+            },
+        )
+
         self.profile_hud_pipeline = self.device.create_render_pipeline(
             layout=self.device.create_pipeline_layout(bind_group_layouts=[]),
             vertex={
@@ -718,6 +906,15 @@ class TerrainRenderer:
         self.depth_size = (0, 0)
         self.depth_texture = None
         self.depth_view = None
+        self._postprocess_size = (0, 0)
+        self.scene_color_texture = None
+        self.scene_color_view = None
+        self.occlusion_mask_texture = None
+        self.occlusion_mask_view = None
+        self.volumetric_shaft_texture = None
+        self.volumetric_shaft_view = None
+        self.radial_blur_bind_group = None
+        self.composite_bind_group = None
         if self.profiling_enabled and self.profile_hud_lines:
             self.profile_hud_vertex_bytes, self.profile_hud_vertex_count = hud_profile.build_profile_hud_vertices(self, self.profile_hud_lines)
         if self.profiling_enabled and self.frame_breakdown_lines:
@@ -799,11 +996,13 @@ class TerrainRenderer:
         self.profile_window_cpu_ms = 0.0
         self.profile_window_frames = 0
         self.profile_window_frame_times = []
-        for samples in self.frame_breakdown_samples.values():
+        for name, samples in self.frame_breakdown_samples.items():
             samples.clear()
+            self.frame_breakdown_sample_sums[name] = 0.0
         self.profile_hud_lines = []
         self.profile_hud_vertex_bytes = b""
         self.profile_hud_vertex_count = 0
+        self._frame_breakdown_next_refresh = now
         self.frame_breakdown_lines = [
             f"FRAME BREAKDOWN @ DIMENSION {self.render_dimension_chunks}x{self.render_dimension_chunks} CHUNKS",
             "CPU FRAME ISSUE: --.- MS",
@@ -834,6 +1033,7 @@ class TerrainRenderer:
         self.profiling_enabled = False
         self.profile_window_start = 0.0
         self.profile_next_report = 0.0
+        self._frame_breakdown_next_refresh = 0.0
         self.profile_window_cpu_ms = 0.0
         self.profile_window_frames = 0
         self.profile_window_frame_times = []
@@ -844,8 +1044,9 @@ class TerrainRenderer:
         self.frame_breakdown_vertex_bytes = b""
         self.frame_breakdown_vertex_count = 0
         self._hud_geometry_cache.clear()
-        for samples in self.frame_breakdown_samples.values():
+        for name, samples in self.frame_breakdown_samples.items():
             samples.clear()
+            self.frame_breakdown_sample_sums[name] = 0.0
 
     def _describe_render_api(self) -> str:
         info = getattr(self.adapter, "info", None)
@@ -910,14 +1111,17 @@ class TerrainRenderer:
             return int(value)
         return ((int(value) + alignment - 1) // alignment) * alignment
 
+    @profile
     def regenerate_world(self) -> None:
         for mesh in self.chunk_cache.values():
             mesh_cache.release_chunk_mesh_storage(self, mesh)
         self.chunk_cache.clear()
         self._mesh_buffer_refs.clear()
         self._pending_chunk_coords.clear()
+        self._chunk_request_target_coords.clear()
         self._chunk_request_queue.clear()
         self._chunk_request_queue_origin = None
+        self._chunk_request_queue_view_signature = None
         self._chunk_request_queue_dirty = True
         self._pending_voxel_mesh_results.clear()
         self._pending_surface_gpu_batches.clear()
@@ -963,6 +1167,7 @@ class TerrainRenderer:
         mesh_cache.clear_tile_render_batches(self)
         self._clear_transient_render_buffers()
         self._visible_chunk_origin = None
+        self._cached_visible_render_batches.clear()
         try:
             metal_mesher.shutdown_renderer_async_state(self)
         except Exception:
@@ -1034,7 +1239,13 @@ class TerrainRenderer:
     def _is_block_solid(self, bx: int, by: int, bz: int) -> bool:
         if by < 0:
             return True
-        return int(self.world.block_at(int(bx), int(by), int(bz))) != int(AIR)
+        key = (int(bx), int(by), int(bz))
+        cached = self._solid_block_cache.get(key)
+        if cached is not None:
+            return bool(cached)
+        is_solid = int(self.world.block_at(key[0], key[1], key[2])) != int(AIR)
+        self._solid_block_cache[key] = bool(is_solid)
+        return bool(is_solid)
 
     def _resolve_collision_axis(self, position: list[float], axis: int, delta: float) -> bool:
         if abs(delta) <= 1e-9:
@@ -1127,6 +1338,7 @@ class TerrainRenderer:
             return True
         return False
 
+    @profile
     def _update_camera_fly(self, dt: float) -> None:
         sprinting = self._key_active("shift", "shiftleft", "shiftright")
         speed = SPRINT_FLY_SPEED if sprinting else self.camera.move_speed
@@ -1160,7 +1372,9 @@ class TerrainRenderer:
             self.camera.position[1] += move[1] * scale
             self.camera.position[2] += move[2] * scale
 
+    @profile
     def _update_camera_walk(self, dt: float) -> None:
+        self._solid_block_cache.clear()
         sprinting = self._key_active("shift", "shiftleft", "shiftright")
         speed = WALK_SPRINT_SPEED if sprinting else self.camera.move_speed
         self._current_move_speed = float(speed)
@@ -1212,6 +1426,7 @@ class TerrainRenderer:
 
         self.camera.position[:] = position
 
+    @profile
     def _update_camera(self, dt: float) -> None:
         if self.walk_mode:
             self._update_camera_walk(dt)
@@ -1312,6 +1527,7 @@ class TerrainRenderer:
     def _apply_visible_chunk_coord_delta(self, new_origin: tuple[int, int, int]) -> bool:
         return False
 
+    @profile
     def _refresh_visible_chunk_coords(self) -> None:
         new_origin = (
             int(self.camera.position[0] // CHUNK_WORLD_SIZE),
@@ -1324,6 +1540,7 @@ class TerrainRenderer:
         self._rebuild_visible_tile_layout_from_coords()
         self._visible_layout_version += 1
         self._cached_tile_draw_batches.clear()
+        self._cached_visible_render_batches.clear()
 
     def _warn_if_visible_exceeds_cache(self) -> None:
         visible_count = len(self._visible_chunk_coords)
@@ -1335,6 +1552,92 @@ class TerrainRenderer:
             f"({self.max_cached_chunks}). Expect missing chunks, evictions, or flashing.",
             file=sys.stderr,
         )
+
+    def _ensure_postprocess_targets(self) -> None:
+        width, height = self.canvas.get_physical_size()
+        target_size = (max(1, int(width)), max(1, int(height)))
+        if target_size == self._postprocess_size and self.scene_color_view is not None and self.occlusion_mask_view is not None and self.volumetric_shaft_view is not None:
+            return
+        self._postprocess_size = target_size
+        texture_usage = wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.TEXTURE_BINDING
+        self.scene_color_texture = self.device.create_texture(
+            size=(target_size[0], target_size[1], 1),
+            format=POSTPROCESS_SCENE_FORMAT,
+            usage=texture_usage,
+        )
+        self.scene_color_view = self.scene_color_texture.create_view()
+        self.occlusion_mask_texture = self.device.create_texture(
+            size=(target_size[0], target_size[1], 1),
+            format=POSTPROCESS_OCCLUSION_FORMAT,
+            usage=texture_usage,
+        )
+        self.occlusion_mask_view = self.occlusion_mask_texture.create_view()
+        self.volumetric_shaft_texture = self.device.create_texture(
+            size=(target_size[0], target_size[1], 1),
+            format=POSTPROCESS_SHAFT_FORMAT,
+            usage=texture_usage,
+        )
+        self.volumetric_shaft_view = self.volumetric_shaft_texture.create_view()
+        self.radial_blur_bind_group = self.device.create_bind_group(
+            layout=self.radial_blur_bind_group_layout,
+            entries=[
+                {"binding": 0, "resource": self.occlusion_mask_view},
+                {"binding": 1, "resource": self.postprocess_sampler},
+                {"binding": 2, "resource": {"buffer": self.radial_blur_params_buffer, "offset": 0, "size": 32}},
+            ],
+        )
+        self.composite_bind_group = self.device.create_bind_group(
+            layout=self.composite_bind_group_layout,
+            entries=[
+                {"binding": 0, "resource": self.scene_color_view},
+                {"binding": 1, "resource": self.volumetric_shaft_view},
+                {"binding": 2, "resource": self.postprocess_sampler},
+                {"binding": 3, "resource": self.occlusion_mask_view},
+                {"binding": 4, "resource": {"buffer": self.radial_blur_params_buffer, "offset": 0, "size": 32}},
+            ],
+        )
+
+    def _project_directional_light_to_screen(self, right, up, forward) -> tuple[tuple[float, float], float]:
+        light_dir = normalize3(tuple(float(v) for v in LIGHT_DIRECTION))
+        view_x = dot3(light_dir, right)
+        view_y = dot3(light_dir, up)
+        view_z = dot3(light_dir, forward)
+        if view_z <= 0.001:
+            return (0.5, 0.5), 0.0
+        width, height = self.canvas.get_physical_size()
+        aspect = max(1.0, float(width) / max(1.0, float(height)))
+        focal = 1.0 / math.tan(math.radians(90.0) * 0.5)
+        ndc_x = view_x * focal / (aspect * view_z)
+        ndc_y = view_y * focal / view_z
+        uv_x = ndc_x * 0.5 + 0.5
+        uv_y = 0.5 - ndc_y * 0.5
+        edge = max(abs(ndc_x), abs(ndc_y))
+        edge_fade = clamp(1.0 - max(0.0, edge - 1.05) / 0.95, 0.0, 1.0)
+        forward_strength = clamp(view_z * 1.5, 0.0, 1.0)
+        strength = max(forward_strength * edge_fade, 0.42 if edge_fade > 0.0 else 0.0)
+        return (uv_x, uv_y), strength
+
+    def _draw_visible_batches_to_pass(self, render_pass, visible_batches, use_gpu_visibility: bool, use_indirect: bool) -> None:
+        if use_gpu_visibility or use_indirect:
+            indirect_buffer = self._mesh_draw_indirect_buffer
+            assert indirect_buffer is not None
+            for vertex_buffer, binding_offset, batch_start, batch_count in visible_batches:
+                render_pass.set_vertex_buffer(0, vertex_buffer, binding_offset)
+                if wgpu_native_multi_draw_indirect is not None and batch_count > 1:
+                    wgpu_native_multi_draw_indirect(
+                        render_pass,
+                        indirect_buffer,
+                        offset=batch_start * INDIRECT_DRAW_COMMAND_STRIDE,
+                        count=batch_count,
+                    )
+                    continue
+                for batch_index in range(batch_count):
+                    indirect_offset = (batch_start + batch_index) * INDIRECT_DRAW_COMMAND_STRIDE
+                    render_pass.draw_indirect(indirect_buffer, indirect_offset)
+        else:
+            for vertex_buffer, binding_offset, vertex_count, first_vertex in visible_batches:
+                render_pass.set_vertex_buffer(0, vertex_buffer, binding_offset)
+                render_pass.draw(vertex_count, 1, first_vertex, 0)
 
     @profile
     def _submit_render(self):
@@ -1407,48 +1710,129 @@ class TerrainRenderer:
         current_texture = self.context.get_current_texture()
         swapchain_acquire_ms = (time.perf_counter() - acquire_start) * 1000.0
         color_view = current_texture.create_view()
-        render_pass = encoder.begin_render_pass(
-            color_attachments=[
-                {
-                    "view": color_view,
-                    "resolve_target": None,
-                    "clear_value": (0.60, 0.80, 0.98, 1.0),
-                    "load_op": wgpu.LoadOp.clear,
-                    "store_op": wgpu.StoreOp.store,
-                }
-            ],
-            depth_stencil_attachment={
-                "view": self.depth_view,
-                "depth_clear_value": 1.0,
-                "depth_load_op": wgpu.LoadOp.clear,
-                "depth_store_op": wgpu.StoreOp.store,
-            },
-        )
-        render_pass.set_pipeline(self.render_pipeline)
-        render_pass.set_bind_group(0, self.camera_bind_group)
 
-        if use_gpu_visibility or use_indirect:
-            indirect_buffer = self._mesh_draw_indirect_buffer
-            assert indirect_buffer is not None
-            for vertex_buffer, binding_offset, batch_start, batch_count in visible_batches:
-                render_pass.set_vertex_buffer(0, vertex_buffer, binding_offset)
-                if wgpu_native_multi_draw_indirect is not None and batch_count > 1:
-                    wgpu_native_multi_draw_indirect(
-                        render_pass,
-                        indirect_buffer,
-                        offset=batch_start * INDIRECT_DRAW_COMMAND_STRIDE,
-                        count=batch_count,
-                    )
-                    continue
-                for batch_index in range(batch_count):
-                    indirect_offset = (batch_start + batch_index) * INDIRECT_DRAW_COMMAND_STRIDE
-                    render_pass.draw_indirect(indirect_buffer, indirect_offset)
+        if self.volumetric_lighting_enabled:
+            self._ensure_postprocess_targets()
+            assert self.scene_color_view is not None
+            assert self.occlusion_mask_view is not None
+            assert self.volumetric_shaft_view is not None
+            assert self.scene_render_pipeline is not None
+            assert self.occlusion_mask_pipeline is not None
+            assert self.radial_blur_pipeline is not None
+            assert self.composite_pipeline is not None
+            assert self.radial_blur_bind_group is not None
+            assert self.composite_bind_group is not None
+
+            scene_pass = encoder.begin_render_pass(
+                color_attachments=[
+                    {
+                        "view": self.scene_color_view,
+                        "resolve_target": None,
+                        "clear_value": (0.60, 0.80, 0.98, 1.0),
+                        "load_op": wgpu.LoadOp.clear,
+                        "store_op": wgpu.StoreOp.store,
+                    }
+                ],
+                depth_stencil_attachment={
+                    "view": self.depth_view,
+                    "depth_clear_value": 1.0,
+                    "depth_load_op": wgpu.LoadOp.clear,
+                    "depth_store_op": wgpu.StoreOp.store,
+                },
+            )
+            scene_pass.set_pipeline(self.scene_render_pipeline)
+            scene_pass.set_bind_group(0, self.camera_bind_group)
+            self._draw_visible_batches_to_pass(scene_pass, visible_batches, use_gpu_visibility, use_indirect)
+            scene_pass.end()
+
+            mask_pass = encoder.begin_render_pass(
+                color_attachments=[
+                    {
+                        "view": self.occlusion_mask_view,
+                        "resolve_target": None,
+                        "clear_value": (1.0, 1.0, 1.0, 1.0),
+                        "load_op": wgpu.LoadOp.clear,
+                        "store_op": wgpu.StoreOp.store,
+                    }
+                ],
+                depth_stencil_attachment={
+                    "view": self.depth_view,
+                    "depth_clear_value": 1.0,
+                    "depth_load_op": wgpu.LoadOp.clear,
+                    "depth_store_op": wgpu.StoreOp.store,
+                },
+            )
+            mask_pass.set_pipeline(self.occlusion_mask_pipeline)
+            mask_pass.set_bind_group(0, self.camera_bind_group)
+            self._draw_visible_batches_to_pass(mask_pass, visible_batches, use_gpu_visibility, use_indirect)
+            mask_pass.end()
+
+            light_uv, light_strength = self._project_directional_light_to_screen(right, up, forward)
+            radial_params = np.array([
+                light_uv[0],
+                light_uv[1],
+                float(VOLUMETRIC_LIGHTING_DENSITY),
+                float(VOLUMETRIC_LIGHTING_WEIGHT),
+                float(VOLUMETRIC_LIGHTING_DECAY),
+                float(VOLUMETRIC_LIGHTING_EXPOSURE),
+                float(VOLUMETRIC_LIGHTING_STRENGTH) * float(light_strength),
+                float(VOLUMETRIC_LIGHTING_SAMPLES),
+            ], dtype=np.float32)
+            self.device.queue.write_buffer(self.radial_blur_params_buffer, 0, radial_params.tobytes())
+
+            blur_pass = encoder.begin_render_pass(
+                color_attachments=[
+                    {
+                        "view": self.volumetric_shaft_view,
+                        "resolve_target": None,
+                        "clear_value": (0.0, 0.0, 0.0, 1.0),
+                        "load_op": wgpu.LoadOp.clear,
+                        "store_op": wgpu.StoreOp.store,
+                    }
+                ],
+            )
+            blur_pass.set_pipeline(self.radial_blur_pipeline)
+            blur_pass.set_bind_group(0, self.radial_blur_bind_group)
+            blur_pass.draw(3, 1, 0, 0)
+            blur_pass.end()
+
+            composite_pass = encoder.begin_render_pass(
+                color_attachments=[
+                    {
+                        "view": color_view,
+                        "resolve_target": None,
+                        "clear_value": (0.0, 0.0, 0.0, 1.0),
+                        "load_op": wgpu.LoadOp.clear,
+                        "store_op": wgpu.StoreOp.store,
+                    }
+                ],
+            )
+            composite_pass.set_pipeline(self.composite_pipeline)
+            composite_pass.set_bind_group(0, self.composite_bind_group)
+            composite_pass.draw(3, 1, 0, 0)
+            composite_pass.end()
         else:
-            for vertex_buffer, vertex_count, vertex_offset in visible_batches:
-                render_pass.set_vertex_buffer(0, vertex_buffer, vertex_offset)
-                render_pass.draw(vertex_count, 1, 0, 0)
-
-        render_pass.end()
+            render_pass = encoder.begin_render_pass(
+                color_attachments=[
+                    {
+                        "view": color_view,
+                        "resolve_target": None,
+                        "clear_value": (0.60, 0.80, 0.98, 1.0),
+                        "load_op": wgpu.LoadOp.clear,
+                        "store_op": wgpu.StoreOp.store,
+                    }
+                ],
+                depth_stencil_attachment={
+                    "view": self.depth_view,
+                    "depth_clear_value": 1.0,
+                    "depth_load_op": wgpu.LoadOp.clear,
+                    "depth_store_op": wgpu.StoreOp.store,
+                },
+            )
+            render_pass.set_pipeline(self.render_pipeline)
+            render_pass.set_bind_group(0, self.camera_bind_group)
+            self._draw_visible_batches_to_pass(render_pass, visible_batches, use_gpu_visibility, use_indirect)
+            render_pass.end()
         stats = {
             "camera_upload_ms": camera_upload_ms,
             "visibility_lookup_ms": 0.0,
@@ -1467,6 +1851,7 @@ class TerrainRenderer:
             return True
         return exc.__class__.__name__ == "GPUValidationError" and "lost" in text.lower()
 
+    @profile
     def draw_frame(self) -> None:
         frame_start = time.perf_counter()
         now = frame_start
@@ -1522,7 +1907,7 @@ class TerrainRenderer:
             hud_profile.record_frame_breakdown_sample(self, "visible_chunks", float(visible_chunks))
             hud_profile.record_frame_breakdown_sample(self, "pending_chunk_requests", float(len(self._pending_chunk_coords)))
 
-            hud_profile.refresh_frame_breakdown_summary(self)
+            hud_profile.refresh_frame_breakdown_summary(self, frame_start)
         except Exception as exc:
             if self._is_device_lost_error(exc):
                 self._device_lost = True
