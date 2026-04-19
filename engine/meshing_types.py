@@ -89,6 +89,7 @@ class ChunkRenderBatch:
     merged_chunk_count: int = 0
     visible_vertex_count: int = 0
     owns_vertex_buffer: bool = False
+    owned_vertex_buffer_capacity_bytes: int = 0
     allocation_id: int | None = None
 
 

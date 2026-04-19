@@ -1296,6 +1296,7 @@ def _store_cached_tile_render_batch(
     merged_chunk_count: int,
     visible_vertex_count: int,
     owns_vertex_buffer: bool,
+    owned_vertex_buffer_capacity_bytes: int = 0,
 ) -> ChunkRenderBatch:
     old_buffer = existing.vertex_buffer if (existing is not None and getattr(existing, "owns_vertex_buffer", False)) else None
     batch = ChunkRenderBatch(
@@ -1316,6 +1317,7 @@ def _store_cached_tile_render_batch(
         merged_chunk_count=int(merged_chunk_count),
         visible_vertex_count=int(visible_vertex_count),
         owns_vertex_buffer=bool(owns_vertex_buffer),
+        owned_vertex_buffer_capacity_bytes=int(owned_vertex_buffer_capacity_bytes),
     )
     renderer._tile_render_batches[tile_key_value] = batch
     renderer._tile_dirty_keys.discard(tile_key_value)
@@ -1622,6 +1624,7 @@ def build_tile_draw_batches(
 
         signature = tuple((mesh.chunk_x, getattr(mesh, "chunk_y", 0), mesh.chunk_z) for mesh in mature_meshes)
         batch_vertex_count = sum(mesh.vertex_count for mesh in mature_meshes)
+        batch_vertex_bytes = int(batch_vertex_count) * int(renderer_module.VERTEX_STRIDE)
         batch_bounds = merge_chunk_bounds(renderer, mature_meshes)
         rebuild_merged = (
             existing is None
@@ -1633,16 +1636,30 @@ def build_tile_draw_batches(
             or not getattr(existing, "owns_vertex_buffer", False)
         )
         merged_buffer = existing.vertex_buffer if not rebuild_merged else None
+        merged_buffer_capacity_bytes = int(batch_vertex_bytes)
+        if not rebuild_merged and existing is not None:
+            merged_buffer_capacity_bytes = int(
+                getattr(existing, "owned_vertex_buffer_capacity_bytes", batch_vertex_bytes)
+                or batch_vertex_bytes
+            )
         if rebuild_merged:
             reuse_merged_buffer = None
+            reuse_capacity_bytes = 0
             if (
                 existing is not None
                 and getattr(existing, "owns_vertex_buffer", False)
                 and existing.vertex_buffer is not None
-                and int(existing.vertex_count) == int(batch_vertex_count)
             ):
-                reuse_merged_buffer = existing.vertex_buffer
+                existing_capacity_bytes = int(
+                    getattr(existing, "owned_vertex_buffer_capacity_bytes", 0)
+                    or (int(existing.vertex_count) * int(renderer_module.VERTEX_STRIDE))
+                )
+                if existing_capacity_bytes >= batch_vertex_bytes:
+                    reuse_merged_buffer = existing.vertex_buffer
+                    reuse_capacity_bytes = existing_capacity_bytes
             merged_buffer = merge_tile_meshes(renderer, mature_meshes, encoder, reuse_merged_buffer)
+            if reuse_merged_buffer is not None and reuse_capacity_bytes > 0:
+                merged_buffer_capacity_bytes = reuse_capacity_bytes
 
         tile_draw_batches: list[ChunkDrawBatch] = [
             ChunkDrawBatch(
@@ -1690,6 +1707,7 @@ def build_tile_draw_batches(
             merged_chunk_count=len(mature_meshes),
             visible_vertex_count=tile_visible_vertex_count,
             owns_vertex_buffer=True,
+            owned_vertex_buffer_capacity_bytes=merged_buffer_capacity_bytes,
         )
         if direct_render_batch_groups is not None:
             _extend_grouped_render_batch_groups(direct_render_batch_groups, batch.cached_grouped_render_batches)
