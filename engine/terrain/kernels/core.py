@@ -991,6 +991,67 @@ def _ao_z_from_planes(
     return _ambient_occlusion_factor(side1, side2, corner)
 
 
+FACE_TOP = np.uint8(1)
+FACE_BOTTOM = np.uint8(2)
+FACE_EAST = np.uint8(4)
+FACE_WEST = np.uint8(8)
+FACE_SOUTH = np.uint8(16)
+FACE_NORTH = np.uint8(32)
+
+
+@njit(cache=True, fastmath=True)
+def _build_chunk_face_masks_with_boundaries(
+    blocks: np.ndarray,
+    chunk_size: int,
+    height_limit: int,
+    top_boundary: np.ndarray,
+    bottom_boundary: np.ndarray,
+) -> tuple[np.ndarray, int]:
+    sample_size = chunk_size + 2
+    end = sample_size - 1
+    last_y = height_limit - 1
+    face_masks = np.zeros((height_limit, sample_size, sample_size), dtype=np.uint8)
+    vertex_count = 0
+
+    for y in range(height_limit):
+        plane = blocks[y]
+        plane_above = blocks[y + 1] if y < last_y else top_boundary
+        plane_below = blocks[y - 1] if y > 0 else bottom_boundary
+        for local_z in range(1, end):
+            row = plane[local_z]
+            row_north = plane[local_z - 1]
+            row_south = plane[local_z + 1]
+            row_above = plane_above[local_z]
+            row_below = plane_below[local_z]
+            mask_row = face_masks[y, local_z]
+            for local_x in range(1, end):
+                if row[local_x] == 0:
+                    continue
+
+                mask = np.uint8(0)
+                if row_above[local_x] == 0:
+                    mask |= FACE_TOP
+                    vertex_count += VERTICES_PER_FACE
+                if row_below[local_x] == 0:
+                    mask |= FACE_BOTTOM
+                    vertex_count += VERTICES_PER_FACE
+                if row[local_x + 1] == 0:
+                    mask |= FACE_EAST
+                    vertex_count += VERTICES_PER_FACE
+                if row[local_x - 1] == 0:
+                    mask |= FACE_WEST
+                    vertex_count += VERTICES_PER_FACE
+                if row_south[local_x] == 0:
+                    mask |= FACE_SOUTH
+                    vertex_count += VERTICES_PER_FACE
+                if row_north[local_x] == 0:
+                    mask |= FACE_NORTH
+                    vertex_count += VERTICES_PER_FACE
+                mask_row[local_x] = mask
+
+    return face_masks, vertex_count
+
+
 @njit(cache=True, fastmath=True)
 def build_chunk_vertex_array_from_voxels_with_boundaries(
     blocks: np.ndarray,
@@ -1004,7 +1065,7 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
     block_size: float = 1.0,
     chunk_y: int = 0,
 ) -> tuple[np.ndarray, int]:
-    vertex_count = count_chunk_voxel_vertices_with_boundaries(blocks, chunk_size, height_limit, top_boundary, bottom_boundary)
+    face_masks, vertex_count = _build_chunk_face_masks_with_boundaries(blocks, chunk_size, height_limit, top_boundary, bottom_boundary)
     vertices = np.empty((vertex_count, VERTEX_COMPONENTS), dtype=np.float32)
     if vertex_count == 0:
         return vertices, 0
@@ -1021,6 +1082,7 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
     for y in range(height_limit):
         plane = blocks[y]
         mat_plane = materials[y]
+        mask_plane = face_masks[y]
         plane_above = blocks[y + 1] if y < last_y else top_boundary
         plane_below = blocks[y - 1] if y > 0 else bottom_boundary
         y0 = origin_y + float(y) * step
@@ -1030,6 +1092,7 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
         for local_z in range(1, end):
             row = plane[local_z]
             row_mat = mat_plane[local_z]
+            row_mask = mask_plane[local_z]
             row_north = plane[local_z - 1]
             row_south = plane[local_z + 1]
             row_above = plane_above[local_z]
@@ -1043,13 +1106,8 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                     continue
 
                 x1 = x0 + step
-                top_empty = row_above[local_x] == 0
-                bottom_empty = row_below[local_x] == 0
-                east_empty = row[local_x + 1] == 0
-                west_empty = row[local_x - 1] == 0
-                south_empty = row_south[local_x] == 0
-                north_empty = row_north[local_x] == 0
-                if not (top_empty or bottom_empty or east_empty or west_empty or south_empty or north_empty):
+                mask = row_mask[local_x]
+                if mask == 0:
                     x0 = x1
                     continue
 
@@ -1081,7 +1139,7 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         cg = 0.54
                         cb = 0.22
 
-                if top_empty:
+                if mask & FACE_TOP:
                     top_r = cr
                     top_g = cg
                     top_b = cb
@@ -1103,7 +1161,7 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         top_r * ao3, top_g * ao3, top_b * ao3,
                     )
 
-                if bottom_empty:
+                if mask & FACE_BOTTOM:
                     bottom_r = cr * 0.50
                     bottom_g = cg * 0.50
                     bottom_b = cb * 0.50
@@ -1125,7 +1183,7 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         bottom_r * ao3, bottom_g * ao3, bottom_b * ao3,
                     )
 
-                if east_empty:
+                if mask & FACE_EAST:
                     east_r = cr * 0.80
                     east_g = cg * 0.80
                     east_b = cb * 0.80
@@ -1148,7 +1206,7 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         east_r * ao3, east_g * ao3, east_b * ao3,
                     )
 
-                if west_empty:
+                if mask & FACE_WEST:
                     west_r = cr * 0.64
                     west_g = cg * 0.64
                     west_b = cb * 0.64
@@ -1171,7 +1229,7 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         west_r * ao3, west_g * ao3, west_b * ao3,
                     )
 
-                if south_empty:
+                if mask & FACE_SOUTH:
                     south_r = cr * 0.72
                     south_g = cg * 0.72
                     south_b = cb * 0.72
@@ -1194,7 +1252,7 @@ def build_chunk_vertex_array_from_voxels_with_boundaries(
                         south_r * ao3, south_g * ao3, south_b * ao3,
                     )
 
-                if north_empty:
+                if mask & FACE_NORTH:
                     north_r = cr * 0.60
                     north_g = cg * 0.60
                     north_b = cb * 0.60
