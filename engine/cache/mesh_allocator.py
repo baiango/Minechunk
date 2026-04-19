@@ -9,16 +9,16 @@ import time
 import numpy as np
 import wgpu
 
-from . import render_constants as render_consts
-from .meshing_types import ChunkDrawBatch, ChunkMesh, ChunkRenderBatch, MeshBufferAllocation, MeshOutputSlab
-from . import wgpu_chunk_mesher as wgpu_mesher
+from .. import render_constants as render_consts
+from ..meshing_types import ChunkDrawBatch, ChunkMesh, ChunkRenderBatch, MeshBufferAllocation, MeshOutputSlab
+from ..meshing import gpu_mesher as wgpu_mesher
 
 
 MERGED_TILE_AGE_REFRESH_INTERVAL_SECONDS = 0.25
 
 
 def _renderer_module():
-    from . import renderer as renderer_module
+    from .. import renderer as renderer_module
 
     return renderer_module
 
@@ -531,6 +531,7 @@ def clear_tile_render_batches(renderer) -> None:
     renderer._tile_dirty_keys.clear()
     renderer._visible_tile_dirty_keys.clear()
     renderer._visible_tile_key_set.clear()
+    renderer._visible_active_tile_key_set.clear()
     renderer._tile_versions.clear()
     renderer._tile_mutation_version += 1
     renderer._visible_tile_mutation_version += 1
@@ -556,8 +557,10 @@ def _refresh_visible_tile_active_meshes_for_key(renderer, tile_key_value, slots)
     active_meshes = [mesh for mesh in slots if mesh is not None and mesh.vertex_count > 0]
     if active_meshes:
         renderer._visible_tile_active_meshes[tile_key_value] = active_meshes
+        renderer._visible_active_tile_key_set.add(tile_key_value)
     else:
         renderer._visible_tile_active_meshes.pop(tile_key_value, None)
+        renderer._visible_active_tile_key_set.discard(tile_key_value)
 
 
 def _remove_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
@@ -570,6 +573,7 @@ def _remove_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
         return
     if not active_meshes:
         renderer._visible_tile_active_meshes.pop(tile_key_value, None)
+        renderer._visible_active_tile_key_set.discard(tile_key_value)
 
 
 def _append_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
@@ -578,6 +582,7 @@ def _append_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
     active_meshes = renderer._visible_tile_active_meshes.get(tile_key_value)
     if active_meshes is None:
         renderer._visible_tile_active_meshes[tile_key_value] = [mesh]
+        renderer._visible_active_tile_key_set.add(tile_key_value)
     else:
         active_meshes.append(mesh)
 
@@ -1129,9 +1134,9 @@ def build_tile_draw_batches(
         visible_tile_dirty_keys = renderer._visible_tile_dirty_keys
         visible_active_tile_keys = getattr(renderer, "_visible_active_tile_keys", None) or ()
         if not visible_tile_dirty_keys:
-            tile_iterable = list(visible_active_tile_keys)
+            tile_iterable = visible_active_tile_keys
         else:
-            active_key_set = set(visible_active_tile_keys)
+            active_key_set = getattr(renderer, "_visible_active_tile_key_set", None) or set(visible_active_tile_keys)
             tile_iterable = list(visible_active_tile_keys)
             tile_iterable.extend(
                 tile_key_value

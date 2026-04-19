@@ -15,8 +15,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
-from .terrain_kernels import (
+from ..types import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
+from ...terrain.kernels import (
     fill_chunk_surface_grids as cpu_fill_chunk_surface_grids,
     fill_chunk_voxel_grid as cpu_fill_chunk_voxel_grid,
     surface_profile_at as cpu_surface_profile_at,

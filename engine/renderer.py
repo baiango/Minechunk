@@ -7,9 +7,9 @@ from collections import OrderedDict, deque
 
 import numpy as np
 import wgpu
-from . import chunk_generation_helpers as chunk_gen
-from . import hud_profile_helpers as hud_profile
-from . import mesh_cache_helpers as mesh_cache
+from .pipelines import chunk_pipeline as chunk_gen
+from .pipelines import profiling as hud_profile
+from .cache import mesh_allocator as mesh_cache
 from .renderer_config import *
 from .render_shaders import (
     COMPOSITE_SHADER,
@@ -32,8 +32,8 @@ from .render_utils import (
     pack_camera_uniform,
     right_vector,
 )
-from . import wgpu_chunk_mesher as wgpu_mesher
-from . import metal_chunk_mesher as metal_mesher
+from .meshing import gpu_mesher as wgpu_mesher
+from .meshing import metal_mesher as metal_mesher
 try:
     from wgpu.backends.wgpu_native import multi_draw_indirect as wgpu_native_multi_draw_indirect
 except Exception:
@@ -57,9 +57,9 @@ from .world_constants import (
     VERTICAL_CHUNK_RENDER_RADIUS,
     VERTICAL_CHUNK_STACK_ENABLED,
 )
-from .voxel_world import VoxelWorld
-from .terrain_backend import ChunkSurfaceGpuBatch
-from .terrain_kernels import AIR
+from .terrain.world import VoxelWorld
+from .terrain.types import ChunkSurfaceGpuBatch
+from .terrain.kernels import AIR
 
 try:
     profile  # type: ignore[name-defined]
@@ -147,6 +147,8 @@ class TerrainRenderer:
             )
         self._log_backend_diagnostics()
 
+        self.pipeline = chunk_gen.ChunkPipeline(self)
+
         spawn_y = self._default_camera_spawn_y()
         self.camera = Camera(position=[0.0, spawn_y, 0.0], yaw=math.pi, pitch=-1.20)
         self.keys_down: set[str] = set()
@@ -190,7 +192,8 @@ class TerrainRenderer:
         self._visible_layout_template_cache: dict[tuple[int, int, int, int, int, int], tuple] = {}
         self._visible_rel_xz_order_cache: dict[tuple[int], tuple[tuple[int, int], ...]] = {}
         self._visible_tile_mesh_slots: dict[tuple[int, int, int], list[ChunkMesh | None]] = {}
-        self._visible_tile_active_meshes: dict[tuple[int, int, int], tuple[ChunkMesh, ...]] = {}
+        self._visible_tile_active_meshes: dict[tuple[int, int, int], list[ChunkMesh]] = {}
+        self._visible_active_tile_key_set: set[tuple[int, int, int]] = set()
         self._visible_tile_slot_index_cache: dict[tuple[int, int, int], dict[tuple[int, int, int], int]] = {}
         self._visible_rel_coord_to_tile_slot: dict[tuple[int, int, int], tuple[tuple[int, int, int], int]] = {}
         self._visible_rel_tile_slot_sizes: dict[tuple[int, int, int], int] = {}
@@ -1207,6 +1210,8 @@ class TerrainRenderer:
                 file=sys.stderr,
             )
         self._log_backend_diagnostics()
+
+        self.pipeline = chunk_gen.ChunkPipeline(self)
         self.camera.position[:] = [0.0, self._default_camera_spawn_y(), 0.0]
         self.camera.yaw = math.pi
         self.camera.pitch = -1.20
@@ -1489,6 +1494,14 @@ class TerrainRenderer:
             self._walk_velocity[1] = float(PLAYER_JUMP_SPEED_METERS)
             self._camera_on_ground = False
         self._jump_queued = False
+
+        if self._camera_on_ground and desired_dx == 0.0 and desired_dz == 0.0 and self._walk_velocity[1] <= 0.0:
+            position = [float(self.camera.position[0]), float(self.camera.position[1]), float(self.camera.position[2])]
+            if self._resolve_small_downward_snap(position, -float(PLAYER_GROUND_SNAP_METERS)):
+                self._walk_velocity[1] = 0.0
+                self.camera.position[:] = position
+                return
+
         self._walk_velocity[1] -= float(PLAYER_GRAVITY_METERS) * dt
 
         position = [float(self.camera.position[0]), float(self.camera.position[1]), float(self.camera.position[2])]
@@ -1797,19 +1810,10 @@ class TerrainRenderer:
 
         shifted_visible_coords = False
         if previous_origin is not None and self._visible_chunk_coords:
-            dx = int(new_origin[0]) - int(previous_origin[0])
-            dy = int(new_origin[1]) - int(previous_origin[1])
-            dz = int(new_origin[2]) - int(previous_origin[2])
-            if dx == 0 and dy == 0 and dz == 0:
-                shifted_visible_coords = True
-            else:
-                visible_coords = self._visible_chunk_coords
-                visible_coord_set = self._visible_chunk_coord_set
-                if visible_coord_set and len(visible_coord_set) == len(visible_coords):
-                    shifted_coords = [(chunk_x + dx, chunk_y + dy, chunk_z + dz) for chunk_x, chunk_y, chunk_z in visible_coords]
-                    self._visible_chunk_coords = shifted_coords
-                    self._visible_chunk_coord_set = {(chunk_x + dx, chunk_y + dy, chunk_z + dz) for chunk_x, chunk_y, chunk_z in visible_coord_set}
-                    shifted_visible_coords = True
+            visible_coord_set = self._visible_chunk_coord_set
+            visible_coords = self._visible_chunk_coords
+            if visible_coord_set and len(visible_coord_set) == len(visible_coords):
+                shifted_visible_coords = self._apply_visible_chunk_coord_delta(new_origin)
         self._visible_chunk_origin = new_origin
 
         if shifted_visible_coords:
@@ -1831,6 +1835,7 @@ class TerrainRenderer:
         # duplicates bookkeeping on every origin hop.
         self._visible_tile_mesh_slots = {}
         self._visible_tile_active_meshes = {}
+        self._visible_active_tile_key_set = set()
         self._visible_tile_slot_index_cache = {}
 
         chunk_cache = self.chunk_cache
@@ -1852,10 +1857,11 @@ class TerrainRenderer:
             active_list.append(mesh)
 
         self._visible_tile_active_meshes = visible_tile_active_meshes
-        active_tile_key_set = set(visible_tile_active_meshes)
-        self._visible_active_tile_keys = [tile_key_value for tile_key_value in self._visible_tile_keys if tile_key_value in active_tile_key_set]
+        self._visible_active_tile_key_set = set(visible_tile_active_meshes)
+        self._visible_active_tile_keys = [tile_key_value for tile_key_value in self._visible_tile_keys if tile_key_value in visible_tile_active_meshes]
 
         self._visible_prefetched_displayed_coords = displayed_coords
+        self._visible_displayed_coords = set(displayed_coords)
         self._visible_tile_dirty_keys = {
             key for key in self._tile_dirty_keys if key in self._visible_tile_key_set
         }
@@ -2196,7 +2202,7 @@ class TerrainRenderer:
             self._update_camera(dt)
             world_update_ms = (time.perf_counter() - update_start) * 1000.0
 
-            visibility_lookup_ms = chunk_gen.refresh_visible_chunk_set(self)
+            visibility_lookup_ms = self.pipeline.refresh_visibility()
             encoder, color_view, render_stats = self._submit_render()
             visibility_lookup_ms += render_stats["visibility_lookup_ms"]
             camera_upload_ms = render_stats["camera_upload_ms"]
@@ -2218,8 +2224,8 @@ class TerrainRenderer:
             self.device.queue.submit([command_buffer])
             queue_submit_ms = (time.perf_counter() - queue_submit_start) * 1000.0
 
-            chunk_gen.service_background_gpu_work(self)
-            _, chunk_stream_ms = chunk_gen.prepare_chunks(self, dt)
+            self.pipeline.service_background_gpu_work()
+            _, chunk_stream_ms = self.pipeline.prepare_chunks(dt)
 
             wall_frame_ms = (time.perf_counter() - frame_start) * 1000.0
 
@@ -2249,7 +2255,7 @@ class TerrainRenderer:
                     hud_profile.profile_end_frame(self, profile_started_at, 0.0)
                 return
             try:
-                chunk_gen.service_background_gpu_work(self)
+                self.pipeline.service_background_gpu_work()
             except Exception:
                 pass
             try:

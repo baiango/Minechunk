@@ -1,23 +1,20 @@
 from __future__ import annotations
 
 from collections import deque
-import math
 import sys
 import time
 
 import numpy as np
 import wgpu
 
-from . import mesh_cache_helpers as mesh_cache
-from .meshing_types import ChunkMesh
-from .terrain_backend import ChunkVoxelResult
-from .terrain_kernels import (
-    build_chunk_vertex_array_from_voxels,
-    build_chunk_vertex_array_from_voxels_with_boundaries,
-    fill_stacked_chunk_vertical_neighbor_planes,
-)
-from . import wgpu_chunk_mesher as wgpu_mesher
-from . import metal_chunk_mesher as metal_mesher
+from ..cache import mesh_allocator as mesh_cache
+from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_voxels, cpu_make_chunk_mesh_from_voxels
+from ..meshing import gpu_mesher as wgpu_mesher
+from ..meshing import metal_mesher
+from ..meshing_types import ChunkMesh
+from ..terrain.types import ChunkVoxelResult
+from ..visibility.coord_manager import refresh_visible_chunk_set, rebuild_visible_missing_tracking
+from . import terrain_stage, meshing_stage, visibility_stage, render_stage, collision_stage, cache_stage, profiling
 
 try:
     profile  # type: ignore[name-defined]
@@ -25,12 +22,10 @@ except NameError:  # pragma: no cover - only used outside kernprof
     def profile(func):
         return func
 
-
 def _renderer_module():
-    from . import renderer as renderer_module
+    from .. import renderer as renderer_module
 
     return renderer_module
-
 
 def _terrain_mesher(renderer):
     terrain_label = renderer.world.terrain_backend_label()
@@ -38,8 +33,6 @@ def _terrain_mesher(renderer):
         return metal_mesher
     return wgpu_mesher
 
-
-@profile
 def chunk_prep_priority(renderer, chunk_x: int, chunk_y: int, chunk_z: int, camera_chunk_x: int, camera_chunk_y: int, camera_chunk_z: int) -> tuple[float, int, int, int]:
     dx = chunk_x - camera_chunk_x
     dy = chunk_y - camera_chunk_y
@@ -47,309 +40,6 @@ def chunk_prep_priority(renderer, chunk_x: int, chunk_y: int, chunk_z: int, came
     distance_sq = float(dx * dx + dz * dz + (dy * dy * 4))
     return (distance_sq, abs(dy), abs(dz), abs(dx))
 
-
-def _shared_empty_chunk_vertex_buffer(renderer) -> wgpu.GPUBuffer:
-    buffer = getattr(renderer, "_shared_empty_chunk_vertex_buffer", None)
-    if buffer is not None:
-        return buffer
-    buffer = renderer.device.create_buffer(
-        size=max(1, int(_renderer_module().VERTEX_STRIDE)),
-        usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
-    )
-    setattr(renderer, "_shared_empty_chunk_vertex_buffer", buffer)
-    return buffer
-
-
-@profile
-def make_chunk_mesh_fast(
-    renderer,
-    *,
-    chunk_x: int,
-    chunk_y: int,
-    chunk_z: int,
-    vertex_count: int,
-    vertex_buffer: wgpu.GPUBuffer,
-    vertex_offset: int,
-    max_height: int,
-    created_at: float,
-    allocation_id: int | None,
-) -> ChunkMesh:
-    renderer_module = _renderer_module()
-    chunk_world_size = float(renderer_module.CHUNK_WORLD_SIZE)
-    vertex_stride = int(renderer_module.VERTEX_STRIDE)
-    half_chunk = chunk_world_size * 0.5
-    half_height = float(max_height) * float(renderer_module.BLOCK_SIZE) * 0.5
-    radius = float(math.sqrt(half_chunk * half_chunk * 2.0 + half_height * half_height))
-    binding_offset = int(vertex_offset % vertex_stride)
-    first_vertex = int((vertex_offset - binding_offset) // vertex_stride)
-
-    mesh = ChunkMesh.__new__(ChunkMesh)
-    mesh.chunk_x = int(chunk_x)
-    mesh.chunk_y = int(chunk_y)
-    mesh.chunk_z = int(chunk_z)
-    mesh.vertex_count = int(vertex_count)
-    mesh.vertex_buffer = vertex_buffer
-    mesh.max_height = int(max_height)
-    mesh.vertex_offset = int(vertex_offset)
-    mesh.created_at = float(created_at)
-    mesh.allocation_id = allocation_id
-    mesh.bounds = (
-        float(int(chunk_x) * chunk_world_size + half_chunk),
-        float((int(chunk_y) * renderer_module.CHUNK_SIZE) * renderer_module.BLOCK_SIZE + half_height),
-        float(int(chunk_z) * chunk_world_size + half_chunk),
-        radius,
-    )
-    mesh.binding_offset = binding_offset
-    mesh.first_vertex = first_vertex
-    return mesh
-
-
-@profile
-def _stacked_vertical_neighbor_planes(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid) -> tuple[np.ndarray, np.ndarray]:
-    renderer_module = _renderer_module()
-    sample_size = int(renderer_module.CHUNK_SIZE) + 2
-    plane_dtype = getattr(voxel_grid, "dtype", np.uint32)
-    top_plane = np.zeros((sample_size, sample_size), dtype=plane_dtype)
-    bottom_plane = np.zeros((sample_size, sample_size), dtype=plane_dtype)
-    if not getattr(renderer_module, "VERTICAL_CHUNK_STACK_ENABLED", False):
-        return top_plane, bottom_plane
-    fill_stacked_chunk_vertical_neighbor_planes(
-        top_plane,
-        bottom_plane,
-        int(chunk_x),
-        int(chunk_y),
-        int(chunk_z),
-        int(renderer_module.CHUNK_SIZE),
-        int(renderer.world.seed),
-        int(renderer.world.height),
-    )
-    return top_plane, bottom_plane
-
-
-_EMPTY_VERTEX_ARRAY = np.empty((0, int(getattr(_renderer_module(), "VERTEX_COMPONENTS", 12))), dtype=np.float32)
-
-
-@profile
-def build_chunk_vertex_array(
-    renderer,
-    voxel_grid,
-    material_grid,
-    chunk_x: int,
-    chunk_y: int,
-    chunk_z: int,
-    top_plane: np.ndarray | None = None,
-    bottom_plane: np.ndarray | None = None,
-) -> tuple[np.ndarray, int, int]:
-    renderer_module = _renderer_module()
-    chunk_max_height = int(chunk_y * renderer_module.CHUNK_SIZE + voxel_grid.shape[0])
-    if not np.any(voxel_grid):
-        return _EMPTY_VERTEX_ARRAY, 0, chunk_max_height
-    if top_plane is None or bottom_plane is None:
-        top_plane, bottom_plane = _stacked_vertical_neighbor_planes(renderer, chunk_x, chunk_y, chunk_z, voxel_grid)
-    if np.all(voxel_grid) and np.all(top_plane) and np.all(bottom_plane):
-        return _EMPTY_VERTEX_ARRAY, 0, chunk_max_height
-    vertex_array, vertex_count = build_chunk_vertex_array_from_voxels_with_boundaries(
-        voxel_grid,
-        material_grid,
-        chunk_x,
-        chunk_z,
-        renderer_module.CHUNK_SIZE,
-        int(voxel_grid.shape[0]),
-        top_plane,
-        bottom_plane,
-        float(renderer_module.BLOCK_SIZE),
-        int(chunk_y),
-    )
-    used_vertex_count = int(vertex_count)
-    used_vertex_array = vertex_array[:used_vertex_count]
-    if getattr(voxel_grid, "ndim", 0) != 3:
-        chunk_max_height = int(chunk_y * renderer_module.CHUNK_SIZE + np.max(voxel_grid))
-    return used_vertex_array, used_vertex_count, chunk_max_height
-
-
-@profile
-def cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVoxelResult]) -> list[ChunkMesh]:
-    if not chunk_results:
-        return []
-
-    if len(chunk_results) == 1:
-        result = chunk_results[0]
-        chunk_x = int(result.chunk_x)
-        chunk_y = int(getattr(result, "chunk_y", 0))
-        chunk_z = int(result.chunk_z)
-        chunk_max_height = int(chunk_y * _renderer_module().CHUNK_SIZE + result.blocks.shape[0])
-        created_at = time.perf_counter()
-        if bool(getattr(result, "is_empty", False)):
-            return [
-                make_chunk_mesh_fast(
-                    renderer,
-                    chunk_x=chunk_x,
-                    chunk_y=chunk_y,
-                    chunk_z=chunk_z,
-                    vertex_count=0,
-                    vertex_buffer=_shared_empty_chunk_vertex_buffer(renderer),
-                    vertex_offset=0,
-                    max_height=int(chunk_max_height),
-                    created_at=created_at,
-                    allocation_id=None,
-                )
-            ]
-        vertex_array, vertex_count, chunk_max_height = build_chunk_vertex_array(
-            renderer,
-            result.blocks,
-            result.materials,
-            chunk_x,
-            chunk_y,
-            chunk_z,
-            getattr(result, "top_boundary", None),
-            getattr(result, "bottom_boundary", None),
-        )
-        if int(vertex_count) <= 0:
-            return [
-                make_chunk_mesh_fast(
-                    renderer,
-                    chunk_x=chunk_x,
-                    chunk_y=chunk_y,
-                    chunk_z=chunk_z,
-                    vertex_count=0,
-                    vertex_buffer=_shared_empty_chunk_vertex_buffer(renderer),
-                    vertex_offset=0,
-                    max_height=int(chunk_max_height),
-                    created_at=created_at,
-                    allocation_id=None,
-                )
-            ]
-        vertex_bytes = int(vertex_count) * int(_renderer_module().VERTEX_STRIDE)
-        batch_allocation = mesh_cache.allocate_mesh_output_range(renderer, vertex_bytes)
-        batch_buffer = batch_allocation.buffer
-        batch_offset = batch_allocation.offset_bytes
-        renderer.device.queue.write_buffer(batch_buffer, batch_offset, memoryview(vertex_array.view(np.uint8).reshape(-1)))
-        return [
-            make_chunk_mesh_fast(
-                renderer,
-                chunk_x=chunk_x,
-                chunk_y=chunk_y,
-                chunk_z=chunk_z,
-                vertex_count=int(vertex_count),
-                vertex_buffer=batch_buffer,
-                vertex_offset=batch_offset,
-                max_height=int(chunk_max_height),
-                created_at=created_at,
-                allocation_id=batch_allocation.allocation_id,
-            )
-        ]
-
-    built_chunks: list[tuple[int, int, int, np.ndarray, int, int, int]] = []
-    total_vertex_bytes = 0
-    created_at = time.perf_counter()
-
-    for result in chunk_results:
-        chunk_x = int(result.chunk_x)
-        chunk_y = int(getattr(result, "chunk_y", 0))
-        chunk_z = int(result.chunk_z)
-        top_plane = getattr(result, "top_boundary", None)
-        bottom_plane = getattr(result, "bottom_boundary", None)
-        if bool(getattr(result, "is_empty", False)):
-            vertex_array = _EMPTY_VERTEX_ARRAY
-            vertex_count = 0
-            chunk_max_height = int(chunk_y * _renderer_module().CHUNK_SIZE + result.blocks.shape[0])
-        else:
-            vertex_array, vertex_count, chunk_max_height = build_chunk_vertex_array(
-                renderer,
-                result.blocks,
-                result.materials,
-                chunk_x,
-                chunk_y,
-                chunk_z,
-                top_plane,
-                bottom_plane,
-            )
-        vertex_bytes = int(vertex_count) * int(_renderer_module().VERTEX_STRIDE)
-        built_chunks.append(
-            (
-                chunk_x,
-                chunk_y,
-                chunk_z,
-                vertex_array,
-                int(vertex_count),
-                int(vertex_bytes),
-                int(chunk_max_height),
-            )
-        )
-        total_vertex_bytes += vertex_bytes
-
-    if total_vertex_bytes <= 0:
-        empty_buffer = _shared_empty_chunk_vertex_buffer(renderer)
-        meshes: list[ChunkMesh] = []
-        for chunk_x, chunk_y, chunk_z, vertex_array, vertex_count, vertex_bytes, chunk_max_height in built_chunks:
-            meshes.append(
-                make_chunk_mesh_fast(
-                    renderer,
-                    chunk_x=chunk_x,
-                    chunk_y=chunk_y,
-                    chunk_z=chunk_z,
-                    vertex_count=0,
-                    vertex_buffer=empty_buffer,
-                    vertex_offset=0,
-                    max_height=chunk_max_height,
-                    created_at=created_at,
-                    allocation_id=None,
-                )
-            )
-        return meshes
-
-    batch_allocation = mesh_cache.allocate_mesh_output_range(renderer, total_vertex_bytes)
-    batch_buffer = batch_allocation.buffer
-    batch_base_offset = batch_allocation.offset_bytes
-
-    upload_bytes = np.empty(total_vertex_bytes, dtype=np.uint8) if total_vertex_bytes > 0 else None
-    meshes: list[ChunkMesh] = []
-    cursor_bytes = 0
-    for chunk_x, chunk_y, chunk_z, vertex_array, vertex_count, vertex_bytes, chunk_max_height in built_chunks:
-        vertex_offset = batch_base_offset + cursor_bytes
-        if vertex_bytes > 0 and upload_bytes is not None:
-            upload_bytes[cursor_bytes : cursor_bytes + vertex_bytes] = vertex_array.view(np.uint8).reshape(-1)
-        meshes.append(
-            make_chunk_mesh_fast(
-                renderer,
-                chunk_x=chunk_x,
-                chunk_y=chunk_y,
-                chunk_z=chunk_z,
-                vertex_count=vertex_count,
-                vertex_buffer=batch_buffer,
-                vertex_offset=vertex_offset,
-                max_height=chunk_max_height,
-                created_at=created_at,
-                allocation_id=batch_allocation.allocation_id,
-            )
-        )
-        cursor_bytes += vertex_bytes
-
-    if upload_bytes is not None and total_vertex_bytes > 0:
-        renderer.device.queue.write_buffer(batch_buffer, batch_base_offset, memoryview(upload_bytes))
-
-    return meshes
-
-
-@profile
-def cpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
-    meshes = cpu_make_chunk_mesh_batch_from_voxels(
-        renderer,
-        [
-            ChunkVoxelResult(
-                chunk_x=int(chunk_x),
-                chunk_y=int(chunk_y),
-                chunk_z=int(chunk_z),
-                blocks=np.ascontiguousarray(voxel_grid, dtype=np.uint32),
-                materials=np.ascontiguousarray(material_grid, dtype=np.uint32),
-                source="cpu",
-            )
-        ],
-    )
-    return meshes[0]
-
-
-@profile
 def gpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
     mesher = _terrain_mesher(renderer)
     meshes = mesher.make_chunk_mesh_batch_from_voxels(
@@ -382,8 +72,6 @@ def gpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_
         )
     return meshes[0]
 
-
-@profile
 def make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
     if renderer.use_gpu_meshing:
         try:
@@ -394,14 +82,10 @@ def make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: i
             print(f"Warning: GPU meshing failed ({exc!s}); using CPU meshing.", file=sys.stderr)
     return cpu_make_chunk_mesh_from_voxels(renderer, chunk_x, chunk_y, chunk_z, voxel_grid, material_grid)
 
-
-@profile
 def make_chunk_mesh(renderer, chunk_x: int, chunk_y: int, chunk_z: int) -> ChunkMesh:
     voxel_grid, material_grid = renderer.world.chunk_voxel_grid(chunk_x, chunk_y, chunk_z)
     return make_chunk_mesh_from_voxels(renderer, chunk_x, chunk_y, chunk_z, voxel_grid, material_grid)
 
-
-@profile
 def accept_chunk_voxel_result(renderer, result) -> None:
     key = (int(result.chunk_x), int(getattr(result, "chunk_y", 0)), int(result.chunk_z))
     renderer._pending_chunk_coords.discard(key)
@@ -411,8 +95,6 @@ def accept_chunk_voxel_result(renderer, result) -> None:
         mesh = cpu_make_chunk_mesh_batch_from_voxels(renderer, [result])[0]
     mesh_cache.store_chunk_mesh(renderer, mesh)
 
-
-@profile
 def ensure_chunk_mesh(renderer, chunk_x: int, chunk_y: int, chunk_z: int) -> ChunkMesh:
     key = (chunk_x, chunk_y, chunk_z)
     mesh = renderer.chunk_cache.get(key)
@@ -424,43 +106,6 @@ def ensure_chunk_mesh(renderer, chunk_x: int, chunk_y: int, chunk_z: int) -> Chu
     mesh_cache.store_chunk_mesh(renderer, mesh)
     return mesh
 
-
-@profile
-def rebuild_visible_missing_tracking(renderer) -> None:
-    visible = getattr(renderer, "_visible_chunk_coord_set", None)
-    if visible is None:
-        visible = set(renderer._visible_chunk_coords)
-        renderer._visible_chunk_coord_set = visible
-
-    chunk_cache = renderer.chunk_cache
-    displayed = getattr(renderer, "_visible_prefetched_displayed_coords", None)
-    if displayed is None:
-        displayed = visible.intersection(chunk_cache.keys())
-    else:
-        renderer._visible_prefetched_displayed_coords = None
-
-    if displayed and len(visible) <= int(getattr(renderer, "max_cached_chunks", 0)):
-        move_to_end = chunk_cache.move_to_end
-        for coord in displayed:
-            move_to_end(coord)
-
-    missing = renderer._visible_missing_coords
-    missing.clear()
-    missing.update(visible)
-    missing.difference_update(displayed)
-    pending_chunk_coords = renderer._pending_chunk_coords
-    if pending_chunk_coords:
-        missing.difference_update(pending_chunk_coords)
-
-    renderer._visible_displayed_coords = displayed
-    renderer._chunk_request_target_coords = set()
-    renderer._chunk_request_queue.clear()
-    renderer._chunk_request_queue_origin = None
-    renderer._chunk_request_queue_view_signature = None
-    renderer._chunk_request_queue_dirty = True
-
-
-@profile
 def _chunk_request_view_signature(renderer, current_origin: tuple[int, int, int]) -> tuple[int, int, int]:
     horizontal_stride = max(1, int(getattr(renderer, "_chunk_request_view_stride", 1)))
     return (
@@ -469,8 +114,6 @@ def _chunk_request_view_signature(renderer, current_origin: tuple[int, int, int]
         int(current_origin[2]) // horizontal_stride,
     )
 
-
-@profile
 def chunk_request_queue_needs_rebuild(renderer, current_origin: tuple[int, int, int]) -> bool:
     if renderer._chunk_request_queue_dirty:
         return True
@@ -478,8 +121,6 @@ def chunk_request_queue_needs_rebuild(renderer, current_origin: tuple[int, int, 
         return True
     return bool(renderer._visible_missing_coords) and not renderer._chunk_request_queue
 
-
-@profile
 def rebuild_chunk_request_queue(renderer, camera_chunk_x: int, camera_chunk_y: int, camera_chunk_z: int) -> None:
     missing_coords = renderer._visible_missing_coords
     current_origin = (int(camera_chunk_x), int(camera_chunk_y), int(camera_chunk_z))
@@ -512,7 +153,6 @@ def rebuild_chunk_request_queue(renderer, camera_chunk_x: int, camera_chunk_y: i
     renderer._chunk_request_queue_view_signature = _chunk_request_view_signature(renderer, current_origin)
     renderer._chunk_request_queue_dirty = False
 
-
 def _chunk_prep_backlog_target(renderer) -> int:
     base_target = max(1, int(max(renderer.mesh_batch_size, renderer.terrain_batch_size)))
     backend = getattr(getattr(renderer, "world", None), "_backend", None)
@@ -524,30 +164,12 @@ def _chunk_prep_backlog_target(renderer) -> int:
     max_in_flight = max(1, int(getattr(backend, "_max_in_flight_batches", 1)))
     return max(base_target, submit_target * max_in_flight)
 
-
 def _chunk_prep_pipeline_backlog(renderer, terrain_backend_label: str) -> int:
     backlog = len(renderer._pending_chunk_coords) + len(renderer._pending_voxel_mesh_results)
     if terrain_backend_label == "Wgpu":
         backlog += int(getattr(renderer, "_pending_surface_gpu_batches_chunk_total", 0))
     return backlog
 
-@profile
-def refresh_visible_chunk_set(renderer) -> float:
-    visibility_start = time.perf_counter()
-    renderer_module = _renderer_module()
-    current_origin = (
-        int(renderer.camera.position[0] // renderer_module.CHUNK_WORLD_SIZE),
-        max(0, min(renderer_module.VERTICAL_CHUNK_COUNT - 1, int(renderer.camera.position[1] // renderer_module.CHUNK_WORLD_SIZE))) if renderer_module.VERTICAL_CHUNK_STACK_ENABLED else 0,
-        int(renderer.camera.position[2] // renderer_module.CHUNK_WORLD_SIZE),
-    )
-    if renderer._visible_chunk_origin != current_origin or not renderer._visible_chunk_coords:
-        renderer._refresh_visible_chunk_coords()
-        rebuild_visible_missing_tracking(renderer)
-    renderer._warn_if_visible_exceeds_cache()
-    return (time.perf_counter() - visibility_start) * 1000.0
-
-
-@profile
 def service_background_gpu_work(renderer) -> None:
     if getattr(renderer, "_device_lost", False):
         return
@@ -561,8 +183,6 @@ def service_background_gpu_work(renderer) -> None:
         if hasattr(mesher, "finalize_pending_gpu_mesh_batches"):
             mesher.finalize_pending_gpu_mesh_batches(renderer)
 
-
-@profile
 def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
     if getattr(renderer, "_device_lost", False):
         return 0.0, 0.0
@@ -741,6 +361,26 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
     renderer._last_displayed_chunk_coords = set(displayed_chunk_coords)
     chunk_stream_ms = (time.perf_counter() - prep_start) * 1000.0
     renderer._last_chunk_stream_drained = chunk_stream_drained
-    from . import hud_profile_helpers as hud_profile
-    hud_profile.record_frame_breakdown_sample(renderer, "chunk_stream_bytes", chunk_stream_bytes)
+    profiling.record_frame_breakdown_sample(renderer, "chunk_stream_bytes", chunk_stream_bytes)
     return visibility_lookup_ms, chunk_stream_ms
+
+
+class ChunkPipeline:
+    def __init__(self, renderer):
+        self.renderer = renderer
+        self.terrain = terrain_stage
+        self.meshing = meshing_stage
+        self.visibility = visibility_stage
+        self.render = render_stage
+        self.collision = collision_stage
+        self.cache = cache_stage
+        self.profiling = profiling
+
+    def prepare_chunks(self, dt: float):
+        return prepare_chunks(self.renderer, dt)
+
+    def service_background_gpu_work(self) -> None:
+        return service_background_gpu_work(self.renderer)
+
+    def refresh_visibility(self) -> float:
+        return refresh_visible_chunk_set(self.renderer)

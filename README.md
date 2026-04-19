@@ -220,9 +220,9 @@ That is expected.
 - `engine/render_constants.py` — render-time constants and cache sizing
 - `engine/voxel_world.py` — terrain world facade and solid-block queries
 - `engine/cpu_terrain_backend.py` — stacked CPU terrain generation path
-- `engine/terrain_kernels.py` — terrain noise, cave carving, and CPU meshing kernels
-- `engine/chunk_generation_helpers.py` — chunk request queueing, meshing handoff, cache insertion
-- `engine/hud_profile_helpers.py` — HUD generation and profiling text
+- `engine/terrain/kernels/core.py` — terrain noise, cave carving, and CPU meshing kernels
+- `engine/pipelines/chunk_pipeline.py` — chunk request queueing, meshing handoff, cache insertion
+- `engine/pipelines/profiling.py` — HUD generation and profiling text
 - `engine/wgpu_terrain_backend.py` — non-stacked GPU terrain path kept for future reintegration
 - `engine/metal_terrain_backend.py` — non-stacked Metal terrain path kept for future reintegration
 - `engine/wgpu_chunk_mesher.py` — GPU meshing path kept for future reintegration

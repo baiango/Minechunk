@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 
-from .world_constants import BLOCK_SIZE
+from ...world_constants import BLOCK_SIZE
 
 
 try:

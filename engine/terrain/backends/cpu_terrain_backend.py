@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
-from .terrain_kernels import (
+from ..types import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
+from ...terrain.kernels import (
     fill_chunk_surface_grids,
     fill_stacked_chunk_voxel_grid,
     fill_stacked_chunk_voxel_grid_with_neighbor_planes,
@@ -14,7 +14,7 @@ from .terrain_kernels import (
     fill_chunk_voxel_grid,
     surface_profile_at as sample_surface_profile_at,
 )
-from .world_constants import CHUNK_SIZE as DEFAULT_CHUNK_SIZE, VERTICAL_CHUNK_STACK_ENABLED
+from ...world_constants import CHUNK_SIZE as DEFAULT_CHUNK_SIZE, VERTICAL_CHUNK_STACK_ENABLED
 
 try:
     profile  # type: ignore[name-defined]

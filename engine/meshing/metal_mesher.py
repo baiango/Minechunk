@@ -13,8 +13,8 @@ import numpy as np
 import Metal
 import wgpu
 
-from . import mesh_cache_helpers as mesh_cache
-from .terrain_backend import ChunkVoxelResult
+from ..cache import mesh_allocator as mesh_cache
+from ..terrain.types import ChunkVoxelResult
 
 
 try:
@@ -29,7 +29,7 @@ _ASYNC_STATE_INIT_LOCK = threading.Lock()
 
 
 def _renderer_module():
-    from . import renderer
+    from .. import renderer
     return renderer
 
 
@@ -666,12 +666,12 @@ def make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVoxelRe
     if mesher is None:
         mesher = get_metal_chunk_mesher(renderer, block=True, timeout=2.0)
     if mesher is None:
-        from .chunk_generation_helpers import cpu_make_chunk_mesh_batch_from_voxels
+        from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_voxels
 
         return cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results)
     resources = mesher.submit_chunk_mesh_batch(renderer, chunk_results, None)
     if resources is None:
-        from .chunk_generation_helpers import cpu_make_chunk_mesh_batch_from_voxels
+        from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_voxels
 
         return cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results)
     return []
@@ -725,7 +725,7 @@ def _build_completed_meshes_from_resources(renderer, resources: AsyncVoxelMeshBa
         )
 
     if overflow_results:
-        from .chunk_generation_helpers import cpu_make_chunk_mesh_batch_from_voxels
+        from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_voxels
 
         preview = ", ".join(f"({x},{z})" for x, z in overflow_coords[:8])
         more = "" if len(overflow_coords) <= 8 else f" ... +{len(overflow_coords) - 8} more"
@@ -742,7 +742,7 @@ def _build_completed_meshes_from_resources(renderer, resources: AsyncVoxelMeshBa
 def _append_completed_meshes_to_renderer(renderer, meshes: list[object]) -> None:
     if not meshes or getattr(renderer, "_device_lost", False):
         return
-    from .chunk_generation_helpers import make_chunk_mesh_fast
+    from ..meshing.cpu_mesher import make_chunk_mesh_fast
 
     created_at = time.perf_counter()
     packed_meshes: list[tuple[int, int, int, int, bytes]] = []

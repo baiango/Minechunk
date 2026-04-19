@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 """
@@ -21,8 +20,8 @@ from typing import Optional
 
 import numpy as np
 
-from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
-from .terrain_kernels import fill_chunk_voxel_grid as cpu_fill_chunk_voxel_grid
+from ..types import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
+from ...terrain.kernels import fill_chunk_voxel_grid as cpu_fill_chunk_voxel_grid
 
 try:
     import Metal

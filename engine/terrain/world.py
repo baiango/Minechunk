@@ -3,9 +3,9 @@ from __future__ import annotations
 import sys
 import numpy as np
 
-from .cpu_terrain_backend import CpuTerrainBackend
+from .backends.cpu_terrain_backend import CpuTerrainBackend
 try:
-    from .metal_terrain_backend import MetalTerrainBackend
+    from .backends.metal_terrain_backend import MetalTerrainBackend
 except Exception as exc:  # pragma: no cover - optional on non-mac / CPU-only fallback
     MetalTerrainBackend = None  # type: ignore[assignment]
     METAL_TERRAIN_IMPORT_ERROR = exc
@@ -13,20 +13,20 @@ else:
     METAL_TERRAIN_IMPORT_ERROR = None
 
 try:
-    from .wgpu_terrain_backend import WgpuTerrainBackend
+    from .backends.wgpu_terrain_backend import WgpuTerrainBackend
 except Exception:  # pragma: no cover - optional during Metal-only deployments
     WgpuTerrainBackend = None  # type: ignore[assignment]
 
-from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
+from .types import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
 
-from .terrain_kernels import (
+from .kernels import (
     AIR,
     BEDROCK,
     DIRT,
     STONE,
     terrain_block_material_at,
 )
-from .world_constants import BLOCK_SIZE, CHUNK_SIZE, CHUNK_WORLD_SIZE, WORLD_HEIGHT_BLOCKS
+from ..world_constants import BLOCK_SIZE, CHUNK_SIZE, CHUNK_WORLD_SIZE, WORLD_HEIGHT_BLOCKS
 
 def _create_preferred_gpu_backend(
     gpu_device,
