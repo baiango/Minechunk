@@ -13,6 +13,7 @@ from .cache import mesh_allocator as mesh_cache
 from .renderer_config import *
 from .render_shaders import (
     COMPOSITE_SHADER,
+    FINAL_BLIT_SHADER,
     GPU_VISIBILITY_SHADER,
     HUD_SHADER,
     OCCLUSION_MASK_SHADER,
@@ -166,21 +167,36 @@ class TerrainRenderer:
         self.depth_view = None
         self.depth_size = (0, 0)
         self.volumetric_lighting_enabled = bool(VOLUMETRIC_LIGHTING_ENABLED)
+        self.final_present_enabled = True
         self._postprocess_size = (0, 0)
+        self.postprocess_msaa_sample_count = 4 if int(POSTPROCESS_MSAA_SAMPLE_COUNT) > 1 else 1
         self.scene_color_texture = None
         self.scene_color_view = None
+        self.scene_color_msaa_texture = None
+        self.scene_color_msaa_view = None
+        self.composite_color_texture = None
+        self.composite_color_view = None
         self.occlusion_mask_texture = None
         self.occlusion_mask_view = None
+        self.occlusion_mask_msaa_texture = None
+        self.occlusion_mask_msaa_view = None
         self.volumetric_shaft_texture = None
         self.volumetric_shaft_view = None
+        self.postprocess_depth_texture = None
+        self.postprocess_depth_view = None
         self.postprocess_sampler = None
         self.radial_blur_params_buffer = None
+        self.final_present_params_buffer = None
         self.radial_blur_bind_group_layout = None
         self.radial_blur_pipeline = None
         self.radial_blur_bind_group = None
         self.composite_bind_group_layout = None
         self.composite_pipeline = None
         self.composite_bind_group = None
+        self.final_present_bind_group_layout = None
+        self.final_present_pipeline = None
+        self.final_scene_bind_group = None
+        self.final_composite_bind_group = None
         self.scene_render_pipeline = None
         self.occlusion_mask_pipeline = None
         self.freeze_view_origin = bool(freeze_view_origin)
@@ -404,6 +420,10 @@ class TerrainRenderer:
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
         )
         self.radial_blur_params_buffer = self.device.create_buffer(
+            size=32,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        self.final_present_params_buffer = self.device.create_buffer(
             size=32,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
@@ -697,6 +717,25 @@ class TerrainRenderer:
                 },
             ],
         )
+        self.final_present_bind_group_layout = self.device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "sampler": {"type": "filtering"},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+            ],
+        )
 
         if self.tile_merge_bind_group_layout is not None:
             try:
@@ -813,6 +852,7 @@ class TerrainRenderer:
                 "depth_write_enabled": True,
                 "depth_compare": "less",
             },
+            multisample={"count": self.postprocess_msaa_sample_count},
         )
         self.occlusion_mask_pipeline = self.device.create_render_pipeline(
             layout=self.device.create_pipeline_layout(bind_group_layouts=[self.render_bind_group_layout]),
@@ -845,6 +885,7 @@ class TerrainRenderer:
                 "depth_write_enabled": True,
                 "depth_compare": "less",
             },
+            multisample={"count": self.postprocess_msaa_sample_count},
         )
         self.radial_blur_pipeline = self.device.create_render_pipeline(
             layout=self.device.create_pipeline_layout(bind_group_layouts=[self.radial_blur_bind_group_layout]),
@@ -872,6 +913,23 @@ class TerrainRenderer:
             },
             fragment={
                 "module": self.device.create_shader_module(code=COMPOSITE_SHADER),
+                "entry_point": "fs_main",
+                "targets": [{"format": POSTPROCESS_COMPOSITE_FORMAT if self.final_present_enabled else self.color_format}],
+            },
+            primitive={
+                "topology": "triangle-list",
+                "cull_mode": "none",
+            },
+        )
+        self.final_present_pipeline = self.device.create_render_pipeline(
+            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.final_present_bind_group_layout]),
+            vertex={
+                "module": self.device.create_shader_module(code=FINAL_BLIT_SHADER),
+                "entry_point": "vs_main",
+                "buffers": [],
+            },
+            fragment={
+                "module": self.device.create_shader_module(code=FINAL_BLIT_SHADER),
                 "entry_point": "fs_main",
                 "targets": [{"format": self.color_format}],
             },
@@ -972,10 +1030,18 @@ class TerrainRenderer:
         self._postprocess_size = (0, 0)
         self.scene_color_texture = None
         self.scene_color_view = None
+        self.scene_color_msaa_texture = None
+        self.scene_color_msaa_view = None
+        self.composite_color_texture = None
+        self.composite_color_view = None
         self.occlusion_mask_texture = None
         self.occlusion_mask_view = None
+        self.occlusion_mask_msaa_texture = None
+        self.occlusion_mask_msaa_view = None
         self.volumetric_shaft_texture = None
         self.volumetric_shaft_view = None
+        self.postprocess_depth_texture = None
+        self.postprocess_depth_view = None
         self.radial_blur_bind_group = None
         self.composite_bind_group = None
         if self.profiling_enabled and self.profile_hud_lines:
@@ -1044,6 +1110,15 @@ class TerrainRenderer:
             if name in self.keys_down:
                 return True
         return False
+
+    def _write_final_present_params(self, width: int, height: int) -> None:
+        params = np.array([
+            1.0 / max(1.0, float(width)),
+            1.0 / max(1.0, float(height)),
+            0.0,
+            0.0,
+        ], dtype=np.float32)
+        self.device.queue.write_buffer(self.final_present_params_buffer, 0, params.tobytes())
 
     def _toggle_profiling(self) -> None:
         if self.profiling_enabled:
@@ -1962,7 +2037,20 @@ class TerrainRenderer:
     def _ensure_postprocess_targets(self) -> None:
         width, height = self.canvas.get_physical_size()
         target_size = (max(1, int(width)), max(1, int(height)))
-        if target_size == self._postprocess_size and self.scene_color_view is not None and self.occlusion_mask_view is not None and self.volumetric_shaft_view is not None:
+        if (
+            target_size == self._postprocess_size
+            and self.scene_color_view is not None
+            and self.composite_color_view is not None
+            and self.occlusion_mask_view is not None
+            and self.volumetric_shaft_view is not None
+            and self.radial_blur_bind_group is not None
+            and self.composite_bind_group is not None
+            and self.final_scene_bind_group is not None
+            and self.final_composite_bind_group is not None
+            and self.postprocess_depth_view is not None
+            and (self.postprocess_msaa_sample_count <= 1 or self.scene_color_msaa_view is not None)
+            and (self.postprocess_msaa_sample_count <= 1 or self.occlusion_mask_msaa_view is not None)
+        ):
             return
         self._postprocess_size = target_size
         texture_usage = wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.TEXTURE_BINDING
@@ -1972,18 +2060,56 @@ class TerrainRenderer:
             usage=texture_usage,
         )
         self.scene_color_view = self.scene_color_texture.create_view()
+        if self.postprocess_msaa_sample_count > 1:
+            self.scene_color_msaa_texture = self.device.create_texture(
+                size=(target_size[0], target_size[1], 1),
+                format=POSTPROCESS_SCENE_FORMAT,
+                usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+                sample_count=self.postprocess_msaa_sample_count,
+            )
+            self.scene_color_msaa_view = self.scene_color_msaa_texture.create_view()
+        else:
+            self.scene_color_msaa_texture = None
+            self.scene_color_msaa_view = self.scene_color_view
+        self.composite_color_texture = self.device.create_texture(
+            size=(target_size[0], target_size[1], 1),
+            format=POSTPROCESS_COMPOSITE_FORMAT,
+            usage=texture_usage,
+        )
+        self.composite_color_view = self.composite_color_texture.create_view()
         self.occlusion_mask_texture = self.device.create_texture(
             size=(target_size[0], target_size[1], 1),
             format=POSTPROCESS_OCCLUSION_FORMAT,
             usage=texture_usage,
         )
         self.occlusion_mask_view = self.occlusion_mask_texture.create_view()
+        if self.postprocess_msaa_sample_count > 1:
+            self.occlusion_mask_msaa_texture = self.device.create_texture(
+                size=(target_size[0], target_size[1], 1),
+                format=POSTPROCESS_OCCLUSION_FORMAT,
+                usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+                sample_count=self.postprocess_msaa_sample_count,
+            )
+            self.occlusion_mask_msaa_view = self.occlusion_mask_msaa_texture.create_view()
+        else:
+            self.occlusion_mask_msaa_texture = None
+            self.occlusion_mask_msaa_view = self.occlusion_mask_view
         self.volumetric_shaft_texture = self.device.create_texture(
             size=(target_size[0], target_size[1], 1),
             format=POSTPROCESS_SHAFT_FORMAT,
             usage=texture_usage,
         )
         self.volumetric_shaft_view = self.volumetric_shaft_texture.create_view()
+        self.postprocess_depth_texture = self.device.create_texture(
+            size=(target_size[0], target_size[1], 1),
+            format=DEPTH_FORMAT,
+            usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
+            sample_count=self.postprocess_msaa_sample_count,
+        )
+        self.postprocess_depth_view = self.postprocess_depth_texture.create_view()
+
+        self._write_final_present_params(target_size[0], target_size[1])
+
         self.radial_blur_bind_group = self.device.create_bind_group(
             layout=self.radial_blur_bind_group_layout,
             entries=[
@@ -2000,6 +2126,22 @@ class TerrainRenderer:
                 {"binding": 2, "resource": self.postprocess_sampler},
                 {"binding": 3, "resource": self.occlusion_mask_view},
                 {"binding": 4, "resource": {"buffer": self.radial_blur_params_buffer, "offset": 0, "size": 32}},
+            ],
+        )
+        self.final_scene_bind_group = self.device.create_bind_group(
+            layout=self.final_present_bind_group_layout,
+            entries=[
+                {"binding": 0, "resource": self.scene_color_view},
+                {"binding": 1, "resource": self.postprocess_sampler},
+                {"binding": 2, "resource": {"buffer": self.final_present_params_buffer, "offset": 0, "size": 32}},
+            ],
+        )
+        self.final_composite_bind_group = self.device.create_bind_group(
+            layout=self.final_present_bind_group_layout,
+            entries=[
+                {"binding": 0, "resource": self.composite_color_view},
+                {"binding": 1, "resource": self.postprocess_sampler},
+                {"binding": 2, "resource": {"buffer": self.final_present_params_buffer, "offset": 0, "size": 32}},
             ],
         )
 
@@ -2130,30 +2272,26 @@ class TerrainRenderer:
         swapchain_acquire_ms = (time.perf_counter() - acquire_start) * 1000.0
         color_view = current_texture.create_view()
 
-        if self.volumetric_lighting_enabled:
+        use_postprocess = bool(self.volumetric_lighting_enabled or self.final_present_enabled)
+        if use_postprocess:
             self._ensure_postprocess_targets()
             assert self.scene_color_view is not None
-            assert self.occlusion_mask_view is not None
-            assert self.volumetric_shaft_view is not None
             assert self.scene_render_pipeline is not None
-            assert self.occlusion_mask_pipeline is not None
-            assert self.radial_blur_pipeline is not None
-            assert self.composite_pipeline is not None
-            assert self.radial_blur_bind_group is not None
-            assert self.composite_bind_group is not None
 
+            scene_color_attachment_view = self.scene_color_msaa_view if self.postprocess_msaa_sample_count > 1 else self.scene_color_view
+            scene_resolve_target = self.scene_color_view if self.postprocess_msaa_sample_count > 1 else None
             scene_pass = encoder.begin_render_pass(
                 color_attachments=[
                     {
-                        "view": self.scene_color_view,
-                        "resolve_target": None,
+                        "view": scene_color_attachment_view,
+                        "resolve_target": scene_resolve_target,
                         "clear_value": (0.60, 0.80, 0.98, 1.0),
                         "load_op": wgpu.LoadOp.clear,
                         "store_op": wgpu.StoreOp.store,
                     }
                 ],
                 depth_stencil_attachment={
-                    "view": self.depth_view,
+                    "view": self.postprocess_depth_view,
                     "depth_clear_value": 1.0,
                     "depth_load_op": wgpu.LoadOp.clear,
                     "depth_store_op": wgpu.StoreOp.store,
@@ -2164,72 +2302,104 @@ class TerrainRenderer:
             self._draw_visible_batches_to_pass(scene_pass, visible_batches, use_gpu_visibility, use_indirect)
             scene_pass.end()
 
-            mask_pass = encoder.begin_render_pass(
-                color_attachments=[
-                    {
-                        "view": self.occlusion_mask_view,
-                        "resolve_target": None,
-                        "clear_value": (1.0, 1.0, 1.0, 1.0),
-                        "load_op": wgpu.LoadOp.clear,
-                        "store_op": wgpu.StoreOp.store,
-                    }
-                ],
-                depth_stencil_attachment={
-                    "view": self.depth_view,
-                    "depth_clear_value": 1.0,
-                    "depth_load_op": wgpu.LoadOp.clear,
-                    "depth_store_op": wgpu.StoreOp.store,
-                },
-            )
-            mask_pass.set_pipeline(self.occlusion_mask_pipeline)
-            mask_pass.set_bind_group(0, self.camera_bind_group)
-            self._draw_visible_batches_to_pass(mask_pass, visible_batches, use_gpu_visibility, use_indirect)
-            mask_pass.end()
+            if self.volumetric_lighting_enabled:
+                assert self.occlusion_mask_view is not None
+                assert self.volumetric_shaft_view is not None
+                assert self.occlusion_mask_pipeline is not None
+                assert self.radial_blur_pipeline is not None
+                assert self.composite_pipeline is not None
+                assert self.radial_blur_bind_group is not None
+                assert self.composite_bind_group is not None
 
-            light_uv, light_strength = self._project_directional_light_to_screen(right, up, forward)
-            radial_params = np.array([
-                light_uv[0],
-                light_uv[1],
-                float(VOLUMETRIC_LIGHTING_DENSITY),
-                float(VOLUMETRIC_LIGHTING_WEIGHT),
-                float(VOLUMETRIC_LIGHTING_DECAY),
-                float(VOLUMETRIC_LIGHTING_EXPOSURE),
-                float(VOLUMETRIC_LIGHTING_STRENGTH) * float(light_strength),
-                float(VOLUMETRIC_LIGHTING_SAMPLES),
-            ], dtype=np.float32)
-            self.device.queue.write_buffer(self.radial_blur_params_buffer, 0, radial_params.tobytes())
+                mask_color_attachment_view = self.occlusion_mask_msaa_view if self.postprocess_msaa_sample_count > 1 else self.occlusion_mask_view
+                mask_resolve_target = self.occlusion_mask_view if self.postprocess_msaa_sample_count > 1 else None
+                mask_pass = encoder.begin_render_pass(
+                    color_attachments=[
+                        {
+                            "view": mask_color_attachment_view,
+                            "resolve_target": mask_resolve_target,
+                            "clear_value": (1.0, 1.0, 1.0, 1.0),
+                            "load_op": wgpu.LoadOp.clear,
+                            "store_op": wgpu.StoreOp.store,
+                        }
+                    ],
+                    depth_stencil_attachment={
+                        "view": self.postprocess_depth_view,
+                        "depth_clear_value": 1.0,
+                        "depth_load_op": wgpu.LoadOp.clear,
+                        "depth_store_op": wgpu.StoreOp.store,
+                    },
+                )
+                mask_pass.set_pipeline(self.occlusion_mask_pipeline)
+                mask_pass.set_bind_group(0, self.camera_bind_group)
+                self._draw_visible_batches_to_pass(mask_pass, visible_batches, use_gpu_visibility, use_indirect)
+                mask_pass.end()
 
-            blur_pass = encoder.begin_render_pass(
-                color_attachments=[
-                    {
-                        "view": self.volumetric_shaft_view,
-                        "resolve_target": None,
-                        "clear_value": (0.0, 0.0, 0.0, 1.0),
-                        "load_op": wgpu.LoadOp.clear,
-                        "store_op": wgpu.StoreOp.store,
-                    }
-                ],
-            )
-            blur_pass.set_pipeline(self.radial_blur_pipeline)
-            blur_pass.set_bind_group(0, self.radial_blur_bind_group)
-            blur_pass.draw(3, 1, 0, 0)
-            blur_pass.end()
+                light_uv, light_strength = self._project_directional_light_to_screen(right, up, forward)
+                radial_params = np.array([
+                    light_uv[0],
+                    light_uv[1],
+                    float(VOLUMETRIC_LIGHTING_DENSITY),
+                    float(VOLUMETRIC_LIGHTING_WEIGHT),
+                    float(VOLUMETRIC_LIGHTING_DECAY),
+                    float(VOLUMETRIC_LIGHTING_EXPOSURE),
+                    float(VOLUMETRIC_LIGHTING_STRENGTH) * float(light_strength),
+                    float(VOLUMETRIC_LIGHTING_SAMPLES),
+                ], dtype=np.float32)
+                self.device.queue.write_buffer(self.radial_blur_params_buffer, 0, radial_params.tobytes())
 
-            composite_pass = encoder.begin_render_pass(
-                color_attachments=[
-                    {
-                        "view": color_view,
-                        "resolve_target": None,
-                        "clear_value": (0.0, 0.0, 0.0, 1.0),
-                        "load_op": wgpu.LoadOp.clear,
-                        "store_op": wgpu.StoreOp.store,
-                    }
-                ],
-            )
-            composite_pass.set_pipeline(self.composite_pipeline)
-            composite_pass.set_bind_group(0, self.composite_bind_group)
-            composite_pass.draw(3, 1, 0, 0)
-            composite_pass.end()
+                blur_pass = encoder.begin_render_pass(
+                    color_attachments=[
+                        {
+                            "view": self.volumetric_shaft_view,
+                            "resolve_target": None,
+                            "clear_value": (0.0, 0.0, 0.0, 1.0),
+                            "load_op": wgpu.LoadOp.clear,
+                            "store_op": wgpu.StoreOp.store,
+                        }
+                    ],
+                )
+                blur_pass.set_pipeline(self.radial_blur_pipeline)
+                blur_pass.set_bind_group(0, self.radial_blur_bind_group)
+                blur_pass.draw(3, 1, 0, 0)
+                blur_pass.end()
+
+                composite_target_view = self.composite_color_view if self.final_present_enabled else color_view
+                composite_pass = encoder.begin_render_pass(
+                    color_attachments=[
+                        {
+                            "view": composite_target_view,
+                            "resolve_target": None,
+                            "clear_value": (0.0, 0.0, 0.0, 1.0),
+                            "load_op": wgpu.LoadOp.clear,
+                            "store_op": wgpu.StoreOp.store,
+                        }
+                    ],
+                )
+                composite_pass.set_pipeline(self.composite_pipeline)
+                composite_pass.set_bind_group(0, self.composite_bind_group)
+                composite_pass.draw(3, 1, 0, 0)
+                composite_pass.end()
+
+            if self.final_present_enabled:
+                source_bind_group = self.final_composite_bind_group if self.volumetric_lighting_enabled else self.final_scene_bind_group
+                assert source_bind_group is not None
+                assert self.final_present_pipeline is not None
+                final_pass = encoder.begin_render_pass(
+                    color_attachments=[
+                        {
+                            "view": color_view,
+                            "resolve_target": None,
+                            "clear_value": (0.0, 0.0, 0.0, 1.0),
+                            "load_op": wgpu.LoadOp.clear,
+                            "store_op": wgpu.StoreOp.store,
+                        }
+                    ],
+                )
+                final_pass.set_pipeline(self.final_present_pipeline)
+                final_pass.set_bind_group(0, source_bind_group)
+                final_pass.draw(3, 1, 0, 0)
+                final_pass.end()
         else:
             render_pass = encoder.begin_render_pass(
                 color_attachments=[
