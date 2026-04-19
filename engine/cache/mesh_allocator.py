@@ -859,17 +859,19 @@ def merge_chunk_bounds(renderer, tile_meshes: list[ChunkMesh]) -> tuple[float, f
 
 
 @profile
-def merge_tile_meshes(renderer, tile_meshes: list[ChunkMesh], encoder) -> wgpu.GPUBuffer:
+def merge_tile_meshes(renderer, tile_meshes: list[ChunkMesh], encoder, existing_buffer=None) -> wgpu.GPUBuffer:
     renderer_module = _renderer_module()
     vertex_stride = int(renderer_module.VERTEX_STRIDE)
     merged_tile_max_chunks = int(renderer_module.MERGED_TILE_MAX_CHUNKS)
 
     total_vertices = sum(mesh.vertex_count for mesh in tile_meshes)
     total_vertex_bytes = total_vertices * vertex_stride
-    merged_buffer = renderer.device.create_buffer(
-        size=max(1, total_vertex_bytes),
-        usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
-    )
+    merged_buffer = existing_buffer
+    if merged_buffer is None:
+        merged_buffer = renderer.device.create_buffer(
+            size=max(1, total_vertex_bytes),
+            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
+        )
     if (
         renderer.tile_merge_pipeline is None
         or renderer.tile_merge_bind_group_layout is None
@@ -1632,7 +1634,15 @@ def build_tile_draw_batches(
         )
         merged_buffer = existing.vertex_buffer if not rebuild_merged else None
         if rebuild_merged:
-            merged_buffer = merge_tile_meshes(renderer, mature_meshes, encoder)
+            reuse_merged_buffer = None
+            if (
+                existing is not None
+                and getattr(existing, "owns_vertex_buffer", False)
+                and existing.vertex_buffer is not None
+                and int(existing.vertex_count) == int(batch_vertex_count)
+            ):
+                reuse_merged_buffer = existing.vertex_buffer
+            merged_buffer = merge_tile_meshes(renderer, mature_meshes, encoder, reuse_merged_buffer)
 
         tile_draw_batches: list[ChunkDrawBatch] = [
             ChunkDrawBatch(
