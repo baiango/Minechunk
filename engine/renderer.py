@@ -81,6 +81,9 @@ class TerrainRenderer:
         use_gpu_meshing: bool | None = None,
         terrain_batch_size: int = DEFAULT_MESH_BATCH_SIZE,
         mesh_batch_size: int | None = None,
+        chunk_radius: int | None = None,
+        vertical_chunk_radius: int | None = None,
+        exit_when_view_ready: bool = False,
     ) -> None:
         default_use_gpu = _engine_mode_uses_gpu_path()
         self.use_gpu_terrain = default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)
@@ -178,8 +181,10 @@ class TerrainRenderer:
         self.scene_render_pipeline = None
         self.occlusion_mask_pipeline = None
         # Fixed target render radius in chunk units.
-        self.chunk_radius = max(1, int(DEFAULT_RENDER_DISTANCE_CHUNKS))
-        self.vertical_chunk_radius = max(0, int(VERTICAL_CHUNK_RENDER_RADIUS)) if VERTICAL_CHUNK_STACK_ENABLED else 0
+        effective_chunk_radius = DEFAULT_RENDER_DISTANCE_CHUNKS if chunk_radius is None else chunk_radius
+        self.chunk_radius = max(1, int(effective_chunk_radius))
+        effective_vertical_radius = VERTICAL_CHUNK_RENDER_RADIUS if vertical_chunk_radius is None else vertical_chunk_radius
+        self.vertical_chunk_radius = max(0, int(effective_vertical_radius)) if VERTICAL_CHUNK_STACK_ENABLED else 0
         self.render_dimension_chunks = self.chunk_radius * 2 + 1
         self.chunk_cache: OrderedDict[tuple[int, int, int], ChunkMesh] = OrderedDict()
         self._visible_chunk_coords: list[tuple[int, int, int]] = []
@@ -322,6 +327,9 @@ class TerrainRenderer:
         self.frame_breakdown_vertex_buffer_capacity = 0
         self._frame_breakdown_next_refresh = 0.0
         self._solid_block_cache: dict[tuple[int, int, int], bool] = {}
+        self.exit_when_view_ready = bool(exit_when_view_ready)
+        self._auto_exit_requested = False
+        self._auto_exit_frame_count = 0
         self._last_frame_draw_calls = 0
         self._last_frame_merged_batches = 0
         self._last_new_displayed_chunks = 0
@@ -2201,6 +2209,61 @@ class TerrainRenderer:
             return True
         return exc.__class__.__name__ == "GPUValidationError" and "lost" in text.lower()
 
+    def _pending_chunk_work_count(self) -> int:
+        return (
+            len(self._pending_chunk_coords)
+            + len(self._pending_voxel_mesh_results)
+            + len(self._pending_surface_gpu_batches)
+            + int(self._pending_surface_gpu_batches_chunk_total)
+            + len(self._pending_gpu_mesh_batches)
+        )
+
+    def _view_ready_for_auto_exit(self) -> bool:
+        if self._device_lost:
+            return False
+        target_coords = self._visible_chunk_coord_set if self._visible_chunk_coord_set else set(self._visible_chunk_coords)
+        if not target_coords:
+            return False
+        if self._visible_missing_coords:
+            return False
+        if self._pending_chunk_work_count() != 0:
+            return False
+        chunk_cache = self.chunk_cache
+        for coord in target_coords:
+            if coord not in chunk_cache:
+                return False
+        return True
+
+    def _request_auto_exit(self) -> None:
+        if self._auto_exit_requested:
+            return
+        self._auto_exit_requested = True
+        target_count = len(self._visible_chunk_coord_set) if self._visible_chunk_coord_set else len(self._visible_chunk_coords)
+        print(
+            f"Info: fixed-radius render complete; loaded {target_count} target chunks. Closing window.",
+            file=sys.stderr,
+        )
+        try:
+            self.canvas.close()
+        except Exception:
+            pass
+        stop_loop = getattr(loop, "stop", None)
+        if callable(stop_loop):
+            try:
+                stop_loop()
+            except Exception:
+                pass
+
+    def _service_auto_exit(self) -> None:
+        if not self.exit_when_view_ready or self._auto_exit_requested:
+            return
+        if self._view_ready_for_auto_exit():
+            self._auto_exit_frame_count += 1
+        else:
+            self._auto_exit_frame_count = 0
+        if self._auto_exit_frame_count >= 2:
+            self._request_auto_exit()
+
     @profile
     def draw_frame(self) -> None:
         frame_start = time.perf_counter()
@@ -2277,4 +2340,6 @@ class TerrainRenderer:
                 hud_profile.profile_end_frame(self, profile_started_at, 0.0)
             raise
         hud_profile.profile_end_frame(self, profile_started_at, wall_frame_ms / 1000.0)
-        self.canvas.request_draw(self.draw_frame)
+        self._service_auto_exit()
+        if not self._auto_exit_requested:
+            self.canvas.request_draw(self.draw_frame)

@@ -985,8 +985,18 @@ def _extend_direct_render_batches(
         _append_direct_render_batch(render_batches, vertex_buffer, binding_offset, vertex_count, first_vertex)
 
 
+def _create_direct_render_batch_group_entry(
+    vertex_buffer: wgpu.GPUBuffer,
+    binding_offset: int,
+    vertex_count: int,
+    first_vertex: int,
+) -> list[object]:
+    batch = (vertex_buffer, binding_offset, vertex_count, first_vertex)
+    return [vertex_buffer, binding_offset, [batch], int(first_vertex), False]
+
+
 def _append_direct_render_batch_grouped(
-    render_batch_groups: OrderedDict[tuple[int, int], list[tuple[wgpu.GPUBuffer, int, int, int]]],
+    render_batch_groups: OrderedDict[tuple[int, int], list[object]],
     vertex_buffer: wgpu.GPUBuffer,
     binding_offset: int,
     vertex_count: int,
@@ -998,11 +1008,45 @@ def _append_direct_render_batch_grouped(
     binding_offset = int(binding_offset)
     first_vertex = int(first_vertex)
     key = (id(vertex_buffer), binding_offset)
-    group = render_batch_groups.get(key)
-    if group is None:
-        render_batch_groups[key] = [(vertex_buffer, binding_offset, vertex_count, first_vertex)]
+    entry = render_batch_groups.get(key)
+    if entry is None:
+        render_batch_groups[key] = _create_direct_render_batch_group_entry(vertex_buffer, binding_offset, vertex_count, first_vertex)
         return
-    if group:
+    batches = entry[2]
+    assert isinstance(batches, list)
+    if batches:
+        last_vertex_buffer, last_binding_offset, last_vertex_count, last_first_vertex = batches[-1]
+        if (
+            last_vertex_buffer is vertex_buffer
+            and int(last_binding_offset) == binding_offset
+            and int(last_first_vertex) + int(last_vertex_count) == first_vertex
+        ):
+            batches[-1] = (vertex_buffer, binding_offset, int(last_vertex_count) + vertex_count, int(last_first_vertex))
+            entry[3] = int(last_first_vertex)
+            return
+    if first_vertex < int(entry[3]):
+        entry[4] = True
+    batches.append((vertex_buffer, binding_offset, vertex_count, first_vertex))
+    entry[3] = first_vertex
+
+
+def _group_render_batches(
+    batches: tuple[tuple[wgpu.GPUBuffer, int, int, int], ...] | list[tuple[wgpu.GPUBuffer, int, int, int]],
+) -> tuple[tuple[tuple[int, int], wgpu.GPUBuffer, int, tuple[tuple[wgpu.GPUBuffer, int, int, int], ...]], ...]:
+    if not batches:
+        return ()
+    grouped: OrderedDict[tuple[int, int], list[tuple[wgpu.GPUBuffer, int, int, int]]] = OrderedDict()
+    for vertex_buffer, binding_offset, vertex_count, first_vertex in batches:
+        vertex_count = int(vertex_count)
+        if vertex_count <= 0:
+            continue
+        binding_offset = int(binding_offset)
+        first_vertex = int(first_vertex)
+        key = (id(vertex_buffer), binding_offset)
+        group = grouped.get(key)
+        if group is None:
+            grouped[key] = [(vertex_buffer, binding_offset, vertex_count, first_vertex)]
+            continue
         last_vertex_buffer, last_binding_offset, last_vertex_count, last_first_vertex = group[-1]
         if (
             last_vertex_buffer is vertex_buffer
@@ -1010,12 +1054,18 @@ def _append_direct_render_batch_grouped(
             and int(last_first_vertex) + int(last_vertex_count) == first_vertex
         ):
             group[-1] = (vertex_buffer, binding_offset, int(last_vertex_count) + vertex_count, int(last_first_vertex))
-            return
-    group.append((vertex_buffer, binding_offset, vertex_count, first_vertex))
+            continue
+        group.append((vertex_buffer, binding_offset, vertex_count, first_vertex))
+    grouped_batches = []
+    for key, group in grouped.items():
+        if not group:
+            continue
+        grouped_batches.append((key, group[0][0], int(group[0][1]), tuple(group)))
+    return tuple(grouped_batches)
 
 
 def _extend_direct_render_batches_grouped(
-    render_batch_groups: OrderedDict[tuple[int, int], list[tuple[wgpu.GPUBuffer, int, int, int]]],
+    render_batch_groups: OrderedDict[tuple[int, int], list[object]],
     batches: tuple[tuple[wgpu.GPUBuffer, int, int, int], ...] | list[tuple[wgpu.GPUBuffer, int, int, int]],
 ) -> None:
     if not batches:
@@ -1029,23 +1079,73 @@ def _extend_direct_render_batches_grouped(
         append_grouped(render_batch_groups, vertex_buffer, binding_offset, vertex_count, first_vertex)
 
 
+def _extend_grouped_render_batch_groups(
+    render_batch_groups: OrderedDict[tuple[int, int], list[object]],
+    grouped_batches: tuple[tuple[tuple[int, int], wgpu.GPUBuffer, int, tuple[tuple[wgpu.GPUBuffer, int, int, int], ...]], ...],
+) -> None:
+    if not grouped_batches:
+        return
+    for key, vertex_buffer, binding_offset, batches_to_add in grouped_batches:
+        if not batches_to_add:
+            continue
+        entry = render_batch_groups.get(key)
+        if entry is None:
+            render_batch_groups[key] = [vertex_buffer, int(binding_offset), list(batches_to_add), int(batches_to_add[-1][3]), False]
+            continue
+        batches = entry[2]
+        assert isinstance(batches, list)
+        first_new = batches_to_add[0]
+        last_existing = batches[-1] if batches else None
+        if last_existing is not None:
+            last_vertex_buffer, last_binding_offset, last_vertex_count, last_first_vertex = last_existing
+            if (
+                last_vertex_buffer is first_new[0]
+                and int(last_binding_offset) == int(first_new[1])
+                and int(last_first_vertex) + int(last_vertex_count) == int(first_new[3])
+            ):
+                batches[-1] = (
+                    first_new[0],
+                    int(first_new[1]),
+                    int(last_vertex_count) + int(first_new[2]),
+                    int(last_first_vertex),
+                )
+                if len(batches_to_add) > 1:
+                    if int(batches_to_add[1][3]) < int(last_first_vertex):
+                        entry[4] = True
+                    batches.extend(batches_to_add[1:])
+                    entry[3] = int(batches_to_add[-1][3])
+                else:
+                    entry[3] = int(last_first_vertex)
+                continue
+        if int(first_new[3]) < int(entry[3]):
+            entry[4] = True
+        batches.extend(batches_to_add)
+        entry[3] = int(batches_to_add[-1][3])
+
+
 def _finalize_direct_render_batch_groups(
-    render_batch_groups: OrderedDict[tuple[int, int], list[tuple[wgpu.GPUBuffer, int, int, int]]],
+    render_batch_groups: OrderedDict[tuple[int, int], list[object]],
 ) -> list[tuple[wgpu.GPUBuffer, int, int, int]]:
     if not render_batch_groups:
         return []
     if len(render_batch_groups) == 1:
-        only_batches = next(iter(render_batch_groups.values()))
+        only_entry = next(iter(render_batch_groups.values()))
+        only_batches = only_entry[2]
+        assert isinstance(only_batches, list)
         if len(only_batches) <= 1:
+            return list(only_batches)
+        if not bool(only_entry[4]):
             return list(only_batches)
     normalized: list[tuple[wgpu.GPUBuffer, int, int, int]] = []
     append_direct = _append_direct_render_batch
-    for batches in render_batch_groups.values():
+    for entry in render_batch_groups.values():
+        batches = entry[2]
+        assert isinstance(batches, list)
         batch_count = len(batches)
         if batch_count == 1:
             append_direct(normalized, *batches[0])
             continue
-        if batch_count > 1:
+        if batch_count > 1 and bool(entry[4]):
             batches.sort(key=lambda item: item[3])
         for batch in batches:
             append_direct(normalized, *batch)
@@ -1138,6 +1238,7 @@ def _store_cached_tile_render_batch(
     source_version: int,
     cached_draw_batches: tuple[ChunkDrawBatch, ...],
     cached_render_batches: tuple[tuple[wgpu.GPUBuffer, int, int, int], ...],
+    cached_grouped_render_batches: tuple[tuple[tuple[int, int], wgpu.GPUBuffer, int, tuple[tuple[wgpu.GPUBuffer, int, int, int], ...]], ...],
     next_refresh_at: float,
     visible_chunk_count: int,
     merged_chunk_count: int,
@@ -1157,6 +1258,7 @@ def _store_cached_tile_render_batch(
         source_version=source_version,
         cached_draw_batches=cached_draw_batches,
         cached_render_batches=cached_render_batches,
+        cached_grouped_render_batches=cached_grouped_render_batches,
         next_refresh_at=float(next_refresh_at),
         visible_chunk_count=int(visible_chunk_count),
         merged_chunk_count=int(merged_chunk_count),
@@ -1287,7 +1389,11 @@ def build_tile_draw_batches(
                 if cached_draw_batches:
                     cached_render_batches = getattr(existing, "cached_render_batches", ())
                     if direct_render_batch_groups is not None:
-                        grouped_extend(direct_render_batch_groups, cached_render_batches)
+                        cached_grouped_render_batches = getattr(existing, "cached_grouped_render_batches", ())
+                        if cached_grouped_render_batches:
+                            _extend_grouped_render_batch_groups(direct_render_batch_groups, cached_grouped_render_batches)
+                        else:
+                            grouped_extend(direct_render_batch_groups, cached_render_batches)
                     elif direct_render_batches is not None:
                         direct_extend(direct_render_batches, cached_render_batches)
                     else:
@@ -1320,7 +1426,11 @@ def build_tile_draw_batches(
                 cached_draw_batches = getattr(existing, "cached_draw_batches", ())
                 if cached_draw_batches:
                     if direct_render_batch_groups is not None:
-                        _extend_direct_render_batches_grouped(direct_render_batch_groups, getattr(existing, "cached_render_batches", ()))
+                        cached_grouped_render_batches = getattr(existing, "cached_grouped_render_batches", ())
+                        if cached_grouped_render_batches:
+                            _extend_grouped_render_batch_groups(direct_render_batch_groups, cached_grouped_render_batches)
+                        else:
+                            _extend_direct_render_batches_grouped(direct_render_batch_groups, getattr(existing, "cached_render_batches", ()))
                     elif direct_render_batches is not None:
                         _extend_direct_render_batches(direct_render_batches, getattr(existing, "cached_render_batches", ()))
                     else:
@@ -1358,6 +1468,7 @@ def build_tile_draw_batches(
                 first_vertex=mesh.first_vertex,
                 bounds=mesh.bounds,
             )
+            single_cached_render_batches = ((mesh.vertex_buffer, int(mesh.binding_offset), int(mesh.vertex_count), int(mesh.first_vertex)),)
             batch = _store_cached_tile_render_batch(
                 renderer,
                 tile_key_value,
@@ -1372,7 +1483,8 @@ def build_tile_draw_batches(
                 visible_mask=current_visible_mask,
                 source_version=tile_version,
                 cached_draw_batches=(single_draw_batch,),
-                cached_render_batches=((mesh.vertex_buffer, int(mesh.binding_offset), int(mesh.vertex_count), int(mesh.first_vertex)),),
+                cached_render_batches=single_cached_render_batches,
+                cached_grouped_render_batches=_group_render_batches(single_cached_render_batches),
                 next_refresh_at=0.0 if (not age_gate or now - float(mesh.created_at) >= merged_tile_min_age_seconds) else float(mesh.created_at) + merged_tile_min_age_seconds,
                 visible_chunk_count=1,
                 merged_chunk_count=0,
@@ -1380,7 +1492,7 @@ def build_tile_draw_batches(
                 owns_vertex_buffer=False,
             )
             if direct_render_batch_groups is not None:
-                grouped_extend(direct_render_batch_groups, batch.cached_render_batches)
+                _extend_grouped_render_batch_groups(direct_render_batch_groups, batch.cached_grouped_render_batches)
             elif direct_render_batches is not None:
                 direct_extend(direct_render_batches, batch.cached_render_batches)
             else:
@@ -1420,6 +1532,8 @@ def build_tile_draw_batches(
                 )
                 tile_visible_chunk_count += 1
                 tile_visible_vertex_count += int(mesh.vertex_count)
+            tile_cached_draw_batches = tuple(tile_draw_batches)
+            tile_cached_render_batches = _draw_batches_to_render_batches(tile_draw_batches)
             batch = _store_cached_tile_render_batch(
                 renderer,
                 tile_key_value,
@@ -1433,8 +1547,9 @@ def build_tile_draw_batches(
                 all_mature=(len(immature_meshes) == 0),
                 visible_mask=current_visible_mask,
                 source_version=tile_version,
-                cached_draw_batches=tuple(tile_draw_batches),
-                cached_render_batches=_draw_batches_to_render_batches(tile_draw_batches),
+                cached_draw_batches=tile_cached_draw_batches,
+                cached_render_batches=tile_cached_render_batches,
+                cached_grouped_render_batches=_group_render_batches(tile_cached_render_batches),
                 next_refresh_at=tile_next_refresh,
                 visible_chunk_count=tile_visible_chunk_count,
                 merged_chunk_count=0,
@@ -1442,7 +1557,7 @@ def build_tile_draw_batches(
                 owns_vertex_buffer=False,
             )
             if direct_render_batch_groups is not None:
-                grouped_extend(direct_render_batch_groups, batch.cached_render_batches)
+                _extend_grouped_render_batch_groups(direct_render_batch_groups, batch.cached_grouped_render_batches)
             elif direct_render_batches is not None:
                 direct_extend(direct_render_batches, batch.cached_render_batches)
             else:
@@ -1492,6 +1607,8 @@ def build_tile_draw_batches(
             )
             tile_visible_vertex_count += int(mesh.vertex_count)
 
+        tile_cached_draw_batches = tuple(tile_draw_batches)
+        tile_cached_render_batches = _draw_batches_to_render_batches(tile_draw_batches)
         batch = _store_cached_tile_render_batch(
             renderer,
             tile_key_value,
@@ -1505,8 +1622,9 @@ def build_tile_draw_batches(
             all_mature=(len(mature_meshes) == tile_mesh_count),
             visible_mask=current_visible_mask,
             source_version=tile_version,
-            cached_draw_batches=tuple(tile_draw_batches),
-            cached_render_batches=_draw_batches_to_render_batches(tile_draw_batches),
+            cached_draw_batches=tile_cached_draw_batches,
+            cached_render_batches=tile_cached_render_batches,
+            cached_grouped_render_batches=_group_render_batches(tile_cached_render_batches),
             next_refresh_at=tile_next_refresh,
             visible_chunk_count=tile_mesh_count,
             merged_chunk_count=len(mature_meshes),
@@ -1514,7 +1632,7 @@ def build_tile_draw_batches(
             owns_vertex_buffer=True,
         )
         if direct_render_batch_groups is not None:
-            grouped_extend(direct_render_batch_groups, batch.cached_render_batches)
+            _extend_grouped_render_batch_groups(direct_render_batch_groups, batch.cached_grouped_render_batches)
         elif direct_render_batches is not None:
             direct_extend(direct_render_batches, batch.cached_render_batches)
         else:

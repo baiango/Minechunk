@@ -83,6 +83,7 @@ class ChunkRenderBatch:
     source_version: int = 0
     cached_draw_batches: tuple[ChunkDrawBatch, ...] = field(default_factory=tuple)
     cached_render_batches: tuple[tuple[wgpu.GPUBuffer, int, int, int], ...] = field(default_factory=tuple)
+    cached_grouped_render_batches: tuple[tuple[tuple[int, int], wgpu.GPUBuffer, int, tuple[tuple[wgpu.GPUBuffer, int, int, int], ...]], ...] = field(default_factory=tuple)
     next_refresh_at: float = 0.0
     visible_chunk_count: int = 0
     merged_chunk_count: int = 0
