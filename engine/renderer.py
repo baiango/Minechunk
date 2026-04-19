@@ -83,6 +83,9 @@ class TerrainRenderer:
         mesh_batch_size: int | None = None,
         chunk_radius: int | None = None,
         vertical_chunk_radius: int | None = None,
+        fixed_view_dimensions: tuple[int, int, int] | None = None,
+        freeze_view_origin: bool = False,
+        freeze_camera: bool = False,
         exit_when_view_ready: bool = False,
     ) -> None:
         default_use_gpu = _engine_mode_uses_gpu_path()
@@ -180,16 +183,45 @@ class TerrainRenderer:
         self.composite_bind_group = None
         self.scene_render_pipeline = None
         self.occlusion_mask_pipeline = None
-        # Fixed target render radius in chunk units.
-        effective_chunk_radius = DEFAULT_RENDER_DISTANCE_CHUNKS if chunk_radius is None else chunk_radius
-        self.chunk_radius = max(1, int(effective_chunk_radius))
-        effective_vertical_radius = VERTICAL_CHUNK_RENDER_RADIUS if vertical_chunk_radius is None else vertical_chunk_radius
-        self.vertical_chunk_radius = max(0, int(effective_vertical_radius)) if VERTICAL_CHUNK_STACK_ENABLED else 0
-        self.render_dimension_chunks = self.chunk_radius * 2 + 1
+        self.freeze_view_origin = bool(freeze_view_origin)
+        self.freeze_camera = bool(freeze_camera)
+        self._frozen_view_origin: tuple[int, int, int] | None = None
+        self.fixed_view_dimensions = None if fixed_view_dimensions is None else tuple(max(1, int(value)) for value in fixed_view_dimensions)
+        if self.fixed_view_dimensions is not None and len(self.fixed_view_dimensions) != 3:
+            raise ValueError("fixed_view_dimensions must contain exactly 3 integers")
+        self.fixed_view_box_mode = self.fixed_view_dimensions is not None
+        if self.fixed_view_box_mode:
+            dim_x, dim_y, dim_z = self.fixed_view_dimensions
+            self._view_extent_neg_x = int(dim_x // 2)
+            self._view_extent_pos_x = int(dim_x - self._view_extent_neg_x - 1)
+            self._view_extent_neg_y = int(dim_y // 2)
+            self._view_extent_pos_y = int(dim_y - self._view_extent_neg_y - 1)
+            self._view_extent_neg_z = int(dim_z // 2)
+            self._view_extent_pos_z = int(dim_z - self._view_extent_neg_z - 1)
+            self.chunk_radius = max(self._view_extent_neg_x, self._view_extent_pos_x)
+            self.vertical_chunk_radius = max(self._view_extent_neg_y, self._view_extent_pos_y) if VERTICAL_CHUNK_STACK_ENABLED else 0
+            self.render_dimension_chunks = int(dim_x)
+            self.render_dimension_vertical_chunks = int(dim_y) if VERTICAL_CHUNK_STACK_ENABLED else 1
+            self.render_dimension_depth_chunks = int(dim_z)
+        else:
+            effective_chunk_radius = DEFAULT_RENDER_DISTANCE_CHUNKS if chunk_radius is None else chunk_radius
+            self.chunk_radius = max(1, int(effective_chunk_radius))
+            effective_vertical_radius = VERTICAL_CHUNK_RENDER_RADIUS if vertical_chunk_radius is None else vertical_chunk_radius
+            self.vertical_chunk_radius = max(0, int(effective_vertical_radius)) if VERTICAL_CHUNK_STACK_ENABLED else 0
+            self.render_dimension_chunks = self.chunk_radius * 2 + 1
+            self.render_dimension_vertical_chunks = self.vertical_chunk_radius * 2 + 1 if VERTICAL_CHUNK_STACK_ENABLED else 1
+            self.render_dimension_depth_chunks = self.render_dimension_chunks
+            self._view_extent_neg_x = int(self.chunk_radius)
+            self._view_extent_pos_x = int(self.chunk_radius)
+            self._view_extent_neg_y = int(self.vertical_chunk_radius) if VERTICAL_CHUNK_STACK_ENABLED else 0
+            self._view_extent_pos_y = int(self.vertical_chunk_radius) if VERTICAL_CHUNK_STACK_ENABLED else 0
+            self._view_extent_neg_z = int(self.chunk_radius)
+            self._view_extent_pos_z = int(self.chunk_radius)
         self.chunk_cache: OrderedDict[tuple[int, int, int], ChunkMesh] = OrderedDict()
         self._visible_chunk_coords: list[tuple[int, int, int]] = []
         self._visible_chunk_coord_set: set[tuple[int, int, int]] = set()
         self._visible_chunk_origin: tuple[int, int, int] | None = None
+        self._visible_display_state_dirty = True
         self._visible_tile_keys: list[tuple[int, int, int]] = []
         self._visible_tile_key_set: set[tuple[int, int, int]] = set()
         self._visible_tile_coords: dict[tuple[int, int, int], tuple[tuple[int, int, int], ...]] = {}
@@ -249,6 +281,9 @@ class TerrainRenderer:
         self._mesh_visibility_record_array = np.empty(0, dtype=MESH_VISIBILITY_RECORD_DTYPE)
         self._mesh_visibility_params_buffer = None
         self.max_cached_chunks = MAX_CACHED_CHUNKS
+        if self.fixed_view_box_mode and self.fixed_view_dimensions is not None:
+            fixed_target_chunk_count = int(self.fixed_view_dimensions[0]) * int(self.fixed_view_dimensions[1]) * int(self.fixed_view_dimensions[2])
+            self.max_cached_chunks = max(int(self.max_cached_chunks), fixed_target_chunk_count)
         self._cache_capacity_warned = False
         self._current_move_speed = self.camera.move_speed
         self.walk_mode = True
@@ -332,6 +367,8 @@ class TerrainRenderer:
         self._auto_exit_frame_count = 0
         self._last_frame_draw_calls = 0
         self._last_frame_merged_batches = 0
+        self._last_frame_visible_chunks = 0
+        self._last_frame_visible_vertices = 0
         self._last_new_displayed_chunks = 0
         self._last_chunk_stream_drained = 0
         self._last_frame_visible_batches = 0
@@ -1575,6 +1612,29 @@ class TerrainRenderer:
         up = normalize3(cross3(right, forward))
         return right, up, forward
 
+    def _camera_chunk_origin(self) -> tuple[int, int, int]:
+        return (
+            int(self.camera.position[0] // CHUNK_WORLD_SIZE),
+            max(0, min(VERTICAL_CHUNK_COUNT - 1, int(self.camera.position[1] // CHUNK_WORLD_SIZE))) if VERTICAL_CHUNK_STACK_ENABLED else 0,
+            int(self.camera.position[2] // CHUNK_WORLD_SIZE),
+        )
+
+    def _current_chunk_origin(self) -> tuple[int, int, int]:
+        current = self._camera_chunk_origin()
+        if self.fixed_view_box_mode and VERTICAL_CHUNK_STACK_ENABLED:
+            min_origin_y = int(self._view_extent_neg_y)
+            max_origin_y = max(min_origin_y, int(VERTICAL_CHUNK_COUNT - 1 - self._view_extent_pos_y))
+            current = (
+                int(current[0]),
+                min(max(int(current[1]), min_origin_y), max_origin_y),
+                int(current[2]),
+            )
+        if self.freeze_view_origin:
+            if self._frozen_view_origin is None:
+                self._frozen_view_origin = current
+            return self._frozen_view_origin
+        return current
+
     @profile
     def _build_visible_layout_template(
         self,
@@ -1588,23 +1648,31 @@ class TerrainRenderer:
         dict[tuple[int, int, int], int],
     ]:
         tile_size = int(MERGED_TILE_SIZE_CHUNKS)
-        radius = int(self.chunk_radius)
-        vertical_radius = int(self.vertical_chunk_radius) if VERTICAL_CHUNK_STACK_ENABLED else 0
+        neg_x = int(self._view_extent_neg_x)
+        pos_x = int(self._view_extent_pos_x)
+        neg_z = int(self._view_extent_neg_z)
+        pos_z = int(self._view_extent_pos_z)
+        neg_y = int(self._view_extent_neg_y) if VERTICAL_CHUNK_STACK_ENABLED else 0
+        pos_y = int(self._view_extent_pos_y) if VERTICAL_CHUNK_STACK_ENABLED else 0
         template_key = (
-            radius,
-            vertical_radius,
+            neg_x,
+            pos_x,
+            neg_y,
+            pos_y,
+            neg_z,
+            pos_z,
             tile_size,
             int(origin_mod_x),
             int(origin_mod_z),
             1 if VERTICAL_CHUNK_STACK_ENABLED else 0,
+            1 if self.fixed_view_box_mode else 0,
         )
         cached = self._visible_layout_template_cache.get(template_key)
         if cached is not None:
             return cached
 
-        radius_sq = radius * radius
-        min_rel_y = -vertical_radius if VERTICAL_CHUNK_STACK_ENABLED else 0
-        max_rel_y = vertical_radius if VERTICAL_CHUNK_STACK_ENABLED else 0
+        min_rel_y = -neg_y if VERTICAL_CHUNK_STACK_ENABLED else 0
+        max_rel_y = pos_y if VERTICAL_CHUNK_STACK_ENABLED else 0
         if VERTICAL_CHUNK_STACK_ENABLED:
             cy_order: list[int] = [0]
             max_offset = max(-min_rel_y, max_rel_y)
@@ -1626,17 +1694,17 @@ class TerrainRenderer:
         base_tile_x = int(origin_mod_x) // tile_size
         base_tile_z = int(origin_mod_z) // tile_size
 
-        rel_xz_order = self._visible_rel_xz_order_cache.get((radius,))
+        rel_xz_cache_key = (neg_x, pos_x, neg_z, pos_z, 1 if self.fixed_view_box_mode else 0)
+        rel_xz_order = self._visible_rel_xz_order_cache.get(rel_xz_cache_key)
         if rel_xz_order is None:
             rel_xz = [
                 (dx, dz)
-                for dz in range(-radius, radius + 1)
-                for dx in range(-radius, radius + 1)
-                if dx * dx + dz * dz <= radius_sq
+                for dz in range(-neg_z, pos_z + 1)
+                for dx in range(-neg_x, pos_x + 1)
             ]
             rel_xz.sort(key=lambda delta: (delta[0] * delta[0] + delta[1] * delta[1], abs(delta[1]), abs(delta[0]), delta[1], delta[0]))
             rel_xz_order = tuple(rel_xz)
-            self._visible_rel_xz_order_cache[(radius,)] = rel_xz_order
+            self._visible_rel_xz_order_cache[rel_xz_cache_key] = rel_xz_order
 
         for rel_y in cy_order:
             for dx, dz in rel_xz_order:
@@ -1726,11 +1794,7 @@ class TerrainRenderer:
         return coords
 
     def _chunk_coords_in_view(self) -> list[tuple[int, int, int]]:
-        origin = (
-            int(self.camera.position[0] // CHUNK_WORLD_SIZE),
-            max(0, min(VERTICAL_CHUNK_COUNT - 1, int(self.camera.position[1] // CHUNK_WORLD_SIZE))) if VERTICAL_CHUNK_STACK_ENABLED else 0,
-            int(self.camera.position[2] // CHUNK_WORLD_SIZE),
-        )
+        origin = self._current_chunk_origin()
         return self._chunk_coords_in_view_for_origin(origin)
 
     def _tile_key_for_chunk(self, chunk_x: int, chunk_z: int, chunk_y: int = 0) -> tuple[int, int, int]:
@@ -1810,11 +1874,7 @@ class TerrainRenderer:
 
     @profile
     def _refresh_visible_chunk_coords(self) -> None:
-        new_origin = (
-            int(self.camera.position[0] // CHUNK_WORLD_SIZE),
-            max(0, min(VERTICAL_CHUNK_COUNT - 1, int(self.camera.position[1] // CHUNK_WORLD_SIZE))) if VERTICAL_CHUNK_STACK_ENABLED else 0,
-            int(self.camera.position[2] // CHUNK_WORLD_SIZE),
-        )
+        new_origin = self._current_chunk_origin()
         previous_origin = self._visible_chunk_origin
         (
             rel_coords,
@@ -1879,6 +1939,7 @@ class TerrainRenderer:
 
         self._visible_prefetched_displayed_coords = displayed_coords
         self._visible_displayed_coords = set(displayed_coords)
+        self._visible_display_state_dirty = False
         self._visible_tile_dirty_keys = {
             key for key in self._tile_dirty_keys if key in self._visible_tile_key_set
         }
@@ -2226,12 +2287,22 @@ class TerrainRenderer:
             return False
         if self._visible_missing_coords:
             return False
-        if self._pending_chunk_work_count() != 0:
+        if self._pending_chunk_work_count() > 0:
             return False
         chunk_cache = self.chunk_cache
+        visible_nonempty_chunks = 0
         for coord in target_coords:
-            if coord not in chunk_cache:
+            mesh = chunk_cache.get(coord)
+            if mesh is None:
                 return False
+            if int(getattr(mesh, "vertex_count", 0)) > 0:
+                visible_nonempty_chunks += 1
+        if visible_nonempty_chunks <= 0:
+            return False
+        if int(self._last_frame_draw_calls) <= 0:
+            return False
+        if int(self._last_frame_visible_vertices) <= 0:
+            return False
         return True
 
     def _request_auto_exit(self) -> None:
@@ -2240,7 +2311,7 @@ class TerrainRenderer:
         self._auto_exit_requested = True
         target_count = len(self._visible_chunk_coord_set) if self._visible_chunk_coord_set else len(self._visible_chunk_coords)
         print(
-            f"Info: fixed-radius render complete; loaded {target_count} target chunks. Closing window.",
+            f"Info: fixed-size render complete; loaded {target_count} target chunks. Closing window.",
             file=sys.stderr,
         )
         try:
@@ -2253,6 +2324,7 @@ class TerrainRenderer:
                 stop_loop()
             except Exception:
                 pass
+        raise SystemExit(0)
 
     def _service_auto_exit(self) -> None:
         if not self.exit_when_view_ready or self._auto_exit_requested:
@@ -2273,7 +2345,8 @@ class TerrainRenderer:
         profile_started_at = hud_profile.profile_begin_frame(self)
         try:
             update_start = time.perf_counter()
-            self._update_camera(dt)
+            if not self.freeze_camera:
+                self._update_camera(dt)
             world_update_ms = (time.perf_counter() - update_start) * 1000.0
 
             visibility_lookup_ms = self.pipeline.refresh_visibility()
@@ -2286,6 +2359,10 @@ class TerrainRenderer:
             merged_chunks = int(render_stats["merged_chunks"])
             visible_chunks = int(render_stats["visible_chunks"])
             visible_vertices = int(render_stats["visible_vertices"])
+            self._last_frame_draw_calls = draw_calls
+            self._last_frame_merged_batches = merged_chunks
+            self._last_frame_visible_chunks = visible_chunks
+            self._last_frame_visible_vertices = visible_vertices
 
             hud_profile.draw_profile_hud(self, encoder, color_view)
             hud_profile.draw_frame_breakdown_hud(self, encoder, color_view)

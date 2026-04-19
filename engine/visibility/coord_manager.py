@@ -36,6 +36,7 @@ def rebuild_visible_missing_tracking(renderer) -> None:
         missing.difference_update(pending_chunk_coords)
 
     renderer._visible_displayed_coords = displayed
+    renderer._visible_display_state_dirty = False
     renderer._chunk_request_target_coords = set()
     renderer._chunk_request_queue.clear()
     renderer._chunk_request_queue_origin = None
@@ -47,13 +48,11 @@ def refresh_visible_chunk_set(renderer) -> float:
     visibility_start = time.perf_counter()
     from ..pipelines.chunk_pipeline import _renderer_module
     renderer_module = _renderer_module()
-    current_origin = (
-        int(renderer.camera.position[0] // renderer_module.CHUNK_WORLD_SIZE),
-        max(0, min(renderer_module.VERTICAL_CHUNK_COUNT - 1, int(renderer.camera.position[1] // renderer_module.CHUNK_WORLD_SIZE))) if renderer_module.VERTICAL_CHUNK_STACK_ENABLED else 0,
-        int(renderer.camera.position[2] // renderer_module.CHUNK_WORLD_SIZE),
-    )
+    current_origin = renderer._current_chunk_origin()
     if renderer._visible_chunk_origin != current_origin or not renderer._visible_chunk_coords:
         renderer._refresh_visible_chunk_coords()
+        rebuild_visible_missing_tracking(renderer)
+    elif bool(getattr(renderer, "_visible_display_state_dirty", False)):
         rebuild_visible_missing_tracking(renderer)
     renderer._warn_if_visible_exceeds_cache()
     return (time.perf_counter() - visibility_start) * 1000.0

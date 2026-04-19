@@ -34,12 +34,16 @@ def _terrain_mesher(renderer):
     return wgpu_mesher
 
 @profile
-def chunk_prep_priority(renderer, chunk_x: int, chunk_y: int, chunk_z: int, camera_chunk_x: int, camera_chunk_y: int, camera_chunk_z: int) -> tuple[float, int, int, int]:
-    dx = chunk_x - camera_chunk_x
-    dy = chunk_y - camera_chunk_y
-    dz = chunk_z - camera_chunk_z
+def chunk_prep_priority(renderer, chunk_x: int, chunk_y: int, chunk_z: int, camera_chunk_x: int, camera_chunk_y: int, camera_chunk_z: int) -> tuple[float, int, int, int, int]:
+    dx = int(chunk_x) - int(camera_chunk_x)
+    dy = int(chunk_y) - int(camera_chunk_y)
+    dz = int(chunk_z) - int(camera_chunk_z)
     distance_sq = float(dx * dx + dz * dz + (dy * dy * 4))
-    return (distance_sq, abs(dy), abs(dz), abs(dx))
+    # Prefer chunks below the camera before equally-distant sky chunks. That gets
+    # surface/ground layers meshed earlier for frozen batch views instead of
+    # burning the whole request budget on empty air above the spawn chunk.
+    above_bias = 1 if dy > 0 else 0
+    return (distance_sq, abs(dy), above_bias, abs(dz), abs(dx))
 
 @profile
 def gpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
@@ -144,14 +148,18 @@ def rebuild_chunk_request_queue(renderer, camera_chunk_x: int, camera_chunk_y: i
         max(32, backlog_target * 4, int(renderer_module.chunk_prep_request_budget_cap) * 8),
     )
 
-    ordered: list[tuple[int, int, int]] = []
-    append_ordered = ordered.append
-    missing_contains = missing_coords.__contains__
-    for coord in renderer._visible_chunk_coords:
-        if missing_contains(coord):
-            append_ordered(coord)
-            if len(ordered) >= queue_target:
-                break
+    ordered = sorted(
+        missing_coords,
+        key=lambda coord: chunk_prep_priority(
+            renderer,
+            int(coord[0]),
+            int(coord[1]),
+            int(coord[2]),
+            current_origin[0],
+            current_origin[1],
+            current_origin[2],
+        ),
+    )[:queue_target]
 
     renderer._chunk_request_target_coords = set(ordered)
     renderer._chunk_request_queue = deque(ordered)
@@ -196,7 +204,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
         return 0.0, 0.0
     renderer_module = _renderer_module()
     visibility_lookup_ms = 0.0
-    current_origin = (int(renderer.camera.position[0] // renderer_module.CHUNK_WORLD_SIZE), max(0, min(renderer_module.VERTICAL_CHUNK_COUNT - 1, int(renderer.camera.position[1] // renderer_module.CHUNK_WORLD_SIZE))) if renderer_module.VERTICAL_CHUNK_STACK_ENABLED else 0, int(renderer.camera.position[2] // renderer_module.CHUNK_WORLD_SIZE))
+    current_origin = renderer._current_chunk_origin()
     if renderer._visible_chunk_origin != current_origin or not renderer._visible_chunk_coords:
         visibility_lookup_ms = refresh_visible_chunk_set(renderer)
 

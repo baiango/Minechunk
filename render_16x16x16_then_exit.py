@@ -3,7 +3,7 @@ from __future__ import annotations
 from engine.renderer import TerrainRenderer
 def main() -> None:
     renderer = TerrainRenderer(
-        fixed_view_dimensions=(8, 8, 8),
+        fixed_view_dimensions=(16, 16, 16),
         freeze_view_origin=True,
         freeze_camera=True,
         exit_when_view_ready=True,

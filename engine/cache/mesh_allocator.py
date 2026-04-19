@@ -205,6 +205,15 @@ def _mesh_output_slabs_for_size_class(renderer, size_class_bytes: int) -> Ordere
     if class_slabs is None:
         class_slabs = OrderedDict()
         slabs_by_class[class_key] = class_slabs
+    elif class_slabs:
+        live_slabs = renderer._mesh_output_slabs
+        stale_ids = [slab_id for slab_id in class_slabs.keys() if slab_id not in live_slabs]
+        for slab_id in stale_ids:
+            class_slabs.pop(slab_id, None)
+        if not class_slabs:
+            slabs_by_class.pop(class_key, None)
+            class_slabs = OrderedDict()
+            slabs_by_class[class_key] = class_slabs
     return class_slabs
 
 
@@ -226,6 +235,9 @@ def _unindex_mesh_output_slab(renderer, slab: MeshOutputSlab) -> None:
 
 
 def _touch_mesh_output_slab(renderer, slab: MeshOutputSlab) -> None:
+    if slab.slab_id not in renderer._mesh_output_slabs:
+        _unindex_mesh_output_slab(renderer, slab)
+        return
     renderer._mesh_output_slabs.move_to_end(slab.slab_id)
     class_slabs = _mesh_output_slabs_for_size_class(renderer, int(getattr(slab, "size_class_bytes", 0)))
     if slab.slab_id in class_slabs:
@@ -516,6 +528,7 @@ def refresh_mesh_output_append_slab(renderer) -> None:
 def retire_mesh_output_slab_if_empty(renderer, slab: MeshOutputSlab) -> None:
     if int(slab.append_offset) != 0 or slab.free_ranges:
         return
+    _unindex_mesh_output_slab(renderer, slab)
     renderer._mesh_output_slabs.pop(slab.slab_id, None)
     if renderer._mesh_output_append_slab_id == slab.slab_id:
         refresh_mesh_output_append_slab(renderer)
@@ -627,6 +640,12 @@ def mark_tile_dirty(renderer, chunk_x: int, chunk_z: int, chunk_y: int = 0) -> N
 
 
 
+def _sync_visible_active_tile_keys(renderer) -> None:
+    visible_tile_keys = getattr(renderer, "_visible_tile_keys", ())
+    active_key_set = getattr(renderer, "_visible_active_tile_key_set", set())
+    renderer._visible_active_tile_keys = [tile_key_value for tile_key_value in visible_tile_keys if tile_key_value in active_key_set]
+
+
 def _refresh_visible_tile_active_meshes_for_key(renderer, tile_key_value, slots) -> None:
     active_meshes = [mesh for mesh in slots if mesh is not None and mesh.vertex_count > 0]
     if active_meshes:
@@ -635,6 +654,7 @@ def _refresh_visible_tile_active_meshes_for_key(renderer, tile_key_value, slots)
     else:
         renderer._visible_tile_active_meshes.pop(tile_key_value, None)
         renderer._visible_active_tile_key_set.discard(tile_key_value)
+    _sync_visible_active_tile_keys(renderer)
 
 
 def _remove_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
@@ -648,6 +668,7 @@ def _remove_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
     if not active_meshes:
         renderer._visible_tile_active_meshes.pop(tile_key_value, None)
         renderer._visible_active_tile_key_set.discard(tile_key_value)
+    _sync_visible_active_tile_keys(renderer)
 
 
 def _append_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
@@ -659,6 +680,7 @@ def _append_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
         renderer._visible_active_tile_key_set.add(tile_key_value)
     else:
         active_meshes.append(mesh)
+    _sync_visible_active_tile_keys(renderer)
 
 
 @profile
@@ -736,6 +758,7 @@ def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
     if visible_keys:
         renderer._visible_displayed_coords.update(visible_keys)
         renderer._visible_missing_coords.difference_update(visible_keys)
+        renderer._visible_display_state_dirty = True
 
     max_cached_chunks = renderer.max_cached_chunks
     if len(chunk_cache) <= max_cached_chunks:
@@ -767,6 +790,7 @@ def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
 
     if queue_dirty:
         renderer._chunk_request_queue_dirty = True
+        renderer._visible_display_state_dirty = True
 
 
 @profile
