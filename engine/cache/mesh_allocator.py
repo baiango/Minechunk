@@ -1258,7 +1258,7 @@ def _build_visible_tile_iterable(
     if not visible_tile_dirty_keys:
         return visible_active_tile_keys
     tile_iterable = list(visible_active_tile_keys)
-    seen = set(active_key_set) if active_key_set else set(tile_iterable)
+    seen = set(tile_iterable)
     seen_add = seen.add
     tile_iterable_append = tile_iterable.append
     for tile_key_value in tile_render_batches.keys():
