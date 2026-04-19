@@ -1160,19 +1160,45 @@ def _finalize_direct_render_batch_groups(
             return list(only_batches)
         if not bool(only_entry[4]):
             return list(only_batches)
+
     normalized: list[tuple[wgpu.GPUBuffer, int, int, int]] = []
-    append_direct = _append_direct_render_batch
+    normalized_extend = normalized.extend
+    normalized_append = normalized.append
     for entry in render_batch_groups.values():
         batches = entry[2]
         assert isinstance(batches, list)
         batch_count = len(batches)
-        if batch_count == 1:
-            append_direct(normalized, *batches[0])
+        if batch_count <= 0:
             continue
-        if batch_count > 1 and bool(entry[4]):
-            batches.sort(key=lambda item: item[3])
-        for batch in batches:
-            append_direct(normalized, *batch)
+        if batch_count == 1:
+            normalized_append(batches[0])
+            continue
+        if not bool(entry[4]):
+            normalized_extend(batches)
+            continue
+
+        batches.sort(key=lambda item: item[3])
+        last_vertex_buffer, last_binding_offset, last_vertex_count, last_first_vertex = batches[0]
+        last_binding_offset = int(last_binding_offset)
+        last_vertex_count = int(last_vertex_count)
+        last_first_vertex = int(last_first_vertex)
+        for vertex_buffer, binding_offset, vertex_count, first_vertex in batches[1:]:
+            binding_offset = int(binding_offset)
+            vertex_count = int(vertex_count)
+            first_vertex = int(first_vertex)
+            if (
+                last_vertex_buffer is vertex_buffer
+                and last_binding_offset == binding_offset
+                and last_first_vertex + last_vertex_count == first_vertex
+            ):
+                last_vertex_count += vertex_count
+                continue
+            normalized_append((last_vertex_buffer, last_binding_offset, last_vertex_count, last_first_vertex))
+            last_vertex_buffer = vertex_buffer
+            last_binding_offset = binding_offset
+            last_vertex_count = vertex_count
+            last_first_vertex = first_vertex
+        normalized_append((last_vertex_buffer, last_binding_offset, last_vertex_count, last_first_vertex))
     return normalized
 
 
