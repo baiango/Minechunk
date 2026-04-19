@@ -613,6 +613,7 @@ def clear_tile_render_batches(renderer) -> None:
     for batch in renderer._tile_render_batches.values():
         if getattr(batch, "owns_vertex_buffer", False) and batch.vertex_buffer is not None:
             batch.vertex_buffer.destroy()
+    _destroy_merged_tile_buffer_reuse_state(renderer)
     renderer._tile_render_batches.clear()
     renderer._tile_dirty_keys.clear()
     renderer._visible_tile_dirty_keys.clear()
@@ -858,8 +859,105 @@ def merge_chunk_bounds(renderer, tile_meshes: list[ChunkMesh]) -> tuple[float, f
     return center_x, center_y, center_z, radius
 
 
+_MERGED_TILE_BUFFER_POOL_BUCKET_MIN_BYTES = 64 * 1024
+_MERGED_TILE_BUFFER_POOL_PER_BUCKET_LIMIT = 8
+
+
+def _merged_tile_buffer_bucket_bytes(required_bytes: int) -> int:
+    needed_bytes = max(int(_renderer_module().VERTEX_STRIDE), int(required_bytes))
+    return max(_MERGED_TILE_BUFFER_POOL_BUCKET_MIN_BYTES, 1 << (needed_bytes - 1).bit_length())
+
+
+def _get_merged_tile_buffer_pool(renderer) -> dict[int, list[wgpu.GPUBuffer]]:
+    pool = getattr(renderer, "_merged_tile_buffer_pool", None)
+    if pool is None:
+        pool = {}
+        setattr(renderer, "_merged_tile_buffer_pool", pool)
+    return pool
+
+
+def _queue_merged_tile_buffer_for_reuse(renderer, buffer, capacity_bytes: int) -> None:
+    if buffer is None:
+        return
+    reuse_capacity_bytes = int(capacity_bytes)
+    if reuse_capacity_bytes <= 0:
+        try:
+            buffer.destroy()
+        except Exception:
+            pass
+        return
+    reuse_queue = getattr(renderer, "_merged_tile_buffer_reuse_queue", None)
+    if reuse_queue is None:
+        reuse_queue = []
+        setattr(renderer, "_merged_tile_buffer_reuse_queue", reuse_queue)
+    reuse_queue.append([(buffer, reuse_capacity_bytes)])
+
+
+def _flush_merged_tile_buffer_reuse_queue(renderer) -> None:
+    reuse_queue = getattr(renderer, "_merged_tile_buffer_reuse_queue", None)
+    if not reuse_queue:
+        return
+    pool = _get_merged_tile_buffer_pool(renderer)
+    while len(reuse_queue) > 3:
+        expired_entries = reuse_queue.pop(0)
+        for buffer, capacity_bytes in expired_entries:
+            bucket_bytes = _merged_tile_buffer_bucket_bytes(capacity_bytes)
+            bucket = pool.get(bucket_bytes)
+            if bucket is None:
+                bucket = []
+                pool[bucket_bytes] = bucket
+            if len(bucket) < _MERGED_TILE_BUFFER_POOL_PER_BUCKET_LIMIT:
+                bucket.append(buffer)
+            else:
+                try:
+                    buffer.destroy()
+                except Exception:
+                    pass
+
+
+def _destroy_merged_tile_buffer_reuse_state(renderer) -> None:
+    reuse_queue = getattr(renderer, "_merged_tile_buffer_reuse_queue", None) or []
+    for entries in reuse_queue:
+        for buffer, _capacity_bytes in entries:
+            try:
+                buffer.destroy()
+            except Exception:
+                pass
+    setattr(renderer, "_merged_tile_buffer_reuse_queue", [])
+
+    pool = getattr(renderer, "_merged_tile_buffer_pool", None) or {}
+    for buffers in pool.values():
+        for buffer in buffers:
+            try:
+                buffer.destroy()
+            except Exception:
+                pass
+    setattr(renderer, "_merged_tile_buffer_pool", {})
+
+
+def _acquire_merged_tile_buffer(renderer, required_bytes: int) -> tuple[wgpu.GPUBuffer, int]:
+    bucket_bytes = _merged_tile_buffer_bucket_bytes(required_bytes)
+    pool = _get_merged_tile_buffer_pool(renderer)
+    bucket = pool.get(bucket_bytes)
+    if bucket:
+        return bucket.pop(), bucket_bytes
+    return (
+        renderer.device.create_buffer(
+            size=max(1, bucket_bytes),
+            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
+        ),
+        bucket_bytes,
+    )
+
+
 @profile
-def merge_tile_meshes(renderer, tile_meshes: list[ChunkMesh], encoder, existing_buffer=None) -> wgpu.GPUBuffer:
+def merge_tile_meshes(
+    renderer,
+    tile_meshes: list[ChunkMesh],
+    encoder,
+    existing_buffer=None,
+    existing_capacity_bytes: int = 0,
+) -> tuple[wgpu.GPUBuffer, int]:
     renderer_module = _renderer_module()
     vertex_stride = int(renderer_module.VERTEX_STRIDE)
     merged_tile_max_chunks = int(renderer_module.MERGED_TILE_MAX_CHUNKS)
@@ -867,11 +965,9 @@ def merge_tile_meshes(renderer, tile_meshes: list[ChunkMesh], encoder, existing_
     total_vertices = sum(mesh.vertex_count for mesh in tile_meshes)
     total_vertex_bytes = total_vertices * vertex_stride
     merged_buffer = existing_buffer
-    if merged_buffer is None:
-        merged_buffer = renderer.device.create_buffer(
-            size=max(1, total_vertex_bytes),
-            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
-        )
+    merged_buffer_capacity_bytes = int(existing_capacity_bytes)
+    if merged_buffer is None or merged_buffer_capacity_bytes < total_vertex_bytes:
+        merged_buffer, merged_buffer_capacity_bytes = _acquire_merged_tile_buffer(renderer, total_vertex_bytes)
     if (
         renderer.tile_merge_pipeline is None
         or renderer.tile_merge_bind_group_layout is None
@@ -888,7 +984,7 @@ def merge_tile_meshes(renderer, tile_meshes: list[ChunkMesh], encoder, existing_
                 copy_size,
             )
             dest_offset += copy_size
-        return merged_buffer
+        return merged_buffer, merged_buffer_capacity_bytes
 
     metadata_array = np.zeros((merged_tile_max_chunks, 4), dtype=np.uint32)
     dst_first_vertex = 0
@@ -939,7 +1035,7 @@ def merge_tile_meshes(renderer, tile_meshes: list[ChunkMesh], encoder, existing_
     compute_pass.dispatch_workgroups(max(1, (total_vertices + 63) // 64), 1, 1)
     compute_pass.end()
     wgpu_mesher.schedule_gpu_buffer_cleanup(renderer, [metadata_buffer, params_buffer], frames=3)
-    return merged_buffer
+    return merged_buffer, merged_buffer_capacity_bytes
 
 
 def visible_tile_mesh_groups(renderer) -> dict[tuple[int, int, int], list[ChunkMesh]]:
@@ -1299,6 +1395,12 @@ def _store_cached_tile_render_batch(
     owned_vertex_buffer_capacity_bytes: int = 0,
 ) -> ChunkRenderBatch:
     old_buffer = existing.vertex_buffer if (existing is not None and getattr(existing, "owns_vertex_buffer", False)) else None
+    old_buffer_capacity_bytes = 0
+    if old_buffer is not None and existing is not None:
+        old_buffer_capacity_bytes = int(
+            getattr(existing, "owned_vertex_buffer_capacity_bytes", 0)
+            or (int(getattr(existing, "vertex_count", 0)) * int(_renderer_module().VERTEX_STRIDE))
+        )
     batch = ChunkRenderBatch(
         signature=signature,
         vertex_count=vertex_count,
@@ -1323,7 +1425,7 @@ def _store_cached_tile_render_batch(
     renderer._tile_dirty_keys.discard(tile_key_value)
     renderer._visible_tile_dirty_keys.discard(tile_key_value)
     if old_buffer is not None and old_buffer is not vertex_buffer:
-        renderer._transient_render_buffers.append([old_buffer])
+        _queue_merged_tile_buffer_for_reuse(renderer, old_buffer, old_buffer_capacity_bytes)
     return batch
 
 
@@ -1383,7 +1485,14 @@ def build_tile_draw_batches(
             for tile_key_value in stale_keys:
                 batch = tile_render_batches.pop(tile_key_value)
                 if getattr(batch, "owns_vertex_buffer", False) and batch.vertex_buffer is not None:
-                    renderer._transient_render_buffers.append([batch.vertex_buffer])
+                    _queue_merged_tile_buffer_for_reuse(
+                        renderer,
+                        batch.vertex_buffer,
+                        int(
+                            getattr(batch, "owned_vertex_buffer_capacity_bytes", 0)
+                            or (int(getattr(batch, "vertex_count", 0)) * int(renderer_module.VERTEX_STRIDE))
+                        ),
+                    )
             renderer._tile_render_batch_cleanup_layout_version = visible_layout_version
     else:
         stale_keys = [tile_key_value for tile_key_value in tile_render_batches if tile_key_value not in current_tile_keys]
@@ -1657,9 +1766,13 @@ def build_tile_draw_batches(
                 if existing_capacity_bytes >= batch_vertex_bytes:
                     reuse_merged_buffer = existing.vertex_buffer
                     reuse_capacity_bytes = existing_capacity_bytes
-            merged_buffer = merge_tile_meshes(renderer, mature_meshes, encoder, reuse_merged_buffer)
-            if reuse_merged_buffer is not None and reuse_capacity_bytes > 0:
-                merged_buffer_capacity_bytes = reuse_capacity_bytes
+            merged_buffer, merged_buffer_capacity_bytes = merge_tile_meshes(
+                renderer,
+                mature_meshes,
+                encoder,
+                reuse_merged_buffer,
+                reuse_capacity_bytes,
+            )
 
         tile_draw_batches: list[ChunkDrawBatch] = [
             ChunkDrawBatch(
@@ -1721,6 +1834,7 @@ def build_tile_draw_batches(
         if tile_next_refresh > 0.0 and (next_refresh_at <= 0.0 or tile_next_refresh < next_refresh_at):
             next_refresh_at = tile_next_refresh
 
+    _flush_merged_tile_buffer_reuse_queue(renderer)
     while len(renderer._transient_render_buffers) > 3:
         old_buffers = renderer._transient_render_buffers.pop(0)
         for buffer in old_buffers:
