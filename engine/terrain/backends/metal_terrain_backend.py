@@ -457,6 +457,7 @@ class MetalTerrainBackend:
         cpu_fill_chunk_voxel_grid(blocks, voxel_materials, int(chunk_x), int(chunk_z), self.chunk_size, self.seed, self.height_limit)
         return blocks, voxel_materials
 
+    @profile
     def _allocate_chunk_batch_resources(self, max_chunks: int) -> _ChunkMetalBatch:
         max_chunks = max(1, int(max_chunks))
         coords_array = np.empty((max_chunks, 2), dtype=np.int32)
@@ -553,6 +554,7 @@ class MetalTerrainBackend:
             )
             self._in_flight_batches.append(batch)
 
+    @profile
     def _wait_for_batch(self, batch: _ChunkMetalBatch) -> None:
         if batch.command_buffer is not None:
             batch.command_buffer.waitUntilCompleted()
@@ -617,6 +619,7 @@ class MetalTerrainBackend:
         self._submit_next_batch()
         return ready
 
+    @profile
     def request_chunk_voxel_batch(self, chunks: list[tuple[int, int]]) -> int:
         return self.request_chunk_surface_batch(chunks)
 

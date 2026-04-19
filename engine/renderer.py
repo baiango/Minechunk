@@ -68,6 +68,7 @@ except NameError:  # pragma: no cover - only used outside kernprof
         return func
 
 
+@profile
 def _engine_mode_uses_gpu_path() -> bool:
     return engine_mode != ENGINE_MODE_CPU
 
@@ -219,6 +220,7 @@ class TerrainRenderer:
         self._cached_visible_render_batches: dict[tuple[int, int, int], tuple[float, list[tuple[wgpu.GPUBuffer, int, int, int]], int, int, int, int]] = {}
         self._mesh_buffer_refs: dict[int, int] = {}
         self._mesh_output_slabs: OrderedDict[int, MeshOutputSlab] = OrderedDict()
+        self._mesh_output_slabs_by_size_class: dict[int, OrderedDict[int, MeshOutputSlab]] = {}
         self._mesh_allocations: dict[int, MeshBufferAllocation] = {}
         self._deferred_mesh_output_frees: deque[tuple[int, int, int, int]] = deque()
         self._next_mesh_output_slab_id = 1
@@ -1377,6 +1379,7 @@ class TerrainRenderer:
                             return True
         return False
 
+    @profile
     def _position_is_clear(self, position: list[float]) -> bool:
         min_x, min_y, min_z, max_x, max_y, max_z = self._player_aabb(position)
         eps = 1e-6
@@ -1393,6 +1396,7 @@ class TerrainRenderer:
                         return False
         return True
 
+    @profile
     def _move_horizontal_with_step(self, position: list[float], axis: int, delta: float) -> bool:
         if abs(delta) <= 1e-9:
             return False
@@ -1563,6 +1567,7 @@ class TerrainRenderer:
         up = normalize3(cross3(right, forward))
         return right, up, forward
 
+    @profile
     def _build_visible_layout_template(
         self,
         origin_mod_x: int,
@@ -1655,6 +1660,7 @@ class TerrainRenderer:
         self._visible_layout_template_cache[template_key] = template
         return template
 
+    @profile
     def _tile_layout_in_view_for_origin(
         self,
         origin: tuple[int, int, int],
@@ -1688,6 +1694,7 @@ class TerrainRenderer:
                 visible_tile_masks[tile_key_value] = mask_value
         return rel_coords, visible_tile_keys, visible_tile_masks, rel_coord_to_tile_slot, rel_tile_slot_sizes, tile_base
 
+    @profile
     def _chunk_coords_and_tile_layout_in_view_for_origin(
         self,
         origin: tuple[int, int, int],
@@ -1762,6 +1769,7 @@ class TerrainRenderer:
             self._visible_tile_mesh_slots[tile_key_value] = slots
         return tile_key_value, int(slot_index), slots
 
+    @profile
     def _rebuild_visible_tile_layout_from_coords(self) -> None:
         origin = self._visible_chunk_origin if self._visible_chunk_origin is not None else (0, 0, 0)
         (
@@ -1774,6 +1782,7 @@ class TerrainRenderer:
         ) = self._tile_layout_in_view_for_origin(origin)
         self._visible_tile_coords = {}
 
+    @profile
     def _apply_visible_chunk_coord_delta(self, new_origin: tuple[int, int, int]) -> bool:
         old_origin = self._visible_chunk_origin
         if old_origin is None or not self._visible_chunk_coords:
@@ -1925,6 +1934,7 @@ class TerrainRenderer:
             ],
         )
 
+    @profile
     def _project_directional_light_to_screen(self, right, up, forward) -> tuple[tuple[float, float], float]:
         light_dir = normalize3(tuple(float(v) for v in LIGHT_DIRECTION))
         view_x = dot3(light_dir, right)
@@ -1945,6 +1955,7 @@ class TerrainRenderer:
         strength = max(forward_strength * edge_fade, 0.42 if edge_fade > 0.0 else 0.0)
         return (uv_x, uv_y), strength
 
+    @profile
     def _draw_visible_batches_to_pass(self, render_pass, visible_batches, use_gpu_visibility: bool, use_indirect: bool) -> None:
         current_vertex_buffer = None
         current_binding_offset = None

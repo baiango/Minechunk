@@ -399,6 +399,7 @@ class WgpuTerrainBackend:
         cpu_fill_chunk_voxel_grid(blocks, voxel_materials, int(chunk_x), int(chunk_z), self.chunk_size, self.seed, self.height_limit)
         return blocks, voxel_materials
 
+    @profile
     def _allocate_chunk_batch_resources(self, max_chunks: int) -> "_ChunkGpuBatch":
         max_chunks = max(1, int(max_chunks))
         coords_array = np.empty((max_chunks, 2), dtype=np.int32)
@@ -690,9 +691,11 @@ class WgpuTerrainBackend:
         self._submit_next_batch()
         return ready
 
+    @profile
     def request_chunk_voxel_batch(self, chunks: list[tuple[int, int]]) -> int:
         return self.request_chunk_surface_batch(chunks)
 
+    @profile
     def poll_ready_chunk_voxel_batches(self) -> list[ChunkVoxelResult]:
         ready: list[ChunkVoxelResult] = []
         for surface_result in self.poll_ready_chunk_surface_batches():

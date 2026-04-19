@@ -8,6 +8,7 @@ except NameError:  # pragma: no cover - only used outside kernprof
     def profile(func):
         return func
 
+@profile
 def rebuild_visible_missing_tracking(renderer) -> None:
     visible = getattr(renderer, "_visible_chunk_coord_set", None)
     if visible is None:
@@ -58,9 +59,11 @@ def refresh_visible_chunk_set(renderer) -> float:
     return (time.perf_counter() - visibility_start) * 1000.0
 
 
+@profile
 def refresh_visible_chunk_coords(renderer) -> None:
     return renderer._refresh_visible_chunk_coords()
 
 
+@profile
 def apply_visible_chunk_coord_delta(renderer, new_origin):
     return renderer._apply_visible_chunk_coord_delta(new_origin)

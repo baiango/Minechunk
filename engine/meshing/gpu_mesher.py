@@ -29,6 +29,7 @@ def _chunk_half() -> float:
     return float(_renderer_module().CHUNK_WORLD_SIZE) * 0.5
 
 
+@profile
 def ensure_voxel_mesh_batch_scratch(renderer, sample_size: int, height_limit: int, chunk_capacity: int | None = None) -> None:
     capacity = max(1, int(chunk_capacity if chunk_capacity is not None else renderer.mesh_batch_size))
     if (
@@ -98,6 +99,7 @@ def ensure_voxel_mesh_batch_scratch(renderer, sample_size: int, height_limit: in
     renderer._voxel_mesh_scratch_chunk_offsets_array = np.empty(max_chunk_count, dtype=np.uint32)
 
 
+@profile
 def create_async_voxel_mesh_batch_resources(renderer, sample_size: int, height_limit: int, chunk_count: int):
     ensure_voxel_mesh_batch_scratch(renderer, sample_size, height_limit, 1)
     chunk_capacity = max(1, int(chunk_count))
@@ -194,6 +196,7 @@ def async_voxel_mesh_batch_resources_match(resources, sample_size: int, height_l
     )
 
 
+@profile
 def destroy_async_voxel_mesh_batch_resources(resources) -> None:
     if resources.readback_buffer.map_state != "unmapped":
         try:
@@ -241,6 +244,7 @@ def schedule_async_voxel_mesh_batch_resource_release(renderer, resources, frames
     renderer._gpu_mesh_deferred_batch_resource_releases.append((max(1, int(frames)), resources))
 
 
+@profile
 def get_cached_async_voxel_mesh_emit_bind_group(renderer, resources, batch_allocation) -> object | None:
     _ = batch_allocation
     return resources.emit_bind_group
@@ -296,6 +300,7 @@ def process_gpu_buffer_cleanup(renderer) -> None:
         renderer._gpu_mesh_deferred_surface_batch_releases = next_surface_release_queue
 
 
+@profile
 def get_voxel_surface_expand_bind_group(renderer, surface_batch: ChunkSurfaceGpuBatch, blocks_buffer, materials_buffer, params_buffer) -> object:
     cache_key = (
         id(surface_batch.heights_buffer),
@@ -858,6 +863,7 @@ def make_chunk_mesh_batch_from_surface_gpu_batch(
     return meshes
 
 
+@profile
 def make_chunk_mesh_batches_from_surface_gpu_batches(renderer, surface_batches: list[ChunkSurfaceGpuBatch]) -> None:
     if renderer.voxel_surface_expand_pipeline is None:
         raise RuntimeError("GPU surface expansion pipeline is unavailable.")
@@ -928,6 +934,7 @@ def make_chunk_mesh_batches_from_surface_gpu_batches(renderer, surface_batches: 
         )
 
 
+@profile
 def release_pending_chunk_mesh_readback(renderer, pending) -> None:
     owner = pending.readback_owner
     if owner is None:
@@ -964,6 +971,7 @@ def release_pending_chunk_mesh_readback(renderer, pending) -> None:
         pass
 
 
+@profile
 def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> int:
     if not renderer._pending_gpu_mesh_batches:
         return 0

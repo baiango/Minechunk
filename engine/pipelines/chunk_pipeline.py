@@ -33,6 +33,7 @@ def _terrain_mesher(renderer):
         return metal_mesher
     return wgpu_mesher
 
+@profile
 def chunk_prep_priority(renderer, chunk_x: int, chunk_y: int, chunk_z: int, camera_chunk_x: int, camera_chunk_y: int, camera_chunk_z: int) -> tuple[float, int, int, int]:
     dx = chunk_x - camera_chunk_x
     dy = chunk_y - camera_chunk_y
@@ -40,6 +41,7 @@ def chunk_prep_priority(renderer, chunk_x: int, chunk_y: int, chunk_z: int, came
     distance_sq = float(dx * dx + dz * dz + (dy * dy * 4))
     return (distance_sq, abs(dy), abs(dz), abs(dx))
 
+@profile
 def gpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
     mesher = _terrain_mesher(renderer)
     meshes = mesher.make_chunk_mesh_batch_from_voxels(
@@ -72,6 +74,7 @@ def gpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_
         )
     return meshes[0]
 
+@profile
 def make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
     if renderer.use_gpu_meshing:
         try:
@@ -86,6 +89,7 @@ def make_chunk_mesh(renderer, chunk_x: int, chunk_y: int, chunk_z: int) -> Chunk
     voxel_grid, material_grid = renderer.world.chunk_voxel_grid(chunk_x, chunk_y, chunk_z)
     return make_chunk_mesh_from_voxels(renderer, chunk_x, chunk_y, chunk_z, voxel_grid, material_grid)
 
+@profile
 def accept_chunk_voxel_result(renderer, result) -> None:
     key = (int(result.chunk_x), int(getattr(result, "chunk_y", 0)), int(result.chunk_z))
     renderer._pending_chunk_coords.discard(key)
@@ -95,6 +99,7 @@ def accept_chunk_voxel_result(renderer, result) -> None:
         mesh = cpu_make_chunk_mesh_batch_from_voxels(renderer, [result])[0]
     mesh_cache.store_chunk_mesh(renderer, mesh)
 
+@profile
 def ensure_chunk_mesh(renderer, chunk_x: int, chunk_y: int, chunk_z: int) -> ChunkMesh:
     key = (chunk_x, chunk_y, chunk_z)
     mesh = renderer.chunk_cache.get(key)
@@ -121,6 +126,7 @@ def chunk_request_queue_needs_rebuild(renderer, current_origin: tuple[int, int, 
         return True
     return bool(renderer._visible_missing_coords) and not renderer._chunk_request_queue
 
+@profile
 def rebuild_chunk_request_queue(renderer, camera_chunk_x: int, camera_chunk_y: int, camera_chunk_z: int) -> None:
     missing_coords = renderer._visible_missing_coords
     current_origin = (int(camera_chunk_x), int(camera_chunk_y), int(camera_chunk_z))
@@ -170,6 +176,7 @@ def _chunk_prep_pipeline_backlog(renderer, terrain_backend_label: str) -> int:
         backlog += int(getattr(renderer, "_pending_surface_gpu_batches_chunk_total", 0))
     return backlog
 
+@profile
 def service_background_gpu_work(renderer) -> None:
     if getattr(renderer, "_device_lost", False):
         return
@@ -183,6 +190,7 @@ def service_background_gpu_work(renderer) -> None:
         if hasattr(mesher, "finalize_pending_gpu_mesh_batches"):
             mesher.finalize_pending_gpu_mesh_batches(renderer)
 
+@profile
 def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
     if getattr(renderer, "_device_lost", False):
         return 0.0, 0.0
@@ -376,9 +384,11 @@ class ChunkPipeline:
         self.cache = cache_stage
         self.profiling = profiling
 
+    @profile
     def prepare_chunks(self, dt: float):
         return prepare_chunks(self.renderer, dt)
 
+    @profile
     def service_background_gpu_work(self) -> None:
         return service_background_gpu_work(self.renderer)
 

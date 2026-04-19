@@ -16,6 +16,12 @@ from ..meshing import gpu_mesher as wgpu_mesher
 
 MERGED_TILE_AGE_REFRESH_INTERVAL_SECONDS = 0.25
 
+try:
+    profile  # type: ignore[name-defined]
+except NameError:  # pragma: no cover - only used outside kernprof
+    def profile(func):
+        return func
+
 
 def _renderer_module():
     from .. import renderer as renderer_module
@@ -189,6 +195,46 @@ def slab_accepts_size_class(slab: MeshOutputSlab, size_class_bytes: int) -> bool
     return slab_class == int(size_class_bytes)
 
 
+def _mesh_output_slabs_for_size_class(renderer, size_class_bytes: int) -> OrderedDict[int, MeshOutputSlab]:
+    slabs_by_class = getattr(renderer, "_mesh_output_slabs_by_size_class", None)
+    if slabs_by_class is None:
+        slabs_by_class = {}
+        setattr(renderer, "_mesh_output_slabs_by_size_class", slabs_by_class)
+    class_key = int(size_class_bytes)
+    class_slabs = slabs_by_class.get(class_key)
+    if class_slabs is None:
+        class_slabs = OrderedDict()
+        slabs_by_class[class_key] = class_slabs
+    return class_slabs
+
+
+def _index_mesh_output_slab(renderer, slab: MeshOutputSlab) -> None:
+    _mesh_output_slabs_for_size_class(renderer, int(getattr(slab, "size_class_bytes", 0)))[slab.slab_id] = slab
+
+
+def _unindex_mesh_output_slab(renderer, slab: MeshOutputSlab) -> None:
+    slabs_by_class = getattr(renderer, "_mesh_output_slabs_by_size_class", None)
+    if not slabs_by_class:
+        return
+    class_key = int(getattr(slab, "size_class_bytes", 0))
+    class_slabs = slabs_by_class.get(class_key)
+    if class_slabs is None:
+        return
+    class_slabs.pop(slab.slab_id, None)
+    if not class_slabs:
+        slabs_by_class.pop(class_key, None)
+
+
+def _touch_mesh_output_slab(renderer, slab: MeshOutputSlab) -> None:
+    renderer._mesh_output_slabs.move_to_end(slab.slab_id)
+    class_slabs = _mesh_output_slabs_for_size_class(renderer, int(getattr(slab, "size_class_bytes", 0)))
+    if slab.slab_id in class_slabs:
+        class_slabs.move_to_end(slab.slab_id)
+    else:
+        class_slabs[slab.slab_id] = slab
+
+
+@profile
 def create_mesh_output_slab(renderer, size_bytes: int, size_class_bytes: int) -> MeshOutputSlab:
     if getattr(renderer, "_device_lost", False):
         raise RuntimeError("Render device is unavailable after device loss.")
@@ -205,10 +251,12 @@ def create_mesh_output_slab(renderer, size_bytes: int, size_class_bytes: int) ->
     )
     renderer._next_mesh_output_slab_id += 1
     renderer._mesh_output_slabs[slab.slab_id] = slab
+    _index_mesh_output_slab(renderer, slab)
     renderer._mesh_output_append_slab_id = slab.slab_id
     return slab
 
 
+@profile
 def register_mesh_output_allocation(
     renderer,
     slab: MeshOutputSlab,
@@ -225,11 +273,12 @@ def register_mesh_output_allocation(
     )
     renderer._next_mesh_allocation_id += 1
     renderer._mesh_allocations[allocation.allocation_id] = allocation
-    renderer._mesh_output_slabs.move_to_end(slab.slab_id)
+    _touch_mesh_output_slab(renderer, slab)
     renderer._mesh_output_append_slab_id = slab.slab_id
     return allocation
 
 
+@profile
 def allocate_from_mesh_output_slab_bump(
     renderer,
     slab: MeshOutputSlab,
@@ -249,6 +298,7 @@ def allocate_from_mesh_output_slab_bump(
     return register_mesh_output_allocation(renderer, slab, aligned_offset, needed_bytes)
 
 
+@profile
 def find_mesh_output_slab_free_range_choice(
     renderer,
     slab: MeshOutputSlab,
@@ -292,6 +342,7 @@ def find_mesh_output_slab_free_range_choice(
     return None
 
 
+@profile
 def allocate_from_mesh_output_slab_free_ranges(
     renderer,
     slab: MeshOutputSlab,
@@ -330,6 +381,7 @@ def allocate_from_mesh_output_slab_free_ranges(
     return register_mesh_output_allocation(renderer, slab, aligned_offset, needed_bytes)
 
 
+@profile
 def allocate_from_mesh_output_slab(
     renderer,
     slab: MeshOutputSlab,
@@ -341,45 +393,58 @@ def allocate_from_mesh_output_slab(
     return allocate_from_mesh_output_slab_free_ranges(renderer, slab, request_bytes)
 
 
+@profile
 def allocate_mesh_output_range(renderer, request_bytes: int) -> MeshBufferAllocation:
     needed_bytes = max(1, int(request_bytes))
     needed_bytes = renderer._align_up(needed_bytes, renderer._mesh_output_binding_alignment)
     size_class_bytes = mesh_output_request_size_class(renderer, needed_bytes)
 
-    slab_items = list(renderer._mesh_output_slabs.items())
-    if slab_items:
-        for _, slab in slab_items:
-            trim_mesh_output_slab_tail(renderer, slab)
+    class_slabs = _mesh_output_slabs_for_size_class(renderer, size_class_bytes)
+    if class_slabs:
+        append_slab_id = renderer._mesh_output_append_slab_id
+        if append_slab_id is not None:
+            append_slab = class_slabs.get(int(append_slab_id))
+            if append_slab is not None:
+                allocation = allocate_from_mesh_output_slab_bump(renderer, append_slab, needed_bytes)
+                if allocation is not None:
+                    return allocation
 
-        class_slab_items = [
-            (slab_id, slab)
-            for slab_id, slab in slab_items
-            if slab_accepts_size_class(slab, size_class_bytes)
-        ]
+        recent_candidates: list[MeshOutputSlab] = []
+        for slab_id, slab in reversed(class_slabs.items()):
+            if append_slab_id is not None and int(slab_id) == int(append_slab_id):
+                continue
+            recent_candidates.append(slab)
+            if len(recent_candidates) >= 4:
+                break
+        for slab in recent_candidates:
+            allocation = allocate_from_mesh_output_slab_bump(renderer, slab, needed_bytes)
+            if allocation is not None:
+                return allocation
 
         best_free_choice: tuple[int, int, int, MeshOutputSlab] | None = None
-        for slab_id, slab in class_slab_items:
+        for slab_id, slab in class_slabs.items():
             choice = find_mesh_output_slab_free_range_choice(renderer, slab, needed_bytes)
             if choice is None:
                 continue
             waste, range_size, _, _, _ = choice
-            ranked = (waste, range_size, slab_id)
+            ranked = (waste, range_size, int(slab_id))
             if best_free_choice is None or ranked < best_free_choice[:3]:
-                best_free_choice = (waste, range_size, slab_id, slab)
+                best_free_choice = (waste, range_size, int(slab_id), slab)
         if best_free_choice is not None:
             allocation = allocate_from_mesh_output_slab_free_ranges(renderer, best_free_choice[3], needed_bytes)
             if allocation is not None:
                 return allocation
 
-        append_candidates: list[tuple[int, int, int, MeshOutputSlab]] = []
-        for slab_id, slab in class_slab_items:
+        best_append_choice: tuple[int, int, int, MeshOutputSlab] | None = None
+        for slab_id, slab in class_slabs.items():
             tail_free_bytes = slab_tail_free_bytes(slab)
             if tail_free_bytes < needed_bytes:
                 continue
-            append_candidates.append((tail_free_bytes - needed_bytes, abs(int(slab.size_bytes) - needed_bytes), slab_id, slab))
-        if append_candidates:
-            _, _, _, slab = min(append_candidates)
-            allocation = allocate_from_mesh_output_slab_bump(renderer, slab, needed_bytes)
+            ranked = (tail_free_bytes - needed_bytes, abs(int(slab.size_bytes) - needed_bytes), int(slab_id), slab)
+            if best_append_choice is None or ranked[:3] < best_append_choice[:3]:
+                best_append_choice = ranked
+        if best_append_choice is not None:
+            allocation = allocate_from_mesh_output_slab_bump(renderer, best_append_choice[3], needed_bytes)
             if allocation is not None:
                 return allocation
 
@@ -394,6 +459,7 @@ def allocate_mesh_output_range(renderer, request_bytes: int) -> MeshBufferAlloca
     return allocation
 
 
+@profile
 def coalesce_mesh_output_free_ranges(free_ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     if not free_ranges:
         return []
@@ -413,6 +479,7 @@ def coalesce_mesh_output_free_ranges(free_ranges: list[tuple[int, int]]) -> list
     return [(offset, size) for offset, size in merged]
 
 
+@profile
 def trim_mesh_output_slab_tail(renderer, slab: MeshOutputSlab) -> None:
     _ensure_slab_free_range_indexes(slab)
     tail_offset = int(slab.append_offset)
@@ -429,6 +496,7 @@ def trim_mesh_output_slab_tail(renderer, slab: MeshOutputSlab) -> None:
     _sync_slab_free_ranges(slab)
 
 
+@profile
 def refresh_mesh_output_append_slab(renderer) -> None:
     renderer._mesh_output_append_slab_id = None
     best_choice: tuple[int, int, int] | None = None
@@ -454,6 +522,7 @@ def retire_mesh_output_slab_if_empty(renderer, slab: MeshOutputSlab) -> None:
     slab.buffer.destroy()
 
 
+@profile
 def free_mesh_output_range(renderer, slab_id: int, offset_bytes: int, size_bytes: int) -> None:
     slab = renderer._mesh_output_slabs.get(int(slab_id))
     if slab is None:
@@ -463,7 +532,7 @@ def free_mesh_output_range(renderer, slab_id: int, offset_bytes: int, size_bytes
     retire_mesh_output_slab_if_empty(renderer, slab)
     if slab.slab_id not in renderer._mesh_output_slabs:
         return
-    renderer._mesh_output_slabs.move_to_end(slab.slab_id)
+    _touch_mesh_output_slab(renderer, slab)
     refresh_mesh_output_append_slab(renderer)
 
 
@@ -474,6 +543,7 @@ def schedule_mesh_output_range_free(renderer, slab_id: int, offset_bytes: int, s
     )
 
 
+@profile
 def process_deferred_mesh_output_frees(renderer) -> None:
     if not renderer._deferred_mesh_output_frees:
         return
@@ -488,6 +558,7 @@ def process_deferred_mesh_output_frees(renderer) -> None:
     renderer._deferred_mesh_output_frees.extend(next_queue)
 
 
+@profile
 def retain_chunk_mesh_storage(renderer, mesh: ChunkMesh) -> None:
     if mesh.allocation_id is None:
         renderer._retain_mesh_buffer(mesh.vertex_buffer)
@@ -498,6 +569,7 @@ def retain_chunk_mesh_storage(renderer, mesh: ChunkMesh) -> None:
     allocation.refcount += 1
 
 
+@profile
 def release_chunk_mesh_storage(renderer, mesh: ChunkMesh) -> None:
     if mesh.allocation_id is None:
         shared_empty_buffer = getattr(renderer, "_shared_empty_chunk_vertex_buffer", None)
@@ -523,6 +595,7 @@ def release_chunk_mesh_storage(renderer, mesh: ChunkMesh) -> None:
     )
 
 
+@profile
 def clear_tile_render_batches(renderer) -> None:
     for batch in renderer._tile_render_batches.values():
         if getattr(batch, "owns_vertex_buffer", False) and batch.vertex_buffer is not None:
@@ -539,6 +612,7 @@ def clear_tile_render_batches(renderer) -> None:
     renderer._cached_visible_render_batches.clear()
 
 
+@profile
 def mark_tile_dirty(renderer, chunk_x: int, chunk_z: int, chunk_y: int = 0) -> None:
     key = tile_key(renderer, int(chunk_x), int(chunk_z), int(chunk_y))
     renderer._tile_dirty_keys.add(key)
@@ -587,6 +661,7 @@ def _append_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
         active_meshes.append(mesh)
 
 
+@profile
 def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
     if not meshes:
         return
@@ -694,6 +769,7 @@ def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
         renderer._chunk_request_queue_dirty = True
 
 
+@profile
 def store_chunk_mesh(renderer, mesh: ChunkMesh) -> None:
     store_chunk_meshes(renderer, [mesh])
 
@@ -758,6 +834,7 @@ def merge_chunk_bounds(renderer, tile_meshes: list[ChunkMesh]) -> tuple[float, f
     return center_x, center_y, center_z, radius
 
 
+@profile
 def merge_tile_meshes(renderer, tile_meshes: list[ChunkMesh], encoder) -> wgpu.GPUBuffer:
     renderer_module = _renderer_module()
     vertex_stride = int(renderer_module.VERTEX_STRIDE)
@@ -941,8 +1018,15 @@ def _extend_direct_render_batches_grouped(
     render_batch_groups: OrderedDict[tuple[int, int], list[tuple[wgpu.GPUBuffer, int, int, int]]],
     batches: tuple[tuple[wgpu.GPUBuffer, int, int, int], ...] | list[tuple[wgpu.GPUBuffer, int, int, int]],
 ) -> None:
+    if not batches:
+        return
+    append_grouped = _append_direct_render_batch_grouped
+    if len(batches) == 1:
+        vertex_buffer, binding_offset, vertex_count, first_vertex = batches[0]
+        append_grouped(render_batch_groups, vertex_buffer, binding_offset, vertex_count, first_vertex)
+        return
     for vertex_buffer, binding_offset, vertex_count, first_vertex in batches:
-        _append_direct_render_batch_grouped(render_batch_groups, vertex_buffer, binding_offset, vertex_count, first_vertex)
+        append_grouped(render_batch_groups, vertex_buffer, binding_offset, vertex_count, first_vertex)
 
 
 def _finalize_direct_render_batch_groups(
@@ -950,12 +1034,21 @@ def _finalize_direct_render_batch_groups(
 ) -> list[tuple[wgpu.GPUBuffer, int, int, int]]:
     if not render_batch_groups:
         return []
+    if len(render_batch_groups) == 1:
+        only_batches = next(iter(render_batch_groups.values()))
+        if len(only_batches) <= 1:
+            return list(only_batches)
     normalized: list[tuple[wgpu.GPUBuffer, int, int, int]] = []
+    append_direct = _append_direct_render_batch
     for batches in render_batch_groups.values():
-        if len(batches) > 1:
+        batch_count = len(batches)
+        if batch_count == 1:
+            append_direct(normalized, *batches[0])
+            continue
+        if batch_count > 1:
             batches.sort(key=lambda item: item[3])
-        for vertex_buffer, binding_offset, vertex_count, first_vertex in batches:
-            _append_direct_render_batch(normalized, vertex_buffer, binding_offset, vertex_count, first_vertex)
+        for batch in batches:
+            append_direct(normalized, *batch)
     return normalized
 
 
@@ -1004,6 +1097,29 @@ def _cached_tile_batch_stats(batch: ChunkRenderBatch) -> tuple[int, int, int, fl
         int(getattr(batch, "visible_vertex_count", 0)),
         float(getattr(batch, "next_refresh_at", 0.0)),
     )
+
+
+def _build_visible_tile_iterable(
+    visible_active_tile_keys: list[tuple[int, int, int]] | tuple[tuple[int, int, int], ...],
+    active_key_set: set[tuple[int, int, int]],
+    tile_render_batches: dict[tuple[int, int, int], ChunkRenderBatch],
+    visible_tile_dirty_keys: set[tuple[int, int, int]],
+) -> list[tuple[int, int, int]] | tuple[tuple[int, int, int], ...]:
+    if not visible_tile_dirty_keys:
+        return visible_active_tile_keys
+    tile_iterable = list(visible_active_tile_keys)
+    seen = set(active_key_set) if active_key_set else set(tile_iterable)
+    seen_add = seen.add
+    tile_iterable_append = tile_iterable.append
+    for tile_key_value in tile_render_batches.keys():
+        if tile_key_value not in seen:
+            seen_add(tile_key_value)
+            tile_iterable_append(tile_key_value)
+    for tile_key_value in visible_tile_dirty_keys:
+        if tile_key_value not in seen:
+            seen_add(tile_key_value)
+            tile_iterable_append(tile_key_value)
+    return tile_iterable
 
 
 def _store_cached_tile_render_batch(
@@ -1055,6 +1171,7 @@ def _store_cached_tile_render_batch(
     return batch
 
 
+@profile
 def build_tile_draw_batches(
     renderer,
     meshes: list[ChunkMesh] | None,
@@ -1069,13 +1186,13 @@ def build_tile_draw_batches(
 
     cache_key: tuple[int, int, int] | None = None
     now = 0.0
-    visible_tile_keys: list[tuple[int, int, int]] | None = None
     current_tile_keys: set[tuple[int, int, int]]
 
     if meshes is None:
+        visible_tile_dirty_keys = renderer._visible_tile_dirty_keys
         cache_key = (int(renderer._visible_layout_version), int(renderer._visible_tile_mutation_version), 1 if age_gate else 0)
         cached = renderer._cached_tile_draw_batches.get(cache_key)
-        if cached is not None and not renderer._visible_tile_dirty_keys:
+        if cached is not None and not visible_tile_dirty_keys:
             cached_until, cached_batches, cached_merged, cached_visible, cached_vertices = cached
             if cached_until <= 0.0:
                 return cached_batches, cached_merged, cached_visible, cached_vertices, 0.0
@@ -1084,9 +1201,9 @@ def build_tile_draw_batches(
                 return cached_batches, cached_merged, cached_visible, cached_vertices, cached_until
         if not renderer._visible_chunk_coords:
             renderer._refresh_visible_chunk_coords()
-        visible_tile_keys = getattr(renderer, "_visible_tile_keys", None) or []
+            visible_tile_dirty_keys = renderer._visible_tile_dirty_keys
         visible_tile_active_meshes = getattr(renderer, "_visible_tile_active_meshes", None) or {}
-        current_tile_keys = getattr(renderer, "_visible_tile_key_set", None) or set(visible_tile_keys)
+        current_tile_keys = getattr(renderer, "_visible_tile_key_set", None) or set(getattr(renderer, "_visible_tile_keys", None) or ())
     else:
         tile_groups: dict[tuple[int, int, int], list[ChunkMesh]] = {}
         for mesh in meshes:
@@ -1099,21 +1216,23 @@ def build_tile_draw_batches(
                 tile_groups[tile_key_value] = group
             group.append(mesh)
         current_tile_keys = set(tile_groups.keys())
+        visible_tile_dirty_keys = set()
 
+    tile_render_batches = renderer._tile_render_batches
     if meshes is None:
         visible_layout_version = int(getattr(renderer, "_visible_layout_version", 0))
         last_cleanup_layout_version = int(getattr(renderer, "_tile_render_batch_cleanup_layout_version", -1))
         if last_cleanup_layout_version != visible_layout_version:
-            stale_keys = [tile_key_value for tile_key_value in renderer._tile_render_batches if tile_key_value not in current_tile_keys]
+            stale_keys = [tile_key_value for tile_key_value in tile_render_batches if tile_key_value not in current_tile_keys]
             for tile_key_value in stale_keys:
-                batch = renderer._tile_render_batches.pop(tile_key_value)
+                batch = tile_render_batches.pop(tile_key_value)
                 if getattr(batch, "owns_vertex_buffer", False) and batch.vertex_buffer is not None:
                     renderer._transient_render_buffers.append([batch.vertex_buffer])
             renderer._tile_render_batch_cleanup_layout_version = visible_layout_version
     else:
-        stale_keys = [tile_key_value for tile_key_value in renderer._tile_render_batches if tile_key_value not in current_tile_keys]
+        stale_keys = [tile_key_value for tile_key_value in tile_render_batches if tile_key_value not in current_tile_keys]
         for tile_key_value in stale_keys:
-            batch = renderer._tile_render_batches.pop(tile_key_value)
+            batch = tile_render_batches.pop(tile_key_value)
             if getattr(batch, "owns_vertex_buffer", False) and batch.vertex_buffer is not None:
                 renderer._transient_render_buffers.append([batch.vertex_buffer])
 
@@ -1129,41 +1248,50 @@ def build_tile_draw_batches(
     visible_vertex_count = 0
 
     if meshes is None:
-        assert visible_tile_keys is not None
-        tile_render_batches = renderer._tile_render_batches
-        visible_tile_dirty_keys = renderer._visible_tile_dirty_keys
         visible_active_tile_keys = getattr(renderer, "_visible_active_tile_keys", None) or ()
-        if not visible_tile_dirty_keys:
-            tile_iterable = visible_active_tile_keys
-        else:
-            active_key_set = getattr(renderer, "_visible_active_tile_key_set", None) or set(visible_active_tile_keys)
-            tile_iterable = list(visible_active_tile_keys)
-            tile_iterable.extend(
-                tile_key_value
-                for tile_key_value in visible_tile_keys
-                if tile_key_value not in active_key_set
-                and (tile_key_value in tile_render_batches or tile_key_value in visible_tile_dirty_keys)
-            )
+        active_key_set = getattr(renderer, "_visible_active_tile_key_set", None) or set(visible_active_tile_keys)
+        tile_iterable = _build_visible_tile_iterable(
+            visible_active_tile_keys,
+            active_key_set,
+            tile_render_batches,
+            visible_tile_dirty_keys,
+        )
+        tile_render_batches_get = tile_render_batches.get
+        tile_versions_get = renderer._tile_versions.get
+        visible_masks_get = visible_masks.get
+        visible_tile_active_meshes_get = visible_tile_active_meshes.get
+        visible_tile_dirty_contains = visible_tile_dirty_keys.__contains__
     else:
         tile_iterable = sorted(tile_groups)
+        tile_render_batches_get = tile_render_batches.get
+        tile_versions_get = renderer._tile_versions.get
+        visible_masks_get = visible_masks.get
+        visible_tile_active_meshes_get = None
+        visible_tile_dirty_contains = visible_tile_dirty_keys.__contains__
+
+    draw_batches_extend = draw_batches.extend
+    draw_batches_append = draw_batches.append
+    grouped_extend = _extend_direct_render_batches_grouped
+    direct_extend = _extend_direct_render_batches
 
     for tile_key_value in tile_iterable:
-        existing = renderer._tile_render_batches.get(tile_key_value)
-        tile_version = int(renderer._tile_versions.get(tile_key_value, 0))
-        tile_is_dirty = tile_key_value in renderer._visible_tile_dirty_keys or (existing is not None and existing.source_version != tile_version)
-        current_visible_mask = int(visible_masks.get(tile_key_value, 0))
+        existing = tile_render_batches_get(tile_key_value)
+        tile_version = int(tile_versions_get(tile_key_value, 0))
+        tile_is_dirty = visible_tile_dirty_contains(tile_key_value) or (existing is not None and existing.source_version != tile_version)
+        current_visible_mask = int(visible_masks_get(tile_key_value, 0))
 
         if meshes is None and existing is not None and not tile_is_dirty and existing.visible_mask == current_visible_mask:
             tile_merged, tile_visible, tile_vertices, tile_refresh_at = _cached_tile_batch_stats(existing)
             if tile_visible > 0 and (tile_refresh_at <= 0.0 or now < tile_refresh_at):
                 cached_draw_batches = getattr(existing, "cached_draw_batches", ())
                 if cached_draw_batches:
+                    cached_render_batches = getattr(existing, "cached_render_batches", ())
                     if direct_render_batch_groups is not None:
-                        _extend_direct_render_batches_grouped(direct_render_batch_groups, getattr(existing, "cached_render_batches", ()))
+                        grouped_extend(direct_render_batch_groups, cached_render_batches)
                     elif direct_render_batches is not None:
-                        _extend_direct_render_batches(direct_render_batches, getattr(existing, "cached_render_batches", ()))
+                        direct_extend(direct_render_batches, cached_render_batches)
                     else:
-                        draw_batches.extend(cached_draw_batches)
+                        draw_batches_extend(cached_draw_batches)
                 merged_chunk_count += tile_merged
                 visible_chunk_count += tile_visible
                 visible_vertex_count += tile_vertices
@@ -1172,7 +1300,7 @@ def build_tile_draw_batches(
                 continue
 
         if meshes is None:
-            tile_meshes = visible_tile_active_meshes.get(tile_key_value)
+            tile_meshes = visible_tile_active_meshes_get(tile_key_value)
             if not tile_meshes:
                 continue
         else:
@@ -1252,11 +1380,11 @@ def build_tile_draw_batches(
                 owns_vertex_buffer=False,
             )
             if direct_render_batch_groups is not None:
-                _extend_direct_render_batches_grouped(direct_render_batch_groups, batch.cached_render_batches)
+                grouped_extend(direct_render_batch_groups, batch.cached_render_batches)
             elif direct_render_batches is not None:
-                _extend_direct_render_batches(direct_render_batches, batch.cached_render_batches)
+                direct_extend(direct_render_batches, batch.cached_render_batches)
             else:
-                draw_batches.append(single_draw_batch)
+                draw_batches_append(single_draw_batch)
             visible_chunk_count += 1
             visible_vertex_count += int(mesh.vertex_count)
             mesh_refresh_at = 0.0 if (not age_gate or now - float(mesh.created_at) >= merged_tile_min_age_seconds) else float(mesh.created_at) + merged_tile_min_age_seconds
@@ -1314,11 +1442,11 @@ def build_tile_draw_batches(
                 owns_vertex_buffer=False,
             )
             if direct_render_batch_groups is not None:
-                _extend_direct_render_batches_grouped(direct_render_batch_groups, batch.cached_render_batches)
+                grouped_extend(direct_render_batch_groups, batch.cached_render_batches)
             elif direct_render_batches is not None:
-                _extend_direct_render_batches(direct_render_batches, batch.cached_render_batches)
+                direct_extend(direct_render_batches, batch.cached_render_batches)
             else:
-                draw_batches.extend(tile_draw_batches)
+                draw_batches_extend(tile_draw_batches)
             visible_chunk_count += tile_visible_chunk_count
             visible_vertex_count += tile_visible_vertex_count
             if tile_next_refresh > 0.0 and (next_refresh_at <= 0.0 or tile_next_refresh < next_refresh_at):
@@ -1386,11 +1514,11 @@ def build_tile_draw_batches(
             owns_vertex_buffer=True,
         )
         if direct_render_batch_groups is not None:
-            _extend_direct_render_batches_grouped(direct_render_batch_groups, batch.cached_render_batches)
+            grouped_extend(direct_render_batch_groups, batch.cached_render_batches)
         elif direct_render_batches is not None:
-            _extend_direct_render_batches(direct_render_batches, batch.cached_render_batches)
+            direct_extend(direct_render_batches, batch.cached_render_batches)
         else:
-            draw_batches.extend(batch.cached_draw_batches)
+            draw_batches_extend(batch.cached_draw_batches)
         merged_chunk_count += batch.merged_chunk_count
         visible_chunk_count += batch.visible_chunk_count
         visible_vertex_count += batch.visible_vertex_count
@@ -1418,6 +1546,7 @@ def build_tile_draw_batches(
     return draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count, next_refresh_at
 
 
+@profile
 def ensure_mesh_draw_indirect_scratch(renderer, command_capacity: int) -> None:
     renderer_module = _renderer_module()
     indirect_draw_command_stride = int(renderer_module.INDIRECT_DRAW_COMMAND_STRIDE)
@@ -1440,6 +1569,7 @@ def ensure_mesh_draw_indirect_scratch(renderer, command_capacity: int) -> None:
         wgpu_mesher.schedule_gpu_buffer_cleanup(renderer, [old_buffer], frames=6)
 
 
+@profile
 def ensure_mesh_visibility_scratch(renderer, record_capacity: int) -> None:
     renderer_module = _renderer_module()
     mesh_visibility_record_dtype = renderer_module.MESH_VISIBILITY_RECORD_DTYPE
@@ -1465,6 +1595,7 @@ def ensure_mesh_visibility_scratch(renderer, record_capacity: int) -> None:
         wgpu_mesher.schedule_gpu_buffer_cleanup(renderer, [old_buffer], frames=6)
 
 
+@profile
 def build_gpu_visibility_records(
     renderer,
     encoder,
@@ -1513,6 +1644,7 @@ def build_gpu_visibility_records(
     return render_batches, command_count, merged_chunk_count, visible_chunk_count, visible_vertex_count
 
 
+@profile
 def visible_render_batches_indirect(
     renderer,
     encoder,
@@ -1590,6 +1722,7 @@ def tile_visible_mask(renderer, tile_key_value: tuple[int, int, int], tile_meshe
     return mask
 
 
+@profile
 def visible_render_batches(
     renderer,
     encoder,

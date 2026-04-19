@@ -32,6 +32,7 @@ def _renderer_module():
 
     return renderer_module
 
+@profile
 def _shared_empty_chunk_vertex_buffer(renderer) -> wgpu.GPUBuffer:
     buffer = getattr(renderer, "_shared_empty_chunk_vertex_buffer", None)
     if buffer is not None:
@@ -43,6 +44,7 @@ def _shared_empty_chunk_vertex_buffer(renderer) -> wgpu.GPUBuffer:
     setattr(renderer, "_shared_empty_chunk_vertex_buffer", buffer)
     return buffer
 
+@profile
 def make_chunk_mesh_fast(
     renderer,
     *,
@@ -85,6 +87,7 @@ def make_chunk_mesh_fast(
     mesh.first_vertex = first_vertex
     return mesh
 
+@profile
 def _stacked_vertical_neighbor_planes(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid) -> tuple[np.ndarray, np.ndarray]:
     renderer_module = _renderer_module()
     sample_size = int(renderer_module.CHUNK_SIZE) + 2
@@ -107,6 +110,7 @@ def _stacked_vertical_neighbor_planes(renderer, chunk_x: int, chunk_y: int, chun
 
 _EMPTY_VERTEX_ARRAY = np.empty((0, int(getattr(_renderer_module(), "VERTEX_COMPONENTS", 12))), dtype=np.float32)
 
+@profile
 def build_chunk_vertex_array(
     renderer,
     voxel_grid,
@@ -143,6 +147,7 @@ def build_chunk_vertex_array(
         chunk_max_height = int(chunk_y * renderer_module.CHUNK_SIZE + np.max(voxel_grid))
     return used_vertex_array, used_vertex_count, chunk_max_height
 
+@profile
 def cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVoxelResult]) -> list[ChunkMesh]:
     if not chunk_results:
         return []
@@ -305,6 +310,7 @@ def cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVox
 
     return meshes
 
+@profile
 def cpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
     meshes = cpu_make_chunk_mesh_batch_from_voxels(
         renderer,
