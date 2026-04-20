@@ -14,6 +14,7 @@ class ChunkMesh:
     vertex_count: int
     vertex_buffer: wgpu.GPUBuffer
     max_height: int
+    chunk_y: int = 0
     vertex_offset: int = 0
     created_at: float = 0.0
     allocation_id: int | None = None
@@ -25,17 +26,24 @@ class ChunkMesh:
         try:
             from . import renderer as renderer_module
 
+            chunk_world_size = float(renderer_module.CHUNK_WORLD_SIZE)
+            block_size = float(renderer_module.BLOCK_SIZE)
             chunk_size = int(renderer_module.CHUNK_SIZE)
             vertex_stride = int(renderer_module.VERTEX_STRIDE)
         except Exception:
-            chunk_size = 32
+            chunk_size = 64
+            chunk_world_size = 6.4
+            block_size = 0.1
             vertex_stride = 48
-        half_chunk = chunk_size * 0.5
-        half_height = float(self.max_height) * 0.5
+        half_chunk = chunk_world_size * 0.5
+        min_y = float(self.chunk_y * chunk_size) * block_size
+        max_y = float(self.max_height) * block_size
+        center_y = min_y + max(0.0, max_y - min_y) * 0.5
+        half_height = max(0.0, max_y - min_y) * 0.5
         self.bounds = (
-            float(self.chunk_x * chunk_size + half_chunk),
-            float(half_height),
-            float(self.chunk_z * chunk_size + half_chunk),
+            float(self.chunk_x * chunk_world_size + half_chunk),
+            float(center_y),
+            float(self.chunk_z * chunk_world_size + half_chunk),
             float(math.sqrt(half_chunk * half_chunk * 2.0 + half_height * half_height)),
         )
         self.binding_offset = int(self.vertex_offset % vertex_stride)
@@ -64,15 +72,25 @@ class MeshBufferAllocation:
 
 @dataclass
 class ChunkRenderBatch:
-    signature: tuple[tuple[int, int], ...]
+    signature: tuple[tuple[int, int, int], ...]
     vertex_count: int
-    vertex_buffer: wgpu.GPUBuffer
+    vertex_buffer: wgpu.GPUBuffer | None
     bounds: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     chunk_count: int = 0
     complete_tile: bool = False
     all_mature: bool = False
     visible_mask: int = 0
     source_version: int = 0
+    cached_draw_batches: tuple[ChunkDrawBatch, ...] = field(default_factory=tuple)
+    cached_render_batches: tuple[tuple[wgpu.GPUBuffer, int, int, int], ...] = field(default_factory=tuple)
+    cached_grouped_render_batches: tuple[tuple[tuple[int, int], wgpu.GPUBuffer, int, tuple[tuple[wgpu.GPUBuffer, int, int, int], ...]], ...] = field(default_factory=tuple)
+    next_refresh_at: float = 0.0
+    visible_chunk_count: int = 0
+    merged_chunk_count: int = 0
+    visible_vertex_count: int = 0
+    owns_vertex_buffer: bool = False
+    owned_vertex_buffer_capacity_bytes: int = 0
+    allocation_id: int | None = None
 
 
 @dataclass
@@ -118,7 +136,7 @@ class PendingChunkMeshReadbackGroup:
 
 @dataclass
 class PendingChunkMeshBatch:
-    chunk_coords: list[tuple[int, int]]
+    chunk_coords: list[tuple[int, int, int]]
     chunk_count: int
     sample_size: int
     height_limit: int

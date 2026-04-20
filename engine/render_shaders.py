@@ -10,6 +10,7 @@ VOXEL_SURFACE_EXPAND_BIND_GROUP_CACHE_LIMIT = render_consts.VOXEL_SURFACE_EXPAND
 
 HUD_FONT_SCALE = render_consts.HUD_FONT_SCALE
 HUD_FONT_CHAR_WIDTH = render_consts.HUD_FONT_CHAR_WIDTH
+VOLUMETRIC_LIGHTING_SAMPLES = render_consts.VOLUMETRIC_LIGHTING_SAMPLES
 HUD_FONT_CHAR_HEIGHT = render_consts.HUD_FONT_CHAR_HEIGHT
 HUD_PANEL_PADDING = render_consts.HUD_PANEL_PADDING
 HUD_LINE_SPACING = render_consts.HUD_LINE_SPACING
@@ -222,9 +223,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let x1 = x0 + cell_size;
     let z0 = origin_z + f32(cell_z) * cell_size;
     let z1 = z0 + cell_size;
-    let y0 = f32(height);
-    let east_y = f32(east_height);
-    let south_y = f32(south_height);
+    let y0 = f32(height) * cell_size;
+    let east_y = f32(east_height) * cell_size;
+    let south_y = f32(south_height) * cell_size;
 
     let top = face_color(material, height, 1.0);
     let east = face_color(material, height, 0.80);
@@ -350,6 +351,213 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
 """
 
 
+OCCLUSION_MASK_SHADER = """
+struct CameraUniform {
+    position: vec4f,
+    right: vec4f,
+    up: vec4f,
+    forward: vec4f,
+    proj: vec4f,
+}
+
+struct VertexInput {
+    @location(0) position: vec4f,
+    @location(1) normal: vec4f,
+    @location(2) color: vec4f,
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+}
+
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    let world = input.position.xyz;
+    let to_point = world - camera.position.xyz;
+    let view_x = dot(to_point, camera.right.xyz);
+    let view_y = dot(to_point, camera.up.xyz);
+    let view_z = dot(to_point, camera.forward.xyz);
+
+    if (view_z <= camera.proj.z) {
+        out.position = vec4f(2.0, 2.0, 2.0, 1.0);
+        return out;
+    }
+
+    let focal = camera.proj.x;
+    let aspect = camera.proj.y;
+    let near = camera.proj.z;
+    let far = camera.proj.w;
+    let clip_x = view_x * focal / aspect;
+    let clip_y = view_y * focal;
+    let clip_z = view_z * (far / (far - near)) - (near * far) / (far - near);
+    out.position = vec4f(clip_x, clip_y, clip_z, view_z);
+    return out;
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4f {
+    return vec4f(0.0, 0.0, 0.0, 1.0);
+}
+"""
+
+
+RADIAL_BLUR_SHADER = """
+struct RadialBlurParams {
+    light_uv_and_density: vec4f,
+    weight_decay_exposure_strength: vec4f,
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f,
+}
+
+@group(0) @binding(0) var occlusion_tex: texture_2d<f32>;
+@group(0) @binding(1) var occlusion_sampler: sampler;
+@group(0) @binding(2) var<uniform> params: RadialBlurParams;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2f, 3>(
+        vec2f(-1.0, -3.0),
+        vec2f(-1.0, 1.0),
+        vec2f(3.0, 1.0),
+    );
+    var out: VertexOutput;
+    let pos = positions[vertex_index];
+    out.position = vec4f(pos, 0.0, 1.0);
+    out.uv = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+    let light_uv = params.light_uv_and_density.xy;
+    let density = params.light_uv_and_density.z;
+    let weight = params.light_uv_and_density.w;
+    let decay = params.weight_decay_exposure_strength.x;
+    let exposure = params.weight_decay_exposure_strength.y;
+    let strength = params.weight_decay_exposure_strength.z;
+    let samples = u32(max(params.weight_decay_exposure_strength.w, 1.0));
+
+    var coord = input.uv;
+    let delta = (coord - light_uv) * density / f32(samples);
+    var illumination_decay = 1.0;
+    var accumulated = 0.0;
+    for (var i: u32 = 0u; i < samples; i = i + 1u) {
+        coord = coord - delta;
+        let sample_value = textureSample(occlusion_tex, occlusion_sampler, coord).r;
+        accumulated = accumulated + sample_value * illumination_decay * weight;
+        illumination_decay = illumination_decay * decay;
+    }
+
+    let source_visibility = textureSample(occlusion_tex, occlusion_sampler, input.uv).r;
+    let light_visibility = textureSample(occlusion_tex, occlusion_sampler, clamp(light_uv, vec2f(0.0, 0.0), vec2f(1.0, 1.0))).r;
+    let radial_dist = distance(input.uv, light_uv);
+    let sun_falloff = pow(clamp(1.0 - radial_dist / 1.35, 0.0, 1.0), 1.25);
+    let sun_halo = pow(clamp(1.0 - radial_dist / 0.42, 0.0, 1.0), 2.0);
+    let sun_core = pow(clamp(1.0 - radial_dist / 0.20, 0.0, 1.0), 6.0);
+    let haze_bias = 0.10;
+    let shafts = max((accumulated - haze_bias) * exposure * strength, 0.0) * source_visibility * sun_falloff;
+    let sun_visibility = max(light_visibility, source_visibility * 0.35);
+    let sun_disc = sun_visibility * strength * (sun_halo * 0.22 + sun_core * 0.45);
+    return vec4f(vec3f(shafts + sun_disc), 1.0);
+}
+"""
+
+
+COMPOSITE_SHADER = """
+struct CompositeParams {
+    light_uv_and_density: vec4f,
+    weight_decay_exposure_strength: vec4f,
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f,
+}
+
+@group(0) @binding(0) var scene_tex: texture_2d<f32>;
+@group(0) @binding(1) var shafts_tex: texture_2d<f32>;
+@group(0) @binding(2) var linear_sampler: sampler;
+@group(0) @binding(3) var occlusion_tex: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> params: CompositeParams;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2f, 3>(
+        vec2f(-1.0, -3.0),
+        vec2f(-1.0, 1.0),
+        vec2f(3.0, 1.0),
+    );
+    var out: VertexOutput;
+    let pos = positions[vertex_index];
+    out.position = vec4f(pos, 0.0, 1.0);
+    out.uv = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+    let scene = textureSample(scene_tex, linear_sampler, input.uv).rgb;
+    let shafts = textureSample(shafts_tex, linear_sampler, input.uv).rgb;
+    let combined_shafts = scene + shafts * (vec3f(1.0, 1.0, 1.0) - scene);
+
+    let light_uv = params.light_uv_and_density.xy;
+    let strength = params.weight_decay_exposure_strength.z;
+    let light_sample_uv = clamp(light_uv, vec2f(0.0, 0.0), vec2f(1.0, 1.0));
+    let light_visibility = textureSample(occlusion_tex, linear_sampler, light_sample_uv).r;
+    let radial_dist = distance(input.uv, light_uv);
+    let sun_halo = pow(clamp(1.0 - radial_dist / 0.24, 0.0, 1.0), 2.4);
+    let sun_core = pow(clamp(1.0 - radial_dist / 0.085, 0.0, 1.0), 7.0);
+    let sun_term = max(light_visibility, 0.35) * strength * (sun_halo * 0.35 + sun_core * 0.95);
+    let sun_color = vec3f(1.0, 0.96, 0.86);
+    let combined = combined_shafts + sun_color * sun_term * (vec3f(1.0, 1.0, 1.0) - combined_shafts);
+    return vec4f(combined, 1.0);
+}
+"""
+
+
+FINAL_BLIT_SHADER = """
+struct PresentParams {
+    viewport_inv_px: vec2f,
+    reserved: vec2f,
+}
+
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_sampler: sampler;
+@group(0) @binding(2) var<uniform> params: PresentParams;
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f,
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var out: VertexOutput;
+    var pos = array<vec2f, 3>(
+        vec2f(-1.0, -3.0),
+        vec2f(-1.0, 1.0),
+        vec2f(3.0, 1.0),
+    )[vertex_index];
+    out.position = vec4f(pos, 0.0, 1.0);
+    out.uv = vec2f(pos.x * 0.5 + 0.5, 0.5 - pos.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4f {
+    let _inv_px = params.viewport_inv_px;
+    let color = textureSample(src_tex, src_sampler, input.uv).rgb;
+    return vec4f(color, 1.0);
+}
+"""
+
+
 HUD_SHADER = """
 struct VertexInput {
     @location(0) position: vec4f,
@@ -448,6 +656,7 @@ fn expand_main(@builtin(global_invocation_id) gid: vec3u) {
 VOXEL_MESH_BATCH_SHADER = """
 struct BatchParams {
     counts_and_flags: vec4u,
+    world_scale_and_pad: vec4f,
 }
 
 struct Vertex {
@@ -533,15 +742,63 @@ fn emit_vertex(position: vec3f, normal: vec3f, color: vec3f, slot: u32) {
     vertices.values[slot] = Vertex(vec4f(position, 1.0), vec4f(normal, 0.0), vec4f(color, 1.0));
 }
 
-fn emit_triangle_at(base: u32, a: vec3f, b: vec3f, c: vec3f, normal: vec3f, color: vec3f) {
-    emit_vertex(a, normal, color, base + 0u);
-    emit_vertex(b, normal, color, base + 1u);
-    emit_vertex(c, normal, color, base + 2u);
+fn emit_triangle_at(base: u32, a: vec3f, b: vec3f, c: vec3f, normal: vec3f, color_a: vec3f, color_b: vec3f, color_c: vec3f) {
+    emit_vertex(a, normal, color_a, base + 0u);
+    emit_vertex(b, normal, color_b, base + 1u);
+    emit_vertex(c, normal, color_c, base + 2u);
 }
 
-fn emit_quad_at(base: u32, p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f, normal: vec3f, color: vec3f) {
-    emit_triangle_at(base + 0u, p0, p1, p2, normal, color);
-    emit_triangle_at(base + 3u, p0, p2, p3, normal, color);
+fn emit_quad_at(base: u32, p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f, normal: vec3f, color0: vec3f, color1: vec3f, color2: vec3f, color3: vec3f) {
+    emit_triangle_at(base + 0u, p0, p1, p2, normal, color0, color1, color2);
+    emit_triangle_at(base + 3u, p0, p2, p3, normal, color0, color2, color3);
+}
+
+fn solid_at(chunk_base: u32, sample_size: u32, plane: u32, local_x: u32, local_z: u32, sample_y: i32, height_limit: u32) -> bool {
+    if (sample_y < 0 || sample_y >= i32(height_limit)) {
+        return false;
+    }
+    let idx = chunk_base + u32(sample_y) * plane + local_z * sample_size + local_x;
+    return blocks.values[idx] != 0u;
+}
+
+fn ambient_occlusion_factor(side1: bool, side2: bool, corner: bool) -> f32 {
+    var occlusion = 0u;
+    if (side1 && side2) {
+        occlusion = 3u;
+    } else {
+        occlusion = select(0u, 1u, side1) + select(0u, 1u, side2) + select(0u, 1u, corner);
+    }
+    if (occlusion == 0u) {
+        return 1.0;
+    }
+    if (occlusion == 1u) {
+        return 0.82;
+    }
+    if (occlusion == 2u) {
+        return 0.68;
+    }
+    return 0.54;
+}
+
+fn ao_y_plane(chunk_base: u32, sample_size: u32, plane: u32, local_x: u32, local_z: u32, sample_y: i32, dx: i32, dz: i32, height_limit: u32) -> f32 {
+    let side1 = solid_at(chunk_base, sample_size, plane, u32(i32(local_x) + dx), local_z, sample_y, height_limit);
+    let side2 = solid_at(chunk_base, sample_size, plane, local_x, u32(i32(local_z) + dz), sample_y, height_limit);
+    let corner = solid_at(chunk_base, sample_size, plane, u32(i32(local_x) + dx), u32(i32(local_z) + dz), sample_y, height_limit);
+    return ambient_occlusion_factor(side1, side2, corner);
+}
+
+fn ao_x_plane(chunk_base: u32, sample_size: u32, plane: u32, sample_x: u32, local_z: u32, y: i32, dy: i32, dz: i32, height_limit: u32) -> f32 {
+    let side1 = solid_at(chunk_base, sample_size, plane, sample_x, local_z, y + dy, height_limit);
+    let side2 = solid_at(chunk_base, sample_size, plane, sample_x, u32(i32(local_z) + dz), y, height_limit);
+    let corner = solid_at(chunk_base, sample_size, plane, sample_x, u32(i32(local_z) + dz), y + dy, height_limit);
+    return ambient_occlusion_factor(side1, side2, corner);
+}
+
+fn ao_z_plane(chunk_base: u32, sample_size: u32, plane: u32, local_x: u32, sample_z: u32, y: i32, dx: i32, dy: i32, height_limit: u32) -> f32 {
+    let side1 = solid_at(chunk_base, sample_size, plane, u32(i32(local_x) + dx), sample_z, y, height_limit);
+    let side2 = solid_at(chunk_base, sample_size, plane, local_x, sample_z, y + dy, height_limit);
+    let corner = solid_at(chunk_base, sample_size, plane, u32(i32(local_x) + dx), sample_z, y + dy, height_limit);
+    return ambient_occlusion_factor(side1, side2, corner);
 }
 
 fn voxel_face_count(
@@ -596,12 +853,13 @@ fn emit_voxel_faces(
         return;
     }
 
-    let x0 = origin_x + f32(local_x - 1u);
-    let x1 = x0 + 1.0;
-    let z0 = origin_z + f32(local_z - 1u);
-    let z1 = z0 + 1.0;
-    let y0 = f32(y);
-    let y1 = y0 + 1.0;
+    let block_scale = params.world_scale_and_pad.x;
+    let x0 = origin_x + f32(local_x - 1u) * block_scale;
+    let x1 = x0 + block_scale;
+    let z0 = origin_z + f32(local_z - 1u) * block_scale;
+    let z1 = z0 + block_scale;
+    let y0 = f32(y) * block_scale;
+    let y1 = y0 + block_scale;
 
     let material = materials.values[cell_index];
     let top = face_color(material, y, 1.0);
@@ -610,9 +868,14 @@ fn emit_voxel_faces(
     let south = face_color(material, y, 0.72);
     let north = face_color(material, y, 0.60);
     let bottom = face_color(material, y, 0.50);
+    let yi = i32(y);
     var face_base = base;
 
     if (y == height_limit - 1u || blocks.values[cell_index + plane] == 0u) {
+        let ao0 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi + 1, -1, -1, height_limit);
+        let ao1 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi + 1, 1, -1, height_limit);
+        let ao2 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi + 1, 1, 1, height_limit);
+        let ao3 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi + 1, -1, 1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y1, z0),
@@ -620,11 +883,18 @@ fn emit_voxel_faces(
             vec3f(x1, y1, z1),
             vec3f(x0, y1, z1),
             vec3f(0.0, 1.0, 0.0),
-            top,
+            top * ao0,
+            top * ao1,
+            top * ao2,
+            top * ao3,
         );
         face_base = face_base + 6u;
     }
     if (y == 0u || blocks.values[cell_index - plane] == 0u) {
+        let ao0 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi - 1, -1, -1, height_limit);
+        let ao1 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi - 1, -1, 1, height_limit);
+        let ao2 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi - 1, 1, 1, height_limit);
+        let ao3 = ao_y_plane(chunk_base, sample_size, plane, local_x, local_z, yi - 1, 1, -1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y0, z0),
@@ -632,11 +902,18 @@ fn emit_voxel_faces(
             vec3f(x1, y0, z1),
             vec3f(x1, y0, z0),
             vec3f(0.0, -1.0, 0.0),
-            bottom,
+            bottom * ao0,
+            bottom * ao1,
+            bottom * ao2,
+            bottom * ao3,
         );
         face_base = face_base + 6u;
     }
     if (blocks.values[cell_index + 1u] == 0u) {
+        let ao0 = ao_x_plane(chunk_base, sample_size, plane, local_x + 1u, local_z, yi, -1, -1, height_limit);
+        let ao1 = ao_x_plane(chunk_base, sample_size, plane, local_x + 1u, local_z, yi, 1, -1, height_limit);
+        let ao2 = ao_x_plane(chunk_base, sample_size, plane, local_x + 1u, local_z, yi, 1, 1, height_limit);
+        let ao3 = ao_x_plane(chunk_base, sample_size, plane, local_x + 1u, local_z, yi, -1, 1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x1, y0, z0),
@@ -644,11 +921,18 @@ fn emit_voxel_faces(
             vec3f(x1, y1, z1),
             vec3f(x1, y0, z1),
             vec3f(1.0, 0.0, 0.0),
-            east,
+            east * ao0,
+            east * ao1,
+            east * ao2,
+            east * ao3,
         );
         face_base = face_base + 6u;
     }
     if (blocks.values[cell_index - 1u] == 0u) {
+        let ao0 = ao_x_plane(chunk_base, sample_size, plane, local_x - 1u, local_z, yi, -1, -1, height_limit);
+        let ao1 = ao_x_plane(chunk_base, sample_size, plane, local_x - 1u, local_z, yi, -1, 1, height_limit);
+        let ao2 = ao_x_plane(chunk_base, sample_size, plane, local_x - 1u, local_z, yi, 1, 1, height_limit);
+        let ao3 = ao_x_plane(chunk_base, sample_size, plane, local_x - 1u, local_z, yi, 1, -1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y0, z0),
@@ -656,11 +940,18 @@ fn emit_voxel_faces(
             vec3f(x0, y1, z1),
             vec3f(x0, y1, z0),
             vec3f(-1.0, 0.0, 0.0),
-            west,
+            west * ao0,
+            west * ao1,
+            west * ao2,
+            west * ao3,
         );
         face_base = face_base + 6u;
     }
     if (blocks.values[cell_index + sample_size] == 0u) {
+        let ao0 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z + 1u, yi, -1, -1, height_limit);
+        let ao1 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z + 1u, yi, 1, -1, height_limit);
+        let ao2 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z + 1u, yi, 1, 1, height_limit);
+        let ao3 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z + 1u, yi, -1, 1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y0, z1),
@@ -668,11 +959,18 @@ fn emit_voxel_faces(
             vec3f(x1, y1, z1),
             vec3f(x0, y1, z1),
             vec3f(0.0, 0.0, 1.0),
-            south,
+            south * ao0,
+            south * ao1,
+            south * ao2,
+            south * ao3,
         );
         face_base = face_base + 6u;
     }
     if (blocks.values[cell_index - sample_size] == 0u) {
+        let ao0 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z - 1u, yi, -1, -1, height_limit);
+        let ao1 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z - 1u, yi, -1, 1, height_limit);
+        let ao2 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z - 1u, yi, 1, 1, height_limit);
+        let ao3 = ao_z_plane(chunk_base, sample_size, plane, local_x, local_z - 1u, yi, 1, -1, height_limit);
         emit_quad_at(
             face_base,
             vec3f(x0, y0, z0),
@@ -680,7 +978,10 @@ fn emit_voxel_faces(
             vec3f(x1, y1, z0),
             vec3f(x1, y0, z0),
             vec3f(0.0, 0.0, -1.0),
-            north,
+            north * ao0,
+            north * ao1,
+            north * ao2,
+            north * ao3,
         );
     }
 }
@@ -780,8 +1081,9 @@ fn emit_main(
     }
     let column_base = chunk_offsets.values[chunk_index] + column_prefix;
     let origin = chunk_coords.values[chunk_index];
-    let origin_x = f32(origin.x * i32(params.counts_and_flags.w));
-    let origin_z = f32(origin.y * i32(params.counts_and_flags.w));
+    let chunk_world_size = f32(params.counts_and_flags.w) * params.world_scale_and_pad.x;
+    let origin_x = f32(origin.x) * chunk_world_size;
+    let origin_z = f32(origin.y) * chunk_world_size;
     emit_voxel_faces(column_base + prefix_offsets[y], chunk_base, sample_size, plane, local_x, local_z, y, height_limit, origin_x, origin_z);
 }
 """

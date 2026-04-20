@@ -8,9 +8,9 @@ from collections import deque
 import numpy as np
 import wgpu
 
-from . import mesh_cache_helpers as mesh_cache
-from . import meshing_types as mt
-from .terrain_backend import ChunkSurfaceGpuBatch, ChunkVoxelResult
+from ..cache import mesh_allocator as mesh_cache
+from .. import meshing_types as mt
+from ..terrain.types import ChunkSurfaceGpuBatch, ChunkVoxelResult
 
 try:
     profile  # type: ignore[name-defined]
@@ -20,15 +20,16 @@ except NameError:  # pragma: no cover - only used outside kernprof
 
 
 def _renderer_module():
-    from . import renderer
+    from .. import renderer
 
     return renderer
 
 
 def _chunk_half() -> float:
-    return float(_renderer_module().CHUNK_SIZE) * 0.5
+    return float(_renderer_module().CHUNK_WORLD_SIZE) * 0.5
 
 
+@profile
 def ensure_voxel_mesh_batch_scratch(renderer, sample_size: int, height_limit: int, chunk_capacity: int | None = None) -> None:
     capacity = max(1, int(chunk_capacity if chunk_capacity is not None else renderer.mesh_batch_size))
     if (
@@ -78,7 +79,7 @@ def ensure_voxel_mesh_batch_scratch(renderer, sample_size: int, height_limit: in
         usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
     )
     renderer._voxel_mesh_scratch_params_buffer = renderer.device.create_buffer(
-        size=16,
+        size=32,
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
     )
     renderer._voxel_mesh_scratch_batch_vertex_buffer = renderer.device.create_buffer(
@@ -98,6 +99,7 @@ def ensure_voxel_mesh_batch_scratch(renderer, sample_size: int, height_limit: in
     renderer._voxel_mesh_scratch_chunk_offsets_array = np.empty(max_chunk_count, dtype=np.uint32)
 
 
+@profile
 def create_async_voxel_mesh_batch_resources(renderer, sample_size: int, height_limit: int, chunk_count: int):
     ensure_voxel_mesh_batch_scratch(renderer, sample_size, height_limit, 1)
     chunk_capacity = max(1, int(chunk_count))
@@ -137,7 +139,7 @@ def create_async_voxel_mesh_batch_resources(renderer, sample_size: int, height_l
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
         ),
         params_buffer=renderer.device.create_buffer(
-            size=16,
+            size=32,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         ),
         readback_buffer=renderer.device.create_buffer(
@@ -194,6 +196,7 @@ def async_voxel_mesh_batch_resources_match(resources, sample_size: int, height_l
     )
 
 
+@profile
 def destroy_async_voxel_mesh_batch_resources(resources) -> None:
     if resources.readback_buffer.map_state != "unmapped":
         try:
@@ -217,6 +220,7 @@ def destroy_async_voxel_mesh_batch_resources(resources) -> None:
             pass
 
 
+@profile
 def acquire_async_voxel_mesh_batch_resources(renderer, sample_size: int, height_limit: int, chunk_count: int):
     target_chunk_count = max(1, int(chunk_count))
     pool_size = len(renderer._async_voxel_mesh_batch_pool)
@@ -228,6 +232,7 @@ def acquire_async_voxel_mesh_batch_resources(renderer, sample_size: int, height_
     return create_async_voxel_mesh_batch_resources(renderer, sample_size, height_limit, target_chunk_count)
 
 
+@profile
 def release_async_voxel_mesh_batch_resources(renderer, resources) -> None:
     if len(renderer._async_voxel_mesh_batch_pool) >= renderer._async_voxel_mesh_batch_pool_limit:
         destroy_async_voxel_mesh_batch_resources(resources)
@@ -239,6 +244,7 @@ def schedule_async_voxel_mesh_batch_resource_release(renderer, resources, frames
     renderer._gpu_mesh_deferred_batch_resource_releases.append((max(1, int(frames)), resources))
 
 
+@profile
 def get_cached_async_voxel_mesh_emit_bind_group(renderer, resources, batch_allocation) -> object | None:
     _ = batch_allocation
     return resources.emit_bind_group
@@ -249,6 +255,7 @@ def schedule_gpu_buffer_cleanup(renderer, buffers: list[wgpu.GPUBuffer], frames:
         renderer._gpu_mesh_deferred_buffer_cleanup.append((max(1, int(frames)), list(buffers)))
 
 
+@profile
 def process_gpu_buffer_cleanup(renderer) -> None:
     if renderer._gpu_mesh_deferred_buffer_cleanup:
         next_queue: deque[tuple[int, list[wgpu.GPUBuffer]]] = deque()
@@ -293,6 +300,7 @@ def process_gpu_buffer_cleanup(renderer) -> None:
         renderer._gpu_mesh_deferred_surface_batch_releases = next_surface_release_queue
 
 
+@profile
 def get_voxel_surface_expand_bind_group(renderer, surface_batch: ChunkSurfaceGpuBatch, blocks_buffer, materials_buffer, params_buffer) -> object:
     cache_key = (
         id(surface_batch.heights_buffer),
@@ -345,6 +353,7 @@ def pending_surface_gpu_batches_chunk_count(renderer) -> int:
     return int(renderer._pending_surface_gpu_batches_chunk_total)
 
 
+@profile
 def enqueue_surface_gpu_batches_for_meshing(renderer, surface_batches: list[ChunkSurfaceGpuBatch]) -> None:
     if not surface_batches:
         return
@@ -359,6 +368,7 @@ def enqueue_surface_gpu_batches_for_meshing(renderer, surface_batches: list[Chun
     renderer._pending_surface_gpu_batches_chunk_total += chunk_total
 
 
+@profile
 def drain_pending_surface_gpu_batches_to_meshing(renderer) -> None:
     if not renderer._pending_surface_gpu_batches:
         renderer._pending_surface_gpu_batches_chunk_total = 0
@@ -392,6 +402,7 @@ def drain_pending_surface_gpu_batches_to_meshing(renderer) -> None:
         make_chunk_mesh_batches_from_surface_gpu_batches(renderer, submit_batches)
 
 
+@profile
 def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
     renderer,
     chunk_coords: list[tuple[int, int]],
@@ -426,11 +437,15 @@ def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
     zero_view = resources.zero_counts_array[:chunk_count]
     zero_view.fill(0)
     params_bytes = struct.pack(
-        "<4I",
+        "<4I4f",
         int(sample_size),
         int(height_limit),
         int(chunk_count),
         int(_renderer_module().CHUNK_SIZE),
+        float(_renderer_module().BLOCK_SIZE),
+        0.0,
+        0.0,
+        0.0,
     )
 
     if not params_already_uploaded:
@@ -481,6 +496,7 @@ def enqueue_gpu_chunk_mesh_batch_from_gpu_buffers(
     )
 
 
+@profile
 def read_chunk_mesh_batch_metadata(renderer, chunk_totals_buffer, chunk_offsets_buffer, chunk_count: int, *, include_offsets: bool = False):
     if chunk_count <= 0:
         empty = np.empty(0, dtype=np.uint32)
@@ -514,6 +530,7 @@ def read_chunk_mesh_batch_metadata(renderer, chunk_totals_buffer, chunk_offsets_
     return totals, offsets
 
 
+@profile
 def make_chunk_mesh_batch_from_voxels(
     renderer,
     chunk_results: list[ChunkVoxelResult],
@@ -596,6 +613,7 @@ def make_chunk_mesh_batch_from_voxels(
     )
 
 
+@profile
 def make_chunk_mesh_batch_from_gpu_buffers(
     renderer,
     chunk_coords: list[tuple[int, int]],
@@ -646,11 +664,15 @@ def make_chunk_mesh_batch_from_gpu_buffers(
         params_buffer,
         0,
         struct.pack(
-            "<4I",
+            "<4I4f",
             int(sample_size),
             int(height_limit),
             int(chunk_count),
             int(renderer.world.chunk_size),
+            float(renderer.world.block_size),
+            0.0,
+            0.0,
+            0.0,
         ),
     )
 
@@ -765,6 +787,7 @@ def make_chunk_mesh_batch_from_gpu_buffers(
     return meshes
 
 
+@profile
 def make_chunk_mesh_batch_from_surface_gpu_batch(
     renderer,
     surface_batch: ChunkSurfaceGpuBatch,
@@ -785,11 +808,15 @@ def make_chunk_mesh_batch_from_surface_gpu_batch(
     sample_size = renderer.world.chunk_size + 2
     height_limit = renderer.world.height
     params_bytes = struct.pack(
-        "<4I",
+        "<4I4f",
         int(sample_size),
         int(height_limit),
         int(chunk_count),
         int(renderer.world.chunk_size),
+        float(renderer.world.block_size),
+        0.0,
+        0.0,
+        0.0,
     )
     ensure_voxel_mesh_batch_scratch(renderer, sample_size, height_limit, chunk_count)
     blocks_buffer = renderer._voxel_mesh_scratch_blocks_buffer
@@ -836,6 +863,7 @@ def make_chunk_mesh_batch_from_surface_gpu_batch(
     return meshes
 
 
+@profile
 def make_chunk_mesh_batches_from_surface_gpu_batches(renderer, surface_batches: list[ChunkSurfaceGpuBatch]) -> None:
     if renderer.voxel_surface_expand_pipeline is None:
         raise RuntimeError("GPU surface expansion pipeline is unavailable.")
@@ -857,11 +885,15 @@ def make_chunk_mesh_batches_from_surface_gpu_batches(renderer, surface_batches: 
         chunk_count = len(chunk_coords)
         resources = acquire_async_voxel_mesh_batch_resources(renderer, sample_size, height_limit, chunk_count)
         params_bytes = struct.pack(
-            "<4I",
+            "<4I4f",
             int(sample_size),
             int(height_limit),
             int(chunk_count),
             int(renderer.world.chunk_size),
+            float(renderer.world.block_size),
+            0.0,
+            0.0,
+            0.0,
         )
 
         renderer.device.queue.write_buffer(resources.params_buffer, 0, params_bytes)
@@ -902,6 +934,7 @@ def make_chunk_mesh_batches_from_surface_gpu_batches(renderer, surface_batches: 
         )
 
 
+@profile
 def release_pending_chunk_mesh_readback(renderer, pending) -> None:
     owner = pending.readback_owner
     if owner is None:
@@ -938,6 +971,7 @@ def release_pending_chunk_mesh_readback(renderer, pending) -> None:
         pass
 
 
+@profile
 def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> int:
     if not renderer._pending_gpu_mesh_batches:
         return 0
@@ -1048,7 +1082,7 @@ def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> in
             height_limit_int = int(pending.height_limit)
             cached_height = height_cache.get(height_limit_int)
             if cached_height is None:
-                half_height = float(height_limit_int) * 0.5
+                half_height = float(height_limit_int) * float(_renderer_module().BLOCK_SIZE) * 0.5
                 radius = float(math.sqrt(_chunk_half() * _chunk_half() * 2.0 + half_height * half_height))
                 cached_height = (half_height, radius)
                 height_cache[height_limit_int] = cached_height
@@ -1071,9 +1105,9 @@ def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> in
                 mesh.created_at = float(created_at)
                 mesh.allocation_id = shared_allocation_id
                 mesh.bounds = (
-                    float(chunk_x_int * _renderer_module().CHUNK_SIZE + _chunk_half()),
+                    float(chunk_x_int * _renderer_module().CHUNK_WORLD_SIZE + _chunk_half()),
                     half_height,
-                    float(chunk_z_int * _renderer_module().CHUNK_SIZE + _chunk_half()),
+                    float(chunk_z_int * _renderer_module().CHUNK_WORLD_SIZE + _chunk_half()),
                     radius,
                 )
                 mesh.binding_offset = binding_offset

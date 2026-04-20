@@ -9,14 +9,14 @@ import time
 from ctypes.util import find_library
 from pathlib import Path
 
-from . import mesh_cache_helpers as mesh_cache
-from . import render_constants as render_consts
+from ..cache import mesh_allocator as mesh_cache
+from .. import render_constants as render_consts
 import wgpu
-from .render_utils import pack_vertex, screen_to_ndc
+from ..render_utils import pack_vertex, screen_to_ndc
 
 
 def _renderer_module():
-    from . import renderer as renderer_module
+    from .. import renderer as renderer_module
 
     return renderer_module
 
@@ -419,14 +419,26 @@ def profile_average_fps(renderer) -> float:
 
 def record_frame_breakdown_sample(renderer, name: str, value: float) -> None:
     samples = renderer.frame_breakdown_samples.get(name)
-    if samples is not None:
-        samples.append(value)
+    if samples is None:
+        return
+    sample_sums = getattr(renderer, "frame_breakdown_sample_sums", None)
+    if sample_sums is None:
+        sample_sums = {key: float(sum(existing_samples)) for key, existing_samples in renderer.frame_breakdown_samples.items()}
+        renderer.frame_breakdown_sample_sums = sample_sums
+    if samples.maxlen is not None and len(samples) >= samples.maxlen:
+        sample_sums[name] -= float(samples[0])
+    value_f = float(value)
+    samples.append(value_f)
+    sample_sums[name] += value_f
 
 
 def frame_breakdown_average(renderer, name: str) -> float:
     samples = renderer.frame_breakdown_samples.get(name)
     if not samples:
         return 0.0
+    sample_sums = getattr(renderer, "frame_breakdown_sample_sums", None)
+    if sample_sums is not None:
+        return float(sample_sums.get(name, 0.0)) / max(1, len(samples))
     return sum(samples) / len(samples)
 
 
@@ -588,9 +600,15 @@ def refresh_profile_summary(renderer, now: float) -> None:
     renderer.profile_window_frame_times = []
 
 
-def refresh_frame_breakdown_summary(renderer) -> None:
+def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
     if not renderer.profiling_enabled:
         return
+    if now is None:
+        now = time.perf_counter()
+    next_refresh = float(getattr(renderer, "_frame_breakdown_next_refresh", 0.0))
+    if renderer.frame_breakdown_vertex_count > 0 and now < next_refresh:
+        return
+    renderer._frame_breakdown_next_refresh = float(now) + 0.2
     renderer_module = _renderer_module()
     avg_world_update = frame_breakdown_average(renderer, "world_update")
     avg_visibility_lookup = frame_breakdown_average(renderer, "visibility_lookup")
@@ -630,13 +648,22 @@ def refresh_frame_breakdown_summary(renderer) -> None:
     if avg_wall_frame > 0.0:
         chunk_generation_per_s = avg_new_displayed_chunks / max(avg_wall_frame / 1000.0, 1e-9)
 
+    camera_x = float(renderer.camera.position[0])
+    camera_y = float(renderer.camera.position[1])
+    camera_z = float(renderer.camera.position[2])
+    camera_block_x = camera_x / max(renderer.world.block_size, 1e-9)
+    camera_block_y = camera_y / max(renderer.world.block_size, 1e-9)
+    camera_block_z = camera_z / max(renderer.world.block_size, 1e-9)
+
     lines = [
         f"FRAME BREAKDOWN @ DIMENSION {renderer.render_dimension_chunks}x{renderer.render_dimension_chunks} CHUNKS",
-        f"MOVE SPEED: {renderer._current_move_speed:5.1f} B/S",
+        f"MOVE SPEED: {renderer._current_move_speed / max(renderer.world.block_size, 1e-9):5.1f} B/S",
+        f"CAM POS M: {camera_x:7.2f} {camera_y:7.2f} {camera_z:7.2f}",
+        f"CAM POS B: {camera_block_x:7.1f} {camera_block_y:7.1f} {camera_block_z:7.1f}",
         f"RENDER BACKEND: {renderer.render_backend_label}",
         f"TERRAIN BACKEND: {renderer.world.terrain_backend_label()}",
         f"MESH BACKEND: {renderer.mesh_backend_label}",
-        f"CHUNK DIMS: {renderer_module.CHUNK_SIZE}x{renderer_module.WORLD_HEIGHT}x{renderer_module.CHUNK_SIZE}",
+        f"CHUNK DIMS: {renderer_module.CHUNK_SIZE}x{renderer_module.CHUNK_SIZE}x{renderer_module.CHUNK_SIZE}",
         f"BACKEND POLL SIZE: {renderer.terrain_batch_size}",
         f"MESH DRAIN SIZE: {renderer.mesh_batch_size}",
         f"MESH SLABS: {slab_count}  USED {slab_used_bytes / (1024.0 * 1024.0):4.1f} MIB  FREE {slab_free_bytes / (1024.0 * 1024.0):4.1f} MIB",

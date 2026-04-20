@@ -15,10 +15,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
-from .terrain_kernels import (
-    expand_chunk_surface_to_voxel_grid,
+from ..types import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
+from ...terrain.kernels import (
     fill_chunk_surface_grids as cpu_fill_chunk_surface_grids,
+    fill_chunk_voxel_grid as cpu_fill_chunk_voxel_grid,
     surface_profile_at as cpu_surface_profile_at,
 )
 
@@ -95,28 +95,39 @@ fn value_noise_2d(x: f32, y: f32, seed: u32, frequency: f32) -> f32 {
 }
 
 fn terrain_sample(x: f32, z: f32, seed: u32, height_limit: u32) -> vec2u {
-    let broad = value_noise_2d(x, z, seed + 11u, 0.0009765625);
-    let ridge = value_noise_2d(x, z, seed + 23u, 0.00390625);
-    let detail = value_noise_2d(x, z, seed + 47u, 0.010416667);
+    let terrain_frequency_scale = 0.1;
 
-    var height_f = 26.0 + broad * 18.0 + ridge * 14.0 + detail * 8.0;
-    if (height_f < 4.0) {
-        height_f = 4.0;
-    }
+    let sample_x = x;
+    let sample_z = z;
+    let broad = value_noise_2d(sample_x, sample_z, seed + 11u, 0.0009765625 * terrain_frequency_scale);
+    let ridge = value_noise_2d(sample_x, sample_z, seed + 23u, 0.00390625 * terrain_frequency_scale);
+    let detail = value_noise_2d(sample_x, sample_z, seed + 47u, 0.010416667 * terrain_frequency_scale);
+    let micro = value_noise_2d(sample_x, sample_z, seed + 71u, 0.020833334 * terrain_frequency_scale);
+    let nano = value_noise_2d(sample_x, sample_z, seed + 97u, 0.041666668 * terrain_frequency_scale);
 
     let upper_bound = height_limit - 1u;
     let upper_bound_f = f32(upper_bound);
+    let normalized_height = 24.0 + broad * 11.0 + ridge * 8.0 + detail * 4.5 + micro * 1.75 + nano * 0.75;
+    let height_scale = select(1.0, upper_bound_f / 50.0, upper_bound > 0u);
+    var height_f = normalized_height * height_scale;
+    if (height_f < 4.0) {
+        height_f = 4.0;
+    }
     if (height_f > upper_bound_f) {
         height_f = upper_bound_f;
     }
     let height_i = u32(height_f);
 
+    let sand_threshold = max(4u, u32(f32(height_limit) * 0.18));
+    let stone_threshold = max(sand_threshold + 6u, u32(f32(height_limit) * 0.58));
+    let snow_threshold = max(stone_threshold + 6u, u32(f32(height_limit) * 0.82));
+
     var material = 4u;
-    if (height_i >= 90u) {
+    if (height_i >= snow_threshold) {
         material = 6u;
-    } else if (height_i <= 14u) {
+    } else if (height_i <= sand_threshold) {
         material = 5u;
-    } else if (height_i >= 70u && detail > 0.12) {
+    } else if (height_i >= stone_threshold && (detail + micro * 0.5 + nano * 0.35) > 0.10) {
         material = 2u;
     }
     return vec2u(height_i, material);
@@ -345,10 +356,12 @@ class WgpuTerrainBackend:
             if buffer.map_state != "unmapped":
                 buffer.unmap()
 
+    @profile
     def surface_profile_at(self, x: int, z: int) -> tuple[int, int]:
         height, material = cpu_surface_profile_at(float(x), float(z), self.seed, self.height_limit)
         return int(height), int(material)
 
+    @profile
     def fill_chunk_surface_grids(self, heights: np.ndarray, materials: np.ndarray, chunk_x: int, chunk_z: int) -> None:
         cpu_fill_chunk_surface_grids(
             heights.reshape(-1),
@@ -360,6 +373,7 @@ class WgpuTerrainBackend:
             self.height_limit,
         )
 
+    @profile
     def chunk_surface_grids(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
         sample_size = self.chunk_size + 2
         cell_count = sample_size * sample_size
@@ -368,6 +382,7 @@ class WgpuTerrainBackend:
         self.fill_chunk_surface_grids(heights, materials, chunk_x, chunk_z)
         return heights, materials
 
+    @profile
     def request_chunk_surface_batch(self, chunks: list[tuple[int, int]]) -> int:
         job_id = self._next_job_id
         self._next_job_id += 1
@@ -377,13 +392,14 @@ class WgpuTerrainBackend:
             self._submit_next_batch()
         return job_id
 
+    @profile
     def chunk_voxel_grid(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
-        heights, materials = self.chunk_surface_grids(chunk_x, chunk_z)
         blocks = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint8)
         voxel_materials = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint32)
-        expand_chunk_surface_to_voxel_grid(blocks, voxel_materials, heights, materials, self.chunk_size, self.height_limit)
+        cpu_fill_chunk_voxel_grid(blocks, voxel_materials, int(chunk_x), int(chunk_z), self.chunk_size, self.seed, self.height_limit)
         return blocks, voxel_materials
 
+    @profile
     def _allocate_chunk_batch_resources(self, max_chunks: int) -> "_ChunkGpuBatch":
         max_chunks = max(1, int(max_chunks))
         coords_array = np.empty((max_chunks, 2), dtype=np.int32)
@@ -534,6 +550,7 @@ class WgpuTerrainBackend:
         self.device.queue.submit([encoder.finish()])
         self._in_flight_batches.extend(submitted)
 
+    @profile
     def _enqueue_surface_readback(self, batch: _ChunkGpuBatch) -> None:
         chunk_count = int(batch.chunk_count)
         total_cells = chunk_count * self.cell_count
@@ -561,6 +578,7 @@ class WgpuTerrainBackend:
             )
         )
 
+    @profile
     def _drain_ready_surface_readbacks(self) -> list[ChunkSurfaceResult]:
         ready: list[ChunkSurfaceResult] = []
         if not self._pending_surface_readbacks:
@@ -603,6 +621,7 @@ class WgpuTerrainBackend:
         self._pending_surface_readbacks = still_pending
         return ready
 
+    @profile
     def _drain_ready_surface_gpu_readbacks(self) -> list[ChunkSurfaceGpuBatch]:
         ready: list[ChunkSurfaceGpuBatch] = []
         if not self._pending_surface_readbacks:
@@ -647,6 +666,7 @@ class WgpuTerrainBackend:
         self._pending_surface_readbacks = still_pending
         return ready
 
+    @profile
     def poll_ready_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         ready: list[ChunkSurfaceResult] = []
         self._reclaim_batch_slots()
@@ -671,9 +691,11 @@ class WgpuTerrainBackend:
         self._submit_next_batch()
         return ready
 
+    @profile
     def request_chunk_voxel_batch(self, chunks: list[tuple[int, int]]) -> int:
         return self.request_chunk_surface_batch(chunks)
 
+    @profile
     def poll_ready_chunk_voxel_batches(self) -> list[ChunkVoxelResult]:
         ready: list[ChunkVoxelResult] = []
         for surface_result in self.poll_ready_chunk_surface_batches():
@@ -704,6 +726,7 @@ class WgpuTerrainBackend:
     def has_pending_chunk_voxel_batches(self) -> bool:
         return self.has_pending_chunk_surface_batches()
 
+    @profile
     def flush_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         ready: list[ChunkSurfaceResult] = []
         while self._in_flight_batches or self._pending_jobs:
@@ -715,6 +738,7 @@ class WgpuTerrainBackend:
             ready.extend(self.poll_ready_chunk_surface_batches())
         return ready
 
+    @profile
     def flush_chunk_voxel_batches(self) -> list[ChunkVoxelResult]:
         ready: list[ChunkVoxelResult] = []
         for surface_result in self.flush_chunk_surface_batches():

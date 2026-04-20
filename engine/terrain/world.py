@@ -3,9 +3,9 @@ from __future__ import annotations
 import sys
 import numpy as np
 
-from .cpu_terrain_backend import CpuTerrainBackend
+from .backends.cpu_terrain_backend import CpuTerrainBackend
 try:
-    from .metal_terrain_backend import MetalTerrainBackend
+    from .backends.metal_terrain_backend import MetalTerrainBackend
 except Exception as exc:  # pragma: no cover - optional on non-mac / CPU-only fallback
     MetalTerrainBackend = None  # type: ignore[assignment]
     METAL_TERRAIN_IMPORT_ERROR = exc
@@ -13,23 +13,20 @@ else:
     METAL_TERRAIN_IMPORT_ERROR = None
 
 try:
-    from .wgpu_terrain_backend import WgpuTerrainBackend
+    from .backends.wgpu_terrain_backend import WgpuTerrainBackend
 except Exception:  # pragma: no cover - optional during Metal-only deployments
     WgpuTerrainBackend = None  # type: ignore[assignment]
 
-from .terrain_backend import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
+from .types import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
 
-from .terrain_kernels import (
+from .kernels import (
     AIR,
     BEDROCK,
     DIRT,
     STONE,
+    terrain_block_material_at,
 )
-
-
-WORLD_HEIGHT = 128
-CHUNK_SIZE = 32
-
+from ..world_constants import BLOCK_SIZE, CHUNK_SIZE, CHUNK_WORLD_SIZE, WORLD_HEIGHT_BLOCKS
 
 def _create_preferred_gpu_backend(
     gpu_device,
@@ -104,8 +101,9 @@ def _create_preferred_gpu_backend(
 
 
 class VoxelWorld:
-    height: int = WORLD_HEIGHT
+    height: int = WORLD_HEIGHT_BLOCKS
     chunk_size: int = CHUNK_SIZE
+    block_size: float = BLOCK_SIZE
 
     def __init__(
         self,
@@ -114,9 +112,12 @@ class VoxelWorld:
         gpu_device=None,
         prefer_gpu_terrain: bool = False,
         prefer_metal_backend: bool = False,
-        terrain_batch_size: int = 256,
+        terrain_batch_size: int = 1 if WORLD_HEIGHT_BLOCKS > 256 else 16,
     ) -> None:
         self.seed = int(seed)
+        self.chunk_size = int(CHUNK_SIZE)
+        self.height = int(WORLD_HEIGHT_BLOCKS)
+        self.block_size = float(BLOCK_SIZE)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
         self._backend = CpuTerrainBackend(
             self.seed,
@@ -124,7 +125,7 @@ class VoxelWorld:
             self.chunk_size,
             chunks_per_poll=self.terrain_batch_size,
         )
-        if prefer_gpu_terrain:
+        if prefer_gpu_terrain and not VERTICAL_CHUNK_STACK_ENABLED:
             try:
                 self._backend = _create_preferred_gpu_backend(
                     gpu_device,
@@ -147,12 +148,7 @@ class VoxelWorld:
                 )
 
     def block_at(self, x: int, y: int, z: int) -> int:
-        if not (0 <= y < self.height):
-            return AIR
-        height, material = self.surface_profile_at(x, z)
-        if y >= height:
-            return AIR
-        return self._layer_material(y, height, material)
+        return int(terrain_block_material_at(int(x), int(y), int(z), self.seed, self.height))
 
     def surface_profile_at(self, x: int, z: int) -> tuple[int, int]:
         return self._backend.surface_profile_at(x, z)
@@ -168,13 +164,13 @@ class VoxelWorld:
     def chunk_surface_grids(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
         return self._backend.chunk_surface_grids(chunk_x, chunk_z)
 
-    def chunk_voxel_grid(self, chunk_x: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
-        return self._backend.chunk_voxel_grid(chunk_x, chunk_z)
+    def chunk_voxel_grid(self, chunk_x: int, chunk_y: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
+        return self._backend.chunk_voxel_grid(chunk_x, chunk_y, chunk_z)
 
-    def request_chunk_surface_batch(self, chunks: list[tuple[int, int]]) -> int:
+    def request_chunk_surface_batch(self, chunks: list[tuple[int, int, int]]) -> int:
         return self._backend.request_chunk_surface_batch(chunks)
 
-    def request_chunk_voxel_batch(self, chunks: list[tuple[int, int]]) -> int:
+    def request_chunk_voxel_batch(self, chunks: list[tuple[int, int, int]]) -> int:
         return self._backend.request_chunk_voxel_batch(chunks)
 
     def poll_ready_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
