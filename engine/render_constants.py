@@ -41,15 +41,18 @@ MERGED_TILE_SIZE_CHUNKS = 4
 MERGED_TILE_MIN_AGE_SECONDS = 2.0
 MERGED_TILE_MAX_CHUNKS = MERGED_TILE_SIZE_CHUNKS * MERGED_TILE_SIZE_CHUNKS
 def _visible_chunk_capacity() -> int:
-    radius = int(DEFAULT_RENDER_DISTANCE_CHUNKS)
-    horizontal = 0
-    radius_sq = radius * radius
-    for dz in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            if dx * dx + dz * dz <= radius_sq:
-                horizontal += 1
-    vertical_layers = (int(VERTICAL_CHUNK_RENDER_RADIUS) * 2 + 1) if VERTICAL_CHUNK_STACK_ENABLED else 1
-    vertical_layers = max(1, min(int(VERTICAL_CHUNK_COUNT), int(vertical_layers)))
+    """Return the maximum valid visible-coordinate budget used by the renderer.
+
+    The visible-layout builder walks a full XZ box, then clamps vertical layers to
+    real world chunk indices for the current origin. Capacity therefore needs to
+    track the largest world-valid box the renderer can ever emit, not the unclamped
+    theoretical span.
+    """
+    horizontal_radius = max(1, int(DEFAULT_RENDER_DISTANCE_CHUNKS))
+    horizontal_layers = horizontal_radius * 2 + 1
+    horizontal = horizontal_layers * horizontal_layers
+    requested_vertical_layers = (max(0, int(VERTICAL_CHUNK_RENDER_RADIUS)) * 2 + 1) if VERTICAL_CHUNK_STACK_ENABLED else 1
+    vertical_layers = min(max(1, requested_vertical_layers), max(1, int(VERTICAL_CHUNK_COUNT)))
     return int(horizontal * vertical_layers)
 
 

@@ -531,7 +531,7 @@ def read_chunk_mesh_batch_metadata(renderer, chunk_totals_buffer, chunk_offsets_
 
 
 @profile
-def make_chunk_mesh_batch_from_voxels(
+def make_chunk_mesh_batch_from_terrain_results(
     renderer,
     chunk_results: list[ChunkVoxelResult],
     *,

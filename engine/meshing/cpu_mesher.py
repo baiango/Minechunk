@@ -9,10 +9,7 @@ import wgpu
 from ..cache import mesh_allocator as mesh_cache
 from ..meshing_types import ChunkMesh
 from ..terrain.types import ChunkVoxelResult
-from ..terrain.kernels import (
-    build_chunk_vertex_array_from_voxels_with_boundaries,
-    fill_stacked_chunk_vertical_neighbor_planes,
-)
+from ..terrain.kernels import build_chunk_vertex_array_from_voxels_with_boundaries
 
 try:
     profile  # type: ignore[name-defined]
@@ -22,8 +19,8 @@ except NameError:  # pragma: no cover - only used outside kernprof
 
 __all__ = [
     "build_chunk_vertex_array",
-    "cpu_make_chunk_mesh_batch_from_voxels",
-    "cpu_make_chunk_mesh_from_voxels",
+    "cpu_make_chunk_mesh_batch_from_terrain_results",
+    "cpu_make_chunk_mesh_from_terrain_result",
     "make_chunk_mesh_fast",
 ]
 
@@ -87,28 +84,15 @@ def make_chunk_mesh_fast(
     mesh.first_vertex = first_vertex
     return mesh
 
-@profile
-def _stacked_vertical_neighbor_planes(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid) -> tuple[np.ndarray, np.ndarray]:
-    renderer_module = _renderer_module()
-    sample_size = int(renderer_module.CHUNK_SIZE) + 2
-    plane_dtype = getattr(voxel_grid, "dtype", np.uint32)
-    top_plane = np.zeros((sample_size, sample_size), dtype=plane_dtype)
-    bottom_plane = np.zeros((sample_size, sample_size), dtype=plane_dtype)
-    if not getattr(renderer_module, "VERTICAL_CHUNK_STACK_ENABLED", False):
-        return top_plane, bottom_plane
-    fill_stacked_chunk_vertical_neighbor_planes(
-        top_plane,
-        bottom_plane,
-        int(chunk_x),
-        int(chunk_y),
-        int(chunk_z),
-        int(renderer_module.CHUNK_SIZE),
-        int(renderer.world.seed),
-        int(renderer.world.height),
-    )
-    return top_plane, bottom_plane
-
 _EMPTY_VERTEX_ARRAY = np.empty((0, int(getattr(_renderer_module(), "VERTEX_COMPONENTS", 12))), dtype=np.float32)
+
+@profile
+def _empty_vertical_neighbor_planes(voxel_grid) -> tuple[np.ndarray, np.ndarray]:
+    sample_size = int(voxel_grid.shape[1]) if getattr(voxel_grid, "ndim", 0) >= 2 else int(_renderer_module().CHUNK_SIZE) + 2
+    plane_dtype = getattr(voxel_grid, "dtype", np.uint32)
+    empty_plane = np.zeros((sample_size, sample_size), dtype=plane_dtype)
+    return empty_plane, empty_plane.copy()
+
 
 @profile
 def build_chunk_vertex_array(
@@ -126,7 +110,7 @@ def build_chunk_vertex_array(
     if not np.any(voxel_grid):
         return _EMPTY_VERTEX_ARRAY, 0, chunk_max_height
     if top_plane is None or bottom_plane is None:
-        top_plane, bottom_plane = _stacked_vertical_neighbor_planes(renderer, chunk_x, chunk_y, chunk_z, voxel_grid)
+        top_plane, bottom_plane = _empty_vertical_neighbor_planes(voxel_grid)
     if np.all(voxel_grid) and np.all(top_plane) and np.all(bottom_plane):
         return _EMPTY_VERTEX_ARRAY, 0, chunk_max_height
     vertex_array, vertex_count = build_chunk_vertex_array_from_voxels_with_boundaries(
@@ -148,12 +132,12 @@ def build_chunk_vertex_array(
     return used_vertex_array, used_vertex_count, chunk_max_height
 
 @profile
-def cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVoxelResult]) -> list[ChunkMesh]:
-    if not chunk_results:
+def _cpu_make_chunk_mesh_batch(renderer, terrain_results: list[ChunkVoxelResult]) -> list[ChunkMesh]:
+    if not terrain_results:
         return []
 
-    if len(chunk_results) == 1:
-        result = chunk_results[0]
+    if len(terrain_results) == 1:
+        result = terrain_results[0]
         chunk_x = int(result.chunk_x)
         chunk_y = int(getattr(result, "chunk_y", 0))
         chunk_z = int(result.chunk_z)
@@ -183,7 +167,7 @@ def cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVox
             chunk_z,
             getattr(result, "top_boundary", None),
             getattr(result, "bottom_boundary", None),
-        )
+                    )
         if int(vertex_count) <= 0:
             return [
                 make_chunk_mesh_fast(
@@ -223,7 +207,7 @@ def cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVox
     total_vertex_bytes = 0
     created_at = time.perf_counter()
 
-    for result in chunk_results:
+    for result in terrain_results:
         chunk_x = int(result.chunk_x)
         chunk_y = int(getattr(result, "chunk_y", 0))
         chunk_z = int(result.chunk_z)
@@ -243,7 +227,7 @@ def cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVox
                 chunk_z,
                 top_plane,
                 bottom_plane,
-            )
+                            )
         vertex_bytes = int(vertex_count) * int(_renderer_module().VERTEX_STRIDE)
         built_chunks.append(
             (
@@ -310,19 +294,13 @@ def cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVox
 
     return meshes
 
+
 @profile
-def cpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
-    meshes = cpu_make_chunk_mesh_batch_from_voxels(
-        renderer,
-        [
-            ChunkVoxelResult(
-                chunk_x=int(chunk_x),
-                chunk_y=int(chunk_y),
-                chunk_z=int(chunk_z),
-                blocks=np.ascontiguousarray(voxel_grid, dtype=np.uint32),
-                materials=np.ascontiguousarray(material_grid, dtype=np.uint32),
-                source="cpu",
-            )
-        ],
-    )
+def cpu_make_chunk_mesh_batch_from_terrain_results(renderer, terrain_results: list[ChunkVoxelResult]) -> list[ChunkMesh]:
+    return _cpu_make_chunk_mesh_batch(renderer, terrain_results)
+
+
+@profile
+def cpu_make_chunk_mesh_from_terrain_result(renderer, terrain_result: ChunkVoxelResult) -> ChunkMesh:
+    meshes = cpu_make_chunk_mesh_batch_from_terrain_results(renderer, [terrain_result])
     return meshes[0]

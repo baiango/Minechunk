@@ -237,6 +237,7 @@ class TerrainRenderer:
         self._visible_chunk_coords: list[tuple[int, int, int]] = []
         self._visible_chunk_coord_set: set[tuple[int, int, int]] = set()
         self._visible_chunk_origin: tuple[int, int, int] | None = None
+        self._visible_rel_y_bounds: tuple[int, int] = (0, 0)
         self._visible_display_state_dirty = True
         self._visible_tile_keys: list[tuple[int, int, int]] = []
         self._visible_tile_key_set: set[tuple[int, int, int]] = set()
@@ -1710,11 +1711,23 @@ class TerrainRenderer:
             return self._frozen_view_origin
         return current
 
+    def _visible_rel_y_bounds_for_origin_y(self, origin_y: int) -> tuple[int, int]:
+        if not VERTICAL_CHUNK_STACK_ENABLED:
+            return (0, 0)
+        requested_min_rel_y = -int(self._view_extent_neg_y)
+        requested_max_rel_y = int(self._view_extent_pos_y)
+        min_rel_y = max(requested_min_rel_y, -int(origin_y))
+        max_rel_y = min(requested_max_rel_y, int(VERTICAL_CHUNK_COUNT - 1 - int(origin_y)))
+        if min_rel_y > max_rel_y:
+            return (0, 0)
+        return (int(min_rel_y), int(max_rel_y))
+
     @profile
     def _build_visible_layout_template(
         self,
         origin_mod_x: int,
         origin_mod_z: int,
+        origin_y: int,
     ) -> tuple[
         tuple[tuple[int, int, int], ...],
         tuple[tuple[int, int, int], ...],
@@ -1727,13 +1740,12 @@ class TerrainRenderer:
         pos_x = int(self._view_extent_pos_x)
         neg_z = int(self._view_extent_neg_z)
         pos_z = int(self._view_extent_pos_z)
-        neg_y = int(self._view_extent_neg_y) if VERTICAL_CHUNK_STACK_ENABLED else 0
-        pos_y = int(self._view_extent_pos_y) if VERTICAL_CHUNK_STACK_ENABLED else 0
+        min_rel_y, max_rel_y = self._visible_rel_y_bounds_for_origin_y(int(origin_y))
         template_key = (
             neg_x,
             pos_x,
-            neg_y,
-            pos_y,
+            min_rel_y,
+            max_rel_y,
             neg_z,
             pos_z,
             tile_size,
@@ -1746,8 +1758,6 @@ class TerrainRenderer:
         if cached is not None:
             return cached
 
-        min_rel_y = -neg_y if VERTICAL_CHUNK_STACK_ENABLED else 0
-        max_rel_y = pos_y if VERTICAL_CHUNK_STACK_ENABLED else 0
         if VERTICAL_CHUNK_STACK_ENABLED:
             cy_order: list[int] = [0]
             max_offset = max(-min_rel_y, max_rel_y)
@@ -1830,6 +1840,7 @@ class TerrainRenderer:
         rel_coords, rel_tile_keys, rel_tile_mask_values, rel_coord_to_tile_slot, rel_tile_slot_sizes = self._build_visible_layout_template(
             chunk_x % tile_size,
             chunk_z % tile_size,
+            chunk_y,
         )
         base_tile_x = chunk_x // tile_size
         base_tile_z = chunk_z // tile_size
@@ -1960,13 +1971,19 @@ class TerrainRenderer:
             self._visible_tile_base,
         ) = self._tile_layout_in_view_for_origin(new_origin)
 
+        new_rel_y_bounds = self._visible_rel_y_bounds_for_origin_y(int(new_origin[1]))
         shifted_visible_coords = False
         if previous_origin is not None and self._visible_chunk_coords:
             visible_coord_set = self._visible_chunk_coord_set
             visible_coords = self._visible_chunk_coords
-            if visible_coord_set and len(visible_coord_set) == len(visible_coords):
+            if (
+                visible_coord_set
+                and len(visible_coord_set) == len(visible_coords)
+                and self._visible_rel_y_bounds == new_rel_y_bounds
+            ):
                 shifted_visible_coords = self._apply_visible_chunk_coord_delta(new_origin)
         self._visible_chunk_origin = new_origin
+        self._visible_rel_y_bounds = new_rel_y_bounds
 
         if shifted_visible_coords:
             visible_coords = self._visible_chunk_coords

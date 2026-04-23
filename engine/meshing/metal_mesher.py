@@ -233,7 +233,7 @@ def submit_chunk_mesh_batch(
         chunk_results: list[ChunkVoxelResult],
         on_complete: Callable[[list[object]], None] | None,
     ) -> AsyncVoxelMeshBatchResources | None:
-        if not chunk_results:
+        if not terrain_results:
             resources = AsyncVoxelMeshBatchResources(
                 mesher=self,
                 slot=None,
@@ -658,22 +658,22 @@ def submit_chunk_mesh_batch_async(
 
 
 @profile
-def make_chunk_mesh_batch_from_voxels(renderer, chunk_results: list[ChunkVoxelResult]):
-    if not chunk_results:
+def make_chunk_mesh_batch_from_terrain_results(renderer, terrain_results: list[ChunkVoxelResult]):
+    if not terrain_results:
         return []
     prewarm_metal_chunk_mesher(renderer)
     mesher = get_metal_chunk_mesher(renderer, block=False)
     if mesher is None:
         mesher = get_metal_chunk_mesher(renderer, block=True, timeout=2.0)
     if mesher is None:
-        from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_voxels
+        from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_terrain_results
 
-        return cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results)
-    resources = mesher.submit_chunk_mesh_batch(renderer, chunk_results, None)
+        return cpu_make_chunk_mesh_batch_from_terrain_results(renderer, terrain_results)
+    resources = mesher.submit_chunk_mesh_batch(renderer, terrain_results, None)
     if resources is None:
-        from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_voxels
+        from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_terrain_results
 
-        return cpu_make_chunk_mesh_batch_from_voxels(renderer, chunk_results)
+        return cpu_make_chunk_mesh_batch_from_terrain_results(renderer, terrain_results)
     return []
 
 
@@ -725,7 +725,7 @@ def _build_completed_meshes_from_resources(renderer, resources: AsyncVoxelMeshBa
         )
 
     if overflow_results:
-        from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_voxels
+        from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_terrain_results
 
         preview = ", ".join(f"({x},{z})" for x, z in overflow_coords[:8])
         more = "" if len(overflow_coords) <= 8 else f" ... +{len(overflow_coords) - 8} more"
@@ -733,7 +733,7 @@ def _build_completed_meshes_from_resources(renderer, resources: AsyncVoxelMeshBa
             f"Warning: Metal mesher overflow on {len(overflow_results)} chunk(s); falling back to CPU meshing for {preview}{more}.",
             file=sys.stderr,
         )
-        meshes.extend(cpu_make_chunk_mesh_batch_from_voxels(renderer, overflow_results))
+        meshes.extend(cpu_make_chunk_mesh_batch_from_terrain_results(renderer, overflow_results))
 
     return meshes
 

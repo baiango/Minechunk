@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 from collections import deque
-import sys
 import time
 
 import numpy as np
-import wgpu
 
 from ..cache import mesh_allocator as mesh_cache
-from ..meshing.cpu_mesher import cpu_make_chunk_mesh_batch_from_voxels, cpu_make_chunk_mesh_from_voxels
 from ..meshing import gpu_mesher as wgpu_mesher
 from ..meshing import metal_mesher
 from ..meshing_types import ChunkMesh
@@ -46,62 +43,12 @@ def chunk_prep_priority(renderer, chunk_x: int, chunk_y: int, chunk_z: int, came
     return (distance_sq, abs(dy), above_bias, abs(dz), abs(dx))
 
 @profile
-def gpu_make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
-    mesher = _terrain_mesher(renderer)
-    meshes = mesher.make_chunk_mesh_batch_from_voxels(
-        renderer,
-        [
-            ChunkVoxelResult(
-                chunk_x=chunk_x,
-                chunk_y=chunk_y,
-                chunk_z=chunk_z,
-                blocks=np.ascontiguousarray(voxel_grid, dtype=np.uint32),
-                materials=np.ascontiguousarray(material_grid, dtype=np.uint32),
-                source="gpu",
-            )
-        ]
-    )
-    if not meshes:
-        empty_buffer = renderer.device.create_buffer(
-            size=1,
-            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC | wgpu.BufferUsage.COPY_DST,
-        )
-        return ChunkMesh(
-            chunk_x=chunk_x,
-            chunk_y=chunk_y,
-            chunk_z=chunk_z,
-            vertex_count=0,
-            vertex_buffer=empty_buffer,
-            max_height=int(voxel_grid.shape[0]),
-            vertex_offset=0,
-            created_at=time.perf_counter(),
-        )
-    return meshes[0]
-
-@profile
-def make_chunk_mesh_from_voxels(renderer, chunk_x: int, chunk_y: int, chunk_z: int, voxel_grid, material_grid) -> ChunkMesh:
-    if renderer.use_gpu_meshing:
-        try:
-            return gpu_make_chunk_mesh_from_voxels(renderer, chunk_x, chunk_y, chunk_z, voxel_grid, material_grid)
-        except Exception as exc:
-            renderer.use_gpu_meshing = False
-            renderer.mesh_backend_label = "CPU"
-            print(f"Warning: GPU meshing failed ({exc!s}); using CPU meshing.", file=sys.stderr)
-    return cpu_make_chunk_mesh_from_voxels(renderer, chunk_x, chunk_y, chunk_z, voxel_grid, material_grid)
-
-def make_chunk_mesh(renderer, chunk_x: int, chunk_y: int, chunk_z: int) -> ChunkMesh:
-    voxel_grid, material_grid = renderer.world.chunk_voxel_grid(chunk_x, chunk_y, chunk_z)
-    return make_chunk_mesh_from_voxels(renderer, chunk_x, chunk_y, chunk_z, voxel_grid, material_grid)
-
-@profile
 def accept_chunk_voxel_result(renderer, result) -> None:
     key = (int(result.chunk_x), int(getattr(result, "chunk_y", 0)), int(result.chunk_z))
     renderer._pending_chunk_coords.discard(key)
-    if renderer.use_gpu_meshing:
-        mesh = make_chunk_mesh_from_voxels(renderer, key[0], key[1], key[2], result.blocks, result.materials)
-    else:
-        mesh = cpu_make_chunk_mesh_batch_from_voxels(renderer, [result])[0]
-    mesh_cache.store_chunk_mesh(renderer, mesh)
+    mesh = meshing_stage.make_chunk_mesh_from_terrain_result(renderer, result)
+    if mesh is not None:
+        mesh_cache.store_chunk_mesh(renderer, mesh)
 
 @profile
 def ensure_chunk_mesh(renderer, chunk_x: int, chunk_y: int, chunk_z: int) -> ChunkMesh:
@@ -111,7 +58,16 @@ def ensure_chunk_mesh(renderer, chunk_x: int, chunk_y: int, chunk_z: int) -> Chu
         renderer.chunk_cache.move_to_end(key)
         return mesh
 
-    mesh = make_chunk_mesh(renderer, chunk_x, chunk_y, chunk_z)
+    voxel_grid, material_grid = renderer.world.chunk_voxel_grid(chunk_x, chunk_y, chunk_z)
+    terrain_result = ChunkVoxelResult(
+        chunk_x=int(chunk_x),
+        chunk_y=int(chunk_y),
+        chunk_z=int(chunk_z),
+        blocks=np.ascontiguousarray(voxel_grid, dtype=np.uint32),
+        materials=np.ascontiguousarray(material_grid, dtype=np.uint32),
+        source="sync",
+    )
+    mesh = meshing_stage.make_chunk_mesh_from_terrain_result(renderer, terrain_result)
     mesh_cache.store_chunk_mesh(renderer, mesh)
     return mesh
 
@@ -240,15 +196,11 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
                     batch_chunk_count = len(surface_batch.chunks)
                     chunk_stream_drained += batch_chunk_count
                     chunk_stream_bytes += float(batch_chunk_count * int(surface_batch.cell_count) * 8)
-                if hasattr(mesher, "enqueue_surface_gpu_batches_for_meshing"):
-                    mesher.enqueue_surface_gpu_batches_for_meshing(renderer, ready_surface_batches)
-                else:
-                    for surface_batch in ready_surface_batches:
-                        meshes = mesher.make_chunk_mesh_batch_from_surface_gpu_batch(renderer, surface_batch)
-                        for mesh in meshes:
-                            mesh_cache.store_chunk_mesh(renderer, mesh)
-                if hasattr(mesher, "drain_pending_surface_gpu_batches_to_meshing"):
-                    mesher.drain_pending_surface_gpu_batches_to_meshing(renderer)
+                staged_meshes = meshing_stage.enqueue_surface_gpu_batches_for_meshing(renderer, ready_surface_batches)
+                if staged_meshes:
+                    for mesh in staged_meshes:
+                        mesh_cache.store_chunk_mesh(renderer, mesh)
+                meshing_stage.drain_pending_surface_gpu_batches_to_meshing(renderer)
         elif using_metal_terrain:
             ready_results = renderer.world.poll_ready_chunk_voxel_batches()
             chunk_stream_bytes = 0.0
@@ -279,7 +231,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
                 drain_budget -= len(batch)
                 if not batch:
                     continue
-                meshes = mesher.make_chunk_mesh_batch_from_voxels(renderer, batch)
+                meshes = meshing_stage.make_chunk_mesh_batch_from_terrain(renderer, batch)
                 for mesh in meshes:
                     mesh_cache.store_chunk_mesh(renderer, mesh)
         else:
@@ -315,7 +267,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
                 continue
             for result in batch:
                 chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
-            meshes = cpu_make_chunk_mesh_batch_from_voxels(renderer, batch)
+            meshes = meshing_stage.make_chunk_mesh_batch_from_terrain(renderer, batch)
             mesh_cache.store_chunk_meshes(renderer, meshes)
 
     missing_coords = renderer._visible_missing_coords
