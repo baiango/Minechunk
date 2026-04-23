@@ -2201,7 +2201,7 @@ class TerrainRenderer:
                 draw(vertex_count, 1, first_vertex, 0)
 
     @profile
-    def _submit_render(self):
+    def _submit_render(self, meshes=None):
         self._ensure_depth_buffer()
         right, up, forward = self._camera_basis()
         camera_upload_start = time.perf_counter()
@@ -2235,35 +2235,66 @@ class TerrainRenderer:
             and self._mesh_allocations
             and hasattr(wgpu.GPURenderCommandsMixin, "draw_indirect")
         )
-        if use_gpu_visibility:
-            gpu_visibility_start = time.perf_counter()
-            visible_batches, draw_calls, merged_batches, visible_chunks, visible_vertices = mesh_cache.build_gpu_visibility_records(self, encoder)
-            if draw_calls > 0:
-                metadata_buffer = self._mesh_visibility_record_buffer
-                indirect_buffer = self._mesh_draw_indirect_buffer
-                params_buffer = self._mesh_visibility_params_buffer
-                assert metadata_buffer is not None
-                assert indirect_buffer is not None
-                assert params_buffer is not None
-                visibility_bind_group = self.device.create_bind_group(
-                    layout=self.mesh_visibility_bind_group_layout,
-                    entries=[
-                        {"binding": 0, "resource": {"buffer": metadata_buffer}},
-                        {"binding": 1, "resource": {"buffer": indirect_buffer}},
-                        {"binding": 2, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
-                        {"binding": 3, "resource": {"buffer": params_buffer, "offset": 0, "size": 16}},
-                    ],
-                )
-                compute_pass = encoder.begin_compute_pass()
-                compute_pass.set_pipeline(self.mesh_visibility_pipeline)
-                compute_pass.set_bind_group(0, visibility_bind_group)
-                compute_pass.dispatch_workgroups((draw_calls + GPU_VISIBILITY_WORKGROUP_SIZE - 1) // GPU_VISIBILITY_WORKGROUP_SIZE, 1, 1)
-                compute_pass.end()
-            render_encode_ms = (time.perf_counter() - gpu_visibility_start) * 1000.0
-        elif use_indirect:
-            visible_batches, render_encode_ms, draw_calls, merged_batches, visible_chunks, visible_vertices = mesh_cache.visible_render_batches_indirect(self, encoder)
+        if meshes is not None:
+            if use_gpu_visibility:
+                gpu_visibility_start = time.perf_counter()
+                visible_batches, draw_calls, merged_batches, visible_chunks, visible_vertices = self.pipeline.render.build_gpu_visibility_records_for_meshes(self, meshes)
+                if draw_calls > 0:
+                    metadata_buffer = self._mesh_visibility_record_buffer
+                    indirect_buffer = self._mesh_draw_indirect_buffer
+                    params_buffer = self._mesh_visibility_params_buffer
+                    assert metadata_buffer is not None
+                    assert indirect_buffer is not None
+                    assert params_buffer is not None
+                    visibility_bind_group = self.device.create_bind_group(
+                        layout=self.mesh_visibility_bind_group_layout,
+                        entries=[
+                            {"binding": 0, "resource": {"buffer": metadata_buffer}},
+                            {"binding": 1, "resource": {"buffer": indirect_buffer}},
+                            {"binding": 2, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+                            {"binding": 3, "resource": {"buffer": params_buffer, "offset": 0, "size": 16}},
+                        ],
+                    )
+                    compute_pass = encoder.begin_compute_pass()
+                    compute_pass.set_pipeline(self.mesh_visibility_pipeline)
+                    compute_pass.set_bind_group(0, visibility_bind_group)
+                    compute_pass.dispatch_workgroups((draw_calls + GPU_VISIBILITY_WORKGROUP_SIZE - 1) // GPU_VISIBILITY_WORKGROUP_SIZE, 1, 1)
+                    compute_pass.end()
+                render_encode_ms = (time.perf_counter() - gpu_visibility_start) * 1000.0
+            elif use_indirect:
+                visible_batches, render_encode_ms, draw_calls, merged_batches, visible_chunks, visible_vertices = self.pipeline.render.visible_render_batches_indirect_for_meshes(self, meshes)
+            else:
+                visible_batches, render_encode_ms, draw_calls, merged_batches, visible_chunks, visible_vertices = self.pipeline.render.visible_render_batches_for_meshes(meshes)
         else:
-            visible_batches, render_encode_ms, draw_calls, merged_batches, visible_chunks, visible_vertices = mesh_cache.visible_render_batches(self, encoder)
+            if use_gpu_visibility:
+                gpu_visibility_start = time.perf_counter()
+                visible_batches, draw_calls, merged_batches, visible_chunks, visible_vertices = mesh_cache.build_gpu_visibility_records(self, encoder)
+                if draw_calls > 0:
+                    metadata_buffer = self._mesh_visibility_record_buffer
+                    indirect_buffer = self._mesh_draw_indirect_buffer
+                    params_buffer = self._mesh_visibility_params_buffer
+                    assert metadata_buffer is not None
+                    assert indirect_buffer is not None
+                    assert params_buffer is not None
+                    visibility_bind_group = self.device.create_bind_group(
+                        layout=self.mesh_visibility_bind_group_layout,
+                        entries=[
+                            {"binding": 0, "resource": {"buffer": metadata_buffer}},
+                            {"binding": 1, "resource": {"buffer": indirect_buffer}},
+                            {"binding": 2, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+                            {"binding": 3, "resource": {"buffer": params_buffer, "offset": 0, "size": 16}},
+                        ],
+                    )
+                    compute_pass = encoder.begin_compute_pass()
+                    compute_pass.set_pipeline(self.mesh_visibility_pipeline)
+                    compute_pass.set_bind_group(0, visibility_bind_group)
+                    compute_pass.dispatch_workgroups((draw_calls + GPU_VISIBILITY_WORKGROUP_SIZE - 1) // GPU_VISIBILITY_WORKGROUP_SIZE, 1, 1)
+                    compute_pass.end()
+                render_encode_ms = (time.perf_counter() - gpu_visibility_start) * 1000.0
+            elif use_indirect:
+                visible_batches, render_encode_ms, draw_calls, merged_batches, visible_chunks, visible_vertices = mesh_cache.visible_render_batches_indirect(self, encoder)
+            else:
+                visible_batches, render_encode_ms, draw_calls, merged_batches, visible_chunks, visible_vertices = mesh_cache.visible_render_batches(self, encoder)
 
         # Drawable acquisition can block when GPU/display work backs up, so keep it
         # measured separately in the HUD instead of folding it into generic encode time.
@@ -2433,6 +2464,13 @@ class TerrainRenderer:
             "visible_vertices": visible_vertices,
         }
         return encoder, color_view, stats
+
+    def encode_render_meshes(self, meshes):
+        """Build render commands from an explicit mesh iterable instead of chunk-cache visibility."""
+        return self._submit_render(meshes=meshes)
+
+    def submit_render_meshes(self, meshes):
+        return self.encode_render_meshes(meshes)
 
     def _is_device_lost_error(self, exc: Exception) -> bool:
         text = str(exc)
