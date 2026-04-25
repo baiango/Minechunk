@@ -12,12 +12,12 @@ from .pipelines import profiling as hud_profile
 from .cache import mesh_allocator as mesh_cache
 from .renderer_config import *
 from .render_shaders import (
-    COMPOSITE_SHADER,
     FINAL_BLIT_SHADER,
+    GI_CASCADE_SHADER,
+    GI_GBUFFER_SHADER,
+    GI_POSTPROCESS_SHADER,
     GPU_VISIBILITY_SHADER,
     HUD_SHADER,
-    OCCLUSION_MASK_SHADER,
-    RADIAL_BLUR_SHADER,
     RENDER_SHADER,
     TILE_MERGE_SHADER,
     VOXEL_MESH_BATCH_SHADER,
@@ -166,7 +166,7 @@ class TerrainRenderer:
         self.depth_texture = None
         self.depth_view = None
         self.depth_size = (0, 0)
-        self.volumetric_lighting_enabled = bool(VOLUMETRIC_LIGHTING_ENABLED)
+        self.radiance_cascades_enabled = bool(RADIANCE_CASCADES_ENABLED)
         self.final_present_enabled = True
         self._postprocess_size = (0, 0)
         self.postprocess_msaa_sample_count = 4 if int(POSTPROCESS_MSAA_SAMPLE_COUNT) > 1 else 1
@@ -174,31 +174,47 @@ class TerrainRenderer:
         self.scene_color_view = None
         self.scene_color_msaa_texture = None
         self.scene_color_msaa_view = None
-        self.composite_color_texture = None
-        self.composite_color_view = None
-        self.occlusion_mask_texture = None
-        self.occlusion_mask_view = None
-        self.occlusion_mask_msaa_texture = None
-        self.occlusion_mask_msaa_view = None
-        self.volumetric_shaft_texture = None
-        self.volumetric_shaft_view = None
+        self.scene_gbuffer_texture = None
+        self.scene_gbuffer_view = None
+        self.scene_gbuffer_msaa_texture = None
+        self.scene_gbuffer_msaa_view = None
+        self.gi_color_texture = None
+        self.gi_color_view = None
+        self.gi_cascade_textures = []
+        self.gi_cascade_views = []
+        self.gi_cascade_param_buffers = []
+        self.gi_cascade_bind_groups = []
+        self.worldspace_rc_textures = []
+        self.worldspace_rc_views = []
+        self.worldspace_rc_visibility_textures = []
+        self.worldspace_rc_visibility_views = []
+        self.worldspace_rc_volume_params_buffer = None
+        self._worldspace_rc_signature = None
+        self._worldspace_rc_active_signatures = [None, None, None, None]
+        self._worldspace_rc_active_mins = [(0.0, 0.0, 0.0) for _ in range(4)]
+        self._worldspace_rc_active_inv_extents = [(0.0, 0.0, 0.0) for _ in range(4)]
+        self._worldspace_rc_cpu_radiance_volumes = [None, None, None, None]
+        self._worldspace_rc_cpu_visibility_volumes = [None, None, None, None]
+        self._worldspace_rc_last_update_frame = [-1000000, -1000000, -1000000, -1000000]
+        self._worldspace_rc_update_cursor = 0
+        self._worldspace_rc_frame_index = 0
+        self._worldspace_rc_material_lru: OrderedDict[tuple[int, int, int], int] = OrderedDict()
         self.postprocess_depth_texture = None
         self.postprocess_depth_view = None
         self.postprocess_sampler = None
-        self.radial_blur_params_buffer = None
+        self.gi_params_buffer = None
         self.final_present_params_buffer = None
-        self.radial_blur_bind_group_layout = None
-        self.radial_blur_pipeline = None
-        self.radial_blur_bind_group = None
-        self.composite_bind_group_layout = None
-        self.composite_pipeline = None
-        self.composite_bind_group = None
+        self.gi_bind_group_layout = None
+        self.gi_pipeline = None
+        self.gi_bind_group = None
+        self.gi_compose_bind_group_layout = None
+        self.gi_compose_pipeline = None
+        self.gi_compose_bind_group = None
         self.final_present_bind_group_layout = None
         self.final_present_pipeline = None
         self.final_scene_bind_group = None
-        self.final_composite_bind_group = None
+        self.final_gi_bind_group = None
         self.scene_render_pipeline = None
-        self.occlusion_mask_pipeline = None
         self.freeze_view_origin = bool(freeze_view_origin)
         self.freeze_camera = bool(freeze_camera)
         self._frozen_view_origin: tuple[int, int, int] | None = None
@@ -420,8 +436,12 @@ class TerrainRenderer:
             size=VERTEX_STRIDE,
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
         )
-        self.radial_blur_params_buffer = self.device.create_buffer(
+        self.gi_params_buffer = self.device.create_buffer(
             size=32,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        self.worldspace_rc_volume_params_buffer = self.device.create_buffer(
+            size=256,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         self.final_present_params_buffer = self.device.create_buffer(
@@ -670,7 +690,7 @@ class TerrainRenderer:
                 }
             ],
         )
-        self.radial_blur_bind_group_layout = self.device.create_bind_group_layout(
+        self.gi_bind_group_layout = self.device.create_bind_group_layout(
             entries=[
                 {
                     "binding": 0,
@@ -680,16 +700,36 @@ class TerrainRenderer:
                 {
                     "binding": 1,
                     "visibility": wgpu.ShaderStage.FRAGMENT,
-                    "sampler": {"type": "filtering"},
+                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
                 },
                 {
                     "binding": 2,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+                },
+                {
+                    "binding": 3,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "sampler": {"type": "filtering"},
+                },
+                {
+                    "binding": 4,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+                {
+                    "binding": 5,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+                {
+                    "binding": 6,
                     "visibility": wgpu.ShaderStage.FRAGMENT,
                     "buffer": {"type": "uniform"},
                 },
             ],
         )
-        self.composite_bind_group_layout = self.device.create_bind_group_layout(
+        self.gi_compose_bind_group_layout = self.device.create_bind_group_layout(
             entries=[
                 {
                     "binding": 0,
@@ -704,15 +744,60 @@ class TerrainRenderer:
                 {
                     "binding": 2,
                     "visibility": wgpu.ShaderStage.FRAGMENT,
-                    "sampler": {"type": "filtering"},
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
                 },
                 {
                     "binding": 3,
                     "visibility": wgpu.ShaderStage.FRAGMENT,
-                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
                 },
                 {
                     "binding": 4,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
+                },
+                {
+                    "binding": 5,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
+                },
+                {
+                    "binding": 6,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
+                },
+                {
+                    "binding": 7,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
+                },
+                {
+                    "binding": 8,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
+                },
+                {
+                    "binding": 9,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
+                },
+                {
+                    "binding": 10,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "sampler": {"type": "filtering"},
+                },
+                {
+                    "binding": 11,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+                {
+                    "binding": 12,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "buffer": {"type": "uniform"},
+                },
+                {
+                    "binding": 13,
                     "visibility": wgpu.ShaderStage.FRAGMENT,
                     "buffer": {"type": "uniform"},
                 },
@@ -825,7 +910,7 @@ class TerrainRenderer:
         self.scene_render_pipeline = self.device.create_render_pipeline(
             layout=self.device.create_pipeline_layout(bind_group_layouts=[self.render_bind_group_layout]),
             vertex={
-                "module": self.device.create_shader_module(code=RENDER_SHADER),
+                "module": self.device.create_shader_module(code=GI_GBUFFER_SHADER),
                 "entry_point": "vs_main",
                 "buffers": [
                     {
@@ -840,43 +925,13 @@ class TerrainRenderer:
                 ],
             },
             fragment={
-                "module": self.device.create_shader_module(code=RENDER_SHADER),
+                "module": self.device.create_shader_module(code=GI_GBUFFER_SHADER),
                 "entry_point": "fs_main",
-                "targets": [{"format": POSTPROCESS_SCENE_FORMAT}],
-            },
-            primitive={
-                "topology": "triangle-list",
-                "cull_mode": "none",
-            },
-            depth_stencil={
-                "format": DEPTH_FORMAT,
-                "depth_write_enabled": True,
-                "depth_compare": "less",
-            },
-            multisample={"count": self.postprocess_msaa_sample_count},
-        )
-        self.occlusion_mask_pipeline = self.device.create_render_pipeline(
-            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.render_bind_group_layout]),
-            vertex={
-                "module": self.device.create_shader_module(code=OCCLUSION_MASK_SHADER),
-                "entry_point": "vs_main",
-                "buffers": [
-                    {
-                        "array_stride": VERTEX_STRIDE,
-                        "step_mode": "vertex",
-                        "attributes": [
-                            {"shader_location": 0, "offset": 0, "format": "float32x4"},
-                            {"shader_location": 1, "offset": 16, "format": "float32x4"},
-                            {"shader_location": 2, "offset": 32, "format": "float32x4"},
-                        ],
-                    }
+                "targets": [
+                    {"format": POSTPROCESS_SCENE_FORMAT},
+                    {"format": POSTPROCESS_GBUFFER_FORMAT},
                 ],
             },
-            fragment={
-                "module": self.device.create_shader_module(code=OCCLUSION_MASK_SHADER),
-                "entry_point": "fs_main",
-                "targets": [{"format": POSTPROCESS_OCCLUSION_FORMAT}],
-            },
             primitive={
                 "topology": "triangle-list",
                 "cull_mode": "none",
@@ -888,34 +943,34 @@ class TerrainRenderer:
             },
             multisample={"count": self.postprocess_msaa_sample_count},
         )
-        self.radial_blur_pipeline = self.device.create_render_pipeline(
-            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.radial_blur_bind_group_layout]),
+        self.gi_pipeline = self.device.create_render_pipeline(
+            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.gi_bind_group_layout]),
             vertex={
-                "module": self.device.create_shader_module(code=RADIAL_BLUR_SHADER),
+                "module": self.device.create_shader_module(code=GI_CASCADE_SHADER),
                 "entry_point": "vs_main",
                 "buffers": [],
             },
             fragment={
-                "module": self.device.create_shader_module(code=RADIAL_BLUR_SHADER),
+                "module": self.device.create_shader_module(code=GI_CASCADE_SHADER),
                 "entry_point": "fs_main",
-                "targets": [{"format": POSTPROCESS_SHAFT_FORMAT}],
+                "targets": [{"format": POSTPROCESS_GI_FORMAT}],
             },
             primitive={
                 "topology": "triangle-list",
                 "cull_mode": "none",
             },
         )
-        self.composite_pipeline = self.device.create_render_pipeline(
-            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.composite_bind_group_layout]),
+        self.gi_compose_pipeline = self.device.create_render_pipeline(
+            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.gi_compose_bind_group_layout]),
             vertex={
-                "module": self.device.create_shader_module(code=COMPOSITE_SHADER),
+                "module": self.device.create_shader_module(code=GI_POSTPROCESS_SHADER),
                 "entry_point": "vs_main",
                 "buffers": [],
             },
             fragment={
-                "module": self.device.create_shader_module(code=COMPOSITE_SHADER),
+                "module": self.device.create_shader_module(code=GI_POSTPROCESS_SHADER),
                 "entry_point": "fs_main",
-                "targets": [{"format": POSTPROCESS_COMPOSITE_FORMAT if self.final_present_enabled else self.color_format}],
+                "targets": [{"format": POSTPROCESS_GI_FORMAT}],
             },
             primitive={
                 "topology": "triangle-list",
@@ -1033,18 +1088,21 @@ class TerrainRenderer:
         self.scene_color_view = None
         self.scene_color_msaa_texture = None
         self.scene_color_msaa_view = None
-        self.composite_color_texture = None
-        self.composite_color_view = None
-        self.occlusion_mask_texture = None
-        self.occlusion_mask_view = None
-        self.occlusion_mask_msaa_texture = None
-        self.occlusion_mask_msaa_view = None
-        self.volumetric_shaft_texture = None
-        self.volumetric_shaft_view = None
+        self.scene_gbuffer_texture = None
+        self.scene_gbuffer_view = None
+        self.scene_gbuffer_msaa_texture = None
+        self.scene_gbuffer_msaa_view = None
+        self.gi_color_texture = None
+        self.gi_color_view = None
+        self.gi_cascade_textures = []
+        self.gi_cascade_views = []
+        self.gi_cascade_param_buffers = []
+        self.gi_cascade_bind_groups = []
+        self.worldspace_rc_visibility_textures = []
+        self.worldspace_rc_visibility_views = []
+        self._worldspace_rc_signature = None
         self.postprocess_depth_texture = None
         self.postprocess_depth_view = None
-        self.radial_blur_bind_group = None
-        self.composite_bind_group = None
         if self.profiling_enabled and self.profile_hud_lines:
             self.profile_hud_vertex_bytes, self.profile_hud_vertex_count = hud_profile.build_profile_hud_vertices(self, self.profile_hud_lines)
         if self.profiling_enabled and self.frame_breakdown_lines:
@@ -1074,6 +1132,8 @@ class TerrainRenderer:
             self.walk_mode = not self.walk_mode
             self._walk_velocity[:] = [0.0, 0.0, 0.0]
             self._jump_queued = False
+        if is_new_press and key == "g":
+            self.radiance_cascades_enabled = not self.radiance_cascades_enabled
         if is_new_press and key == "space":
             self._jump_queued = True
 
@@ -2054,22 +2114,29 @@ class TerrainRenderer:
     def _ensure_postprocess_targets(self) -> None:
         width, height = self.canvas.get_physical_size()
         target_size = (max(1, int(width)), max(1, int(height)))
+        cascade_count = max(1, int(RADIANCE_CASCADES_CASCADE_COUNT))
         if (
             target_size == self._postprocess_size
             and self.scene_color_view is not None
-            and self.composite_color_view is not None
-            and self.occlusion_mask_view is not None
-            and self.volumetric_shaft_view is not None
-            and self.radial_blur_bind_group is not None
-            and self.composite_bind_group is not None
+            and self.scene_gbuffer_view is not None
+            and self.gi_color_view is not None
+            and len(self.gi_cascade_views) == cascade_count
+            and len(self.gi_cascade_bind_groups) == cascade_count
+            and len(self.worldspace_rc_views) == 4
+            and self.gi_compose_bind_group is not None
             and self.final_scene_bind_group is not None
-            and self.final_composite_bind_group is not None
+            and self.final_gi_bind_group is not None
             and self.postprocess_depth_view is not None
             and (self.postprocess_msaa_sample_count <= 1 or self.scene_color_msaa_view is not None)
-            and (self.postprocess_msaa_sample_count <= 1 or self.occlusion_mask_msaa_view is not None)
+            and (self.postprocess_msaa_sample_count <= 1 or self.scene_gbuffer_msaa_view is not None)
         ):
             return
         self._postprocess_size = target_size
+        gi_compose_scale = min(1.0, max(0.25, float(RADIANCE_CASCADES_COMPOSE_SCALE)))
+        gi_target_size = (
+            max(1, int(math.ceil(float(target_size[0]) * gi_compose_scale))),
+            max(1, int(math.ceil(float(target_size[1]) * gi_compose_scale))),
+        )
         texture_usage = wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.TEXTURE_BINDING
         self.scene_color_texture = self.device.create_texture(
             size=(target_size[0], target_size[1], 1),
@@ -2088,35 +2155,76 @@ class TerrainRenderer:
         else:
             self.scene_color_msaa_texture = None
             self.scene_color_msaa_view = self.scene_color_view
-        self.composite_color_texture = self.device.create_texture(
+        self.scene_gbuffer_texture = self.device.create_texture(
             size=(target_size[0], target_size[1], 1),
-            format=POSTPROCESS_COMPOSITE_FORMAT,
+            format=POSTPROCESS_GBUFFER_FORMAT,
             usage=texture_usage,
         )
-        self.composite_color_view = self.composite_color_texture.create_view()
-        self.occlusion_mask_texture = self.device.create_texture(
-            size=(target_size[0], target_size[1], 1),
-            format=POSTPROCESS_OCCLUSION_FORMAT,
-            usage=texture_usage,
-        )
-        self.occlusion_mask_view = self.occlusion_mask_texture.create_view()
+        self.scene_gbuffer_view = self.scene_gbuffer_texture.create_view()
         if self.postprocess_msaa_sample_count > 1:
-            self.occlusion_mask_msaa_texture = self.device.create_texture(
+            self.scene_gbuffer_msaa_texture = self.device.create_texture(
                 size=(target_size[0], target_size[1], 1),
-                format=POSTPROCESS_OCCLUSION_FORMAT,
+                format=POSTPROCESS_GBUFFER_FORMAT,
                 usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
                 sample_count=self.postprocess_msaa_sample_count,
             )
-            self.occlusion_mask_msaa_view = self.occlusion_mask_msaa_texture.create_view()
+            self.scene_gbuffer_msaa_view = self.scene_gbuffer_msaa_texture.create_view()
         else:
-            self.occlusion_mask_msaa_texture = None
-            self.occlusion_mask_msaa_view = self.occlusion_mask_view
-        self.volumetric_shaft_texture = self.device.create_texture(
-            size=(target_size[0], target_size[1], 1),
-            format=POSTPROCESS_SHAFT_FORMAT,
+            self.scene_gbuffer_msaa_texture = None
+            self.scene_gbuffer_msaa_view = self.scene_gbuffer_view
+        self.gi_color_texture = self.device.create_texture(
+            size=(gi_target_size[0], gi_target_size[1], 1),
+            format=POSTPROCESS_GI_FORMAT,
             usage=texture_usage,
         )
-        self.volumetric_shaft_view = self.volumetric_shaft_texture.create_view()
+        self.gi_color_view = self.gi_color_texture.create_view()
+        worldspace_resolution = max(4, int(WORLDSPACE_RC_GRID_RESOLUTION))
+        self.worldspace_rc_textures = []
+        self.worldspace_rc_views = []
+        self.worldspace_rc_visibility_textures = []
+        self.worldspace_rc_visibility_views = []
+        for _ in range(4):
+            rc_texture = self.device.create_texture(
+                size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
+                dimension="3d",
+                format=POSTPROCESS_GI_FORMAT,
+                usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            )
+            vis_texture = self.device.create_texture(
+                size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
+                dimension="3d",
+                format=POSTPROCESS_GI_FORMAT,
+                usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+            )
+            self.worldspace_rc_textures.append(rc_texture)
+            self.worldspace_rc_views.append(rc_texture.create_view(dimension="3d"))
+            self.worldspace_rc_visibility_textures.append(vis_texture)
+            self.worldspace_rc_visibility_views.append(vis_texture.create_view(dimension="3d"))
+        self._worldspace_rc_signature = None
+        self._worldspace_rc_active_signatures = [None, None, None, None]
+        self._worldspace_rc_active_mins = [(0.0, 0.0, 0.0) for _ in range(4)]
+        self._worldspace_rc_active_inv_extents = [(0.0, 0.0, 0.0) for _ in range(4)]
+        self._worldspace_rc_cpu_radiance_volumes = [None, None, None, None]
+        self._worldspace_rc_cpu_visibility_volumes = [None, None, None, None]
+        self._worldspace_rc_last_update_frame = [-1000000, -1000000, -1000000, -1000000]
+        self._worldspace_rc_update_cursor = 0
+        self.gi_cascade_textures = []
+        self.gi_cascade_views = []
+        self.gi_cascade_param_buffers = []
+        self.gi_cascade_bind_groups = []
+        for cascade_index in range(cascade_count):
+            cascade_size = (
+                max(1, target_size[0] >> cascade_index),
+                max(1, target_size[1] >> cascade_index),
+                1,
+            )
+            cascade_texture = self.device.create_texture(
+                size=cascade_size,
+                format=POSTPROCESS_GI_FORMAT,
+                usage=texture_usage,
+            )
+            self.gi_cascade_textures.append(cascade_texture)
+            self.gi_cascade_views.append(cascade_texture.create_view())
         self.postprocess_depth_texture = self.device.create_texture(
             size=(target_size[0], target_size[1], 1),
             format=DEPTH_FORMAT,
@@ -2127,22 +2235,70 @@ class TerrainRenderer:
 
         self._write_final_present_params(target_size[0], target_size[1])
 
-        self.radial_blur_bind_group = self.device.create_bind_group(
-            layout=self.radial_blur_bind_group_layout,
-            entries=[
-                {"binding": 0, "resource": self.occlusion_mask_view},
-                {"binding": 1, "resource": self.postprocess_sampler},
-                {"binding": 2, "resource": {"buffer": self.radial_blur_params_buffer, "offset": 0, "size": 32}},
-            ],
-        )
-        self.composite_bind_group = self.device.create_bind_group(
-            layout=self.composite_bind_group_layout,
+        gi_params = np.array([
+            float(RADIANCE_CASCADES_STRENGTH),
+            float(RADIANCE_CASCADES_BIAS),
+            float(RADIANCE_CASCADES_SKY_STRENGTH),
+            float(RADIANCE_CASCADES_HIT_THICKNESS),
+            float(RADIANCE_CASCADES_MERGE_OVERLAP),
+            float(RADIANCE_CASCADES_MERGE_STRENGTH),
+            float(RADIANCE_CASCADES_CASCADE_COUNT),
+            float(WORLDSPACE_RC_GRID_RESOLUTION),
+        ], dtype=np.float32)
+        self.device.queue.write_buffer(self.gi_params_buffer, 0, gi_params.tobytes())
+
+        for cascade_index in range(cascade_count):
+            cascade_params = np.array([
+                float(cascade_index),
+                1.0 if cascade_index + 1 < cascade_count else 0.0,
+                float(cascade_count),
+                0.0,
+                float(RADIANCE_CASCADES_BASE_INTERVAL),
+                float(RADIANCE_CASCADES_INTERVAL_SCALE),
+                float(RADIANCE_CASCADES_STEPS_PER_CASCADE),
+                0.0,
+            ], dtype=np.float32)
+            cascade_param_buffer = self.device.create_buffer(
+                size=32,
+                usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+            )
+            self.device.queue.write_buffer(cascade_param_buffer, 0, cascade_params.tobytes())
+            self.gi_cascade_param_buffers.append(cascade_param_buffer)
+            prev_view = self.gi_cascade_views[cascade_index + 1] if cascade_index + 1 < cascade_count else self.scene_color_view
+            self.gi_cascade_bind_groups.append(
+                self.device.create_bind_group(
+                    layout=self.gi_bind_group_layout,
+                    entries=[
+                        {"binding": 0, "resource": self.scene_color_view},
+                        {"binding": 1, "resource": self.scene_gbuffer_view},
+                        {"binding": 2, "resource": prev_view},
+                        {"binding": 3, "resource": self.postprocess_sampler},
+                        {"binding": 4, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+                        {"binding": 5, "resource": {"buffer": self.gi_params_buffer, "offset": 0, "size": 32}},
+                        {"binding": 6, "resource": {"buffer": cascade_param_buffer, "offset": 0, "size": 32}},
+                    ],
+                )
+            )
+        self.gi_bind_group = self.gi_cascade_bind_groups[0] if self.gi_cascade_bind_groups else None
+        worldspace_rc_params = np.zeros((8, 4), dtype=np.float32)
+        self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, worldspace_rc_params.tobytes())
+        self.gi_compose_bind_group = self.device.create_bind_group(
+            layout=self.gi_compose_bind_group_layout,
             entries=[
                 {"binding": 0, "resource": self.scene_color_view},
-                {"binding": 1, "resource": self.volumetric_shaft_view},
-                {"binding": 2, "resource": self.postprocess_sampler},
-                {"binding": 3, "resource": self.occlusion_mask_view},
-                {"binding": 4, "resource": {"buffer": self.radial_blur_params_buffer, "offset": 0, "size": 32}},
+                {"binding": 1, "resource": self.scene_gbuffer_view},
+                {"binding": 2, "resource": self.worldspace_rc_views[0]},
+                {"binding": 3, "resource": self.worldspace_rc_views[1]},
+                {"binding": 4, "resource": self.worldspace_rc_views[2]},
+                {"binding": 5, "resource": self.worldspace_rc_views[3]},
+                {"binding": 6, "resource": self.worldspace_rc_visibility_views[0]},
+                {"binding": 7, "resource": self.worldspace_rc_visibility_views[1]},
+                {"binding": 8, "resource": self.worldspace_rc_visibility_views[2]},
+                {"binding": 9, "resource": self.worldspace_rc_visibility_views[3]},
+                {"binding": 10, "resource": self.postprocess_sampler},
+                {"binding": 11, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+                {"binding": 12, "resource": {"buffer": self.gi_params_buffer, "offset": 0, "size": 32}},
+                {"binding": 13, "resource": {"buffer": self.worldspace_rc_volume_params_buffer, "offset": 0, "size": 256}},
             ],
         )
         self.final_scene_bind_group = self.device.create_bind_group(
@@ -2153,37 +2309,15 @@ class TerrainRenderer:
                 {"binding": 2, "resource": {"buffer": self.final_present_params_buffer, "offset": 0, "size": 32}},
             ],
         )
-        self.final_composite_bind_group = self.device.create_bind_group(
+        self.final_gi_bind_group = self.device.create_bind_group(
             layout=self.final_present_bind_group_layout,
             entries=[
-                {"binding": 0, "resource": self.composite_color_view},
+                {"binding": 0, "resource": self.gi_color_view},
                 {"binding": 1, "resource": self.postprocess_sampler},
                 {"binding": 2, "resource": {"buffer": self.final_present_params_buffer, "offset": 0, "size": 32}},
             ],
         )
 
-    @profile
-    def _project_directional_light_to_screen(self, right, up, forward) -> tuple[tuple[float, float], float]:
-        light_dir = normalize3(tuple(float(v) for v in LIGHT_DIRECTION))
-        view_x = dot3(light_dir, right)
-        view_y = dot3(light_dir, up)
-        view_z = dot3(light_dir, forward)
-        if view_z <= 0.001:
-            return (0.5, 0.5), 0.0
-        width, height = self.canvas.get_physical_size()
-        aspect = max(1.0, float(width) / max(1.0, float(height)))
-        focal = 1.0 / math.tan(math.radians(90.0) * 0.5)
-        ndc_x = view_x * focal / (aspect * view_z)
-        ndc_y = view_y * focal / view_z
-        uv_x = ndc_x * 0.5 + 0.5
-        uv_y = 0.5 - ndc_y * 0.5
-        edge = max(abs(ndc_x), abs(ndc_y))
-        edge_fade = clamp(1.0 - max(0.0, edge - 1.05) / 0.95, 0.0, 1.0)
-        forward_strength = clamp(view_z * 1.5, 0.0, 1.0)
-        strength = max(forward_strength * edge_fade, 0.42 if edge_fade > 0.0 else 0.0)
-        return (uv_x, uv_y), strength
-
-    @profile
     def _draw_visible_batches_to_pass(self, render_pass, visible_batches, use_gpu_visibility: bool, use_indirect: bool) -> None:
         current_vertex_buffer = None
         current_binding_offset = None
@@ -2216,6 +2350,537 @@ class TerrainRenderer:
                     current_vertex_buffer = vertex_buffer
                     current_binding_offset = binding_offset
                 draw(vertex_count, 1, first_vertex, 0)
+
+    def _worldspace_rc_material_rgb(self, material: int) -> tuple[float, float, float]:
+        if material == 1:
+            return 0.24, 0.22, 0.20
+        if material == 2:
+            return 0.42, 0.40, 0.38
+        if material == 3:
+            return 0.47, 0.31, 0.18
+        if material == 4:
+            return 0.31, 0.68, 0.24
+        if material == 5:
+            return 0.78, 0.71, 0.49
+        if material == 6:
+            return 0.95, 0.97, 0.98
+        return 0.60, 0.80, 0.98
+
+    def _worldspace_rc_trace_directions(self) -> tuple[tuple[float, float, float], ...]:
+        cached = getattr(self, "_worldspace_rc_trace_dirs", None)
+        target_count = max(6, int(WORLDSPACE_RC_TRACE_DIRECTIONS))
+        if cached is not None and len(cached) == target_count:
+            return cached
+        directions: list[tuple[float, float, float]] = []
+        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+        for i in range(target_count):
+            y = 1.0 - (2.0 * (float(i) + 0.5) / float(target_count))
+            radius = math.sqrt(max(0.0, 1.0 - y * y))
+            theta = golden_angle * float(i)
+            directions.append((math.cos(theta) * radius, y, math.sin(theta) * radius))
+        self._worldspace_rc_trace_dirs = tuple(directions)
+        return self._worldspace_rc_trace_dirs
+
+    def _worldspace_rc_solid_at(
+        self,
+        bx: int,
+        by: int,
+        bz: int,
+        material_cache: dict[tuple[int, int, int], int],
+    ) -> bool:
+        key = (int(bx), int(by), int(bz))
+        material = material_cache.get(key)
+        if material is None:
+            lru_cache = getattr(self, "_worldspace_rc_material_lru", None)
+            if lru_cache is not None:
+                cached = lru_cache.get(key)
+                if cached is not None:
+                    material = int(cached)
+                    lru_cache.move_to_end(key)
+            if material is None:
+                material = int(self.world.block_at(key[0], key[1], key[2])) if key[1] >= 0 else 1
+                if lru_cache is not None:
+                    lru_cache[key] = material
+                    lru_cache.move_to_end(key)
+                    max_entries = max(0, int(WORLDSPACE_RC_MATERIAL_CACHE_MAX_ENTRIES))
+                    while max_entries > 0 and len(lru_cache) > max_entries:
+                        lru_cache.popitem(last=False)
+            material_cache[key] = material
+        return material != int(AIR)
+
+    def _worldspace_rc_estimate_hit_normal(
+        self,
+        bx: int,
+        by: int,
+        bz: int,
+        ray_dx: float,
+        ray_dy: float,
+        ray_dz: float,
+        material_cache: dict[tuple[int, int, int], int],
+        normal_cache: dict[tuple[int, int, int], tuple[float, float, float]] | None = None,
+    ) -> tuple[float, float, float]:
+        cache_key = (int(bx), int(by), int(bz))
+        if normal_cache is not None:
+            cached = normal_cache.get(cache_key)
+            if cached is not None:
+                return cached
+        sx0 = 1.0 if self._worldspace_rc_solid_at(bx - 1, by, bz, material_cache) else 0.0
+        sx1 = 1.0 if self._worldspace_rc_solid_at(bx + 1, by, bz, material_cache) else 0.0
+        sy0 = 1.0 if self._worldspace_rc_solid_at(bx, by - 1, bz, material_cache) else 0.0
+        sy1 = 1.0 if self._worldspace_rc_solid_at(bx, by + 1, bz, material_cache) else 0.0
+        sz0 = 1.0 if self._worldspace_rc_solid_at(bx, by, bz - 1, material_cache) else 0.0
+        sz1 = 1.0 if self._worldspace_rc_solid_at(bx, by, bz + 1, material_cache) else 0.0
+        nx = sx0 - sx1
+        ny = sy0 - sy1
+        nz = sz0 - sz1
+        length = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if length <= 0.0001:
+            nx = -float(ray_dx)
+            ny = -float(ray_dy)
+            nz = -float(ray_dz)
+            length = math.sqrt(nx * nx + ny * ny + nz * nz)
+            inv_length = 1.0 / max(length, 0.0001)
+            return nx * inv_length, ny * inv_length, nz * inv_length
+        inv_length = 1.0 / max(length, 0.0001)
+        normal = (nx * inv_length, ny * inv_length, nz * inv_length)
+        if normal_cache is not None:
+            normal_cache[cache_key] = normal
+        return normal
+
+    def _worldspace_rc_hit_sky_visibility(self, bx: int, by: int, bz: int, material_cache: dict[tuple[int, int, int], int], sky_visibility_cache: dict[tuple[int, int, int], float] | None = None) -> float:
+        cache_key = (int(bx), int(by), int(bz))
+        if sky_visibility_cache is not None:
+            cached = sky_visibility_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        sample_count = max(1, int(WORLDSPACE_RC_SKY_VISIBILITY_STEPS))
+        step_blocks = max(1, int(WORLDSPACE_RC_SKY_VISIBILITY_STEP_BLOCKS))
+        aperture_radius = max(1, int(WORLDSPACE_RC_SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS))
+        aperture_power = max(0.25, float(WORLDSPACE_RC_SKY_VISIBILITY_APERTURE_POWER))
+        min_aperture = max(0.0, min(0.25, float(WORLDSPACE_RC_SKY_VISIBILITY_MIN_APERTURE)))
+
+        def column_access(sx: int, sz: int) -> float:
+            open_count = 0
+            for step in range(1, sample_count + 1):
+                sample_y = by + step * step_blocks
+                if self._worldspace_rc_solid_at(bx + sx, sample_y, bz + sz, material_cache):
+                    break
+                open_count += 1
+            return float(open_count) / float(sample_count)
+
+        center_access = column_access(0, 0)
+        if center_access <= 0.0:
+            visibility = 0.0
+        else:
+            side_offsets = (
+                (aperture_radius, 0),
+                (-aperture_radius, 0),
+                (0, aperture_radius),
+                (0, -aperture_radius),
+                (aperture_radius, aperture_radius),
+                (aperture_radius, -aperture_radius),
+                (-aperture_radius, aperture_radius),
+                (-aperture_radius, -aperture_radius),
+            )
+            side_access = 0.0
+            for sx, sz in side_offsets:
+                side_access += column_access(sx, sz)
+            side_access /= float(len(side_offsets))
+            aperture = max(min_aperture, side_access ** aperture_power)
+            visibility = center_access * aperture
+
+        if sky_visibility_cache is not None:
+            sky_visibility_cache[cache_key] = visibility
+        return visibility
+
+    def _trace_worldspace_rc_probe(
+        self,
+        origin: tuple[float, float, float],
+        max_distance: float,
+        cascade_index: int,
+        material_cache: dict[tuple[int, int, int], int],
+        sky_visibility_cache: dict[tuple[int, int, int], float],
+        normal_cache: dict[tuple[int, int, int], tuple[float, float, float]],
+        probe_trace_cache: dict[tuple[int, int, int, int], tuple[tuple[float, float, float], float, float, float, float, float]],
+    ) -> tuple[tuple[float, float, float], float, float, float, float, float]:
+        directions = self._worldspace_rc_trace_directions()
+        sky_rgb = (
+            0.60 * float(RADIANCE_CASCADES_SKY_STRENGTH),
+            0.80 * float(RADIANCE_CASCADES_SKY_STRENGTH),
+            0.98 * float(RADIANCE_CASCADES_SKY_STRENGTH),
+        )
+        sun_dx, sun_dy, sun_dz = normalize3(tuple(float(v) for v in LIGHT_DIRECTION))
+        side_weight = max(0.0, min(1.0, float(WORLDSPACE_RC_SKY_VISIBILITY_SIDE_WEIGHT)))
+        direct_sun_strength = max(0.0, float(WORLDSPACE_RC_DIRECT_SUN_STRENGTH))
+        indirect_floor = max(0.0, float(WORLDSPACE_RC_INDIRECT_FLOOR))
+        accum = np.zeros(3, dtype=np.float32)
+        hit_count = 0.0
+        sky_count = 0.0
+        hit_sky_visibility_accum = 0.0
+        distance_accum = 0.0
+        distance_sq_accum = 0.0
+        ox, oy, oz = origin
+        origin_bx = int(math.floor(ox / BLOCK_SIZE))
+        origin_by = int(math.floor(oy / BLOCK_SIZE))
+        origin_bz = int(math.floor(oz / BLOCK_SIZE))
+        if self._worldspace_rc_solid_at(origin_bx, origin_by, origin_bz, material_cache):
+            blocked_distance = float(max_distance)
+            return (0.0, 0.0, 0.0), 0.0, blocked_distance, blocked_distance * blocked_distance, 0.0, 0.0
+        trace_cache_key = (origin_bx, origin_by, origin_bz, int(cascade_index))
+        cached_trace = probe_trace_cache.get(trace_cache_key)
+        if cached_trace is not None:
+            return cached_trace
+        origin_sky_visibility = self._worldspace_rc_hit_sky_visibility(origin_bx, origin_by, origin_bz, material_cache, sky_visibility_cache)
+        effective_directions = directions
+        if cascade_index >= 2 and len(effective_directions) > 8:
+            effective_directions = effective_directions[::2]
+        elif cascade_index >= 1 and origin_sky_visibility <= 0.04 and len(effective_directions) > 12:
+            effective_directions = effective_directions[::2]
+        effective_step_count = max(6, int(WORLDSPACE_RC_TRACE_MAX_STEPS) - max(0, int(cascade_index)) * 2)
+        if origin_sky_visibility <= 0.04:
+            effective_step_count = max(6, effective_step_count - 2)
+        step_size = max(float(BLOCK_SIZE), float(max_distance) / float(effective_step_count))
+        for dx, dy, dz in effective_directions:
+            dist = step_size * 0.5
+            hit = False
+            hit_distance = float(max_distance)
+            while dist <= max_distance:
+                wx = ox + dx * dist
+                wy = oy + dy * dist
+                wz = oz + dz * dist
+                bx = int(math.floor(wx / BLOCK_SIZE))
+                by = int(math.floor(wy / BLOCK_SIZE))
+                bz = int(math.floor(wz / BLOCK_SIZE))
+                key = (bx, by, bz)
+                material = material_cache.get(key)
+                if material is None:
+                    material = int(self.world.block_at(bx, by, bz)) if by >= 0 else 1
+                    material_cache[key] = material
+                if material != int(AIR):
+                    color = self._worldspace_rc_material_rgb(material)
+                    nx, ny, nz = self._worldspace_rc_estimate_hit_normal(bx, by, bz, dx, dy, dz, material_cache, normal_cache)
+                    facing = max(0.0, min(1.0, -(nx * dx + ny * dy + nz * dz)))
+                    sun_term = max(0.0, nx * sun_dx + ny * sun_dy + nz * sun_dz)
+                    sky_visibility = self._worldspace_rc_hit_sky_visibility(bx, by, bz, material_cache, sky_visibility_cache)
+                    cave_gate = sky_visibility ** 3.0
+                    open_hemi = max(0.0, ny) ** 1.5
+                    ambient_sky = cave_gate * (0.10 + 0.90 * open_hemi) * 0.38
+                    direct_sun = cave_gate * sun_term * direct_sun_strength * 1.10
+                    falloff = 1.0 - min(1.0, dist / max(max_distance, 1e-4))
+                    range_term = 0.16 + 0.84 * falloff
+                    facing_term = 0.20 + 0.80 * facing
+                    bounce_scale = (indirect_floor + ambient_sky + direct_sun) * range_term * facing_term
+                    accum[0] += color[0] * bounce_scale
+                    accum[1] += color[1] * bounce_scale
+                    accum[2] += color[2] * bounce_scale
+                    hit_sky_visibility_accum += sky_visibility * (0.35 + 0.65 * facing)
+                    hit_count += 1.0
+                    hit = True
+                    hit_distance = float(dist)
+                    break
+                dist += step_size
+            if not hit:
+                sky_axis = max(0.0, float(dy))
+                sky_ray_weight = (0.03 + 0.97 * (sky_axis ** 2.0)) * (max(0.0, origin_sky_visibility) ** 1.85)
+                accum[0] += sky_rgb[0] * sky_ray_weight
+                accum[1] += sky_rgb[1] * sky_ray_weight
+                accum[2] += sky_rgb[2] * sky_ray_weight
+                sky_count += sky_ray_weight
+            distance_accum += hit_distance
+            distance_sq_accum += hit_distance * hit_distance
+        ray_count = float(max(1, len(effective_directions)))
+        accum /= ray_count
+        hit_fraction = hit_count / ray_count
+        sky_fraction = min(1.0, sky_count / ray_count)
+        valid_fraction = min(1.0, max(0.0, hit_fraction + 0.75 * sky_fraction))
+        observed_sky_access = 0.0
+        if hit_count > 0.0:
+            observed_sky_access = hit_sky_visibility_accum / hit_count
+        observed_sky_access = max(observed_sky_access, sky_fraction)
+        probe_sky_access = min(1.0, max(0.0, 0.78 * origin_sky_visibility + 0.22 * observed_sky_access))
+        alpha = valid_fraction
+        mean_distance = distance_accum / ray_count
+        mean_distance_sq = distance_sq_accum / ray_count
+        result = ((float(accum[0]), float(accum[1]), float(accum[2])), float(alpha), float(mean_distance), float(mean_distance_sq), float(valid_fraction), float(probe_sky_access))
+        probe_trace_cache[trace_cache_key] = result
+        return result
+
+    def _worldspace_rc_filter_volume(self, volume: np.ndarray) -> np.ndarray:
+        passes = max(0, int(WORLDSPACE_RC_SPATIAL_FILTER_PASSES))
+        if passes <= 0:
+            return volume.astype(np.float16, copy=False)
+        filtered = volume.astype(np.float32, copy=True)
+        for _ in range(passes):
+            src = filtered
+            dst = src * 0.40
+            weights = np.full(src.shape[:3] + (1,), 0.40, dtype=np.float32)
+            for axis in range(3):
+                src_front = [slice(None)] * 4
+                dst_front = [slice(None)] * 4
+                src_front[axis] = slice(0, -1)
+                dst_front[axis] = slice(1, None)
+                dst[tuple(dst_front)] += src[tuple(src_front)] * 0.10
+                weights[tuple(dst_front[:3] + [slice(None)])] += 0.10
+                src_back = [slice(None)] * 4
+                dst_back = [slice(None)] * 4
+                src_back[axis] = slice(1, None)
+                dst_back[axis] = slice(0, -1)
+                dst[tuple(dst_back)] += src[tuple(src_back)] * 0.10
+                weights[tuple(dst_back[:3] + [slice(None)])] += 0.10
+            filtered = dst / np.maximum(weights, 1e-6)
+        return filtered.astype(np.float16)
+
+    def _worldspace_rc_sparse_sample_coords(self, resolution: int, stride: int) -> tuple[int, ...]:
+        stride = max(1, int(stride))
+        coords = list(range(0, max(1, int(resolution)), stride))
+        last = max(0, int(resolution) - 1)
+        if not coords or coords[-1] != last:
+            coords.append(last)
+        return tuple(sorted(set(int(v) for v in coords)))
+
+    def _worldspace_rc_fill_sparse_probe_volume(
+        self,
+        volume: np.ndarray,
+        visibility_volume: np.ndarray,
+        solid_probe_mask: np.ndarray,
+        sample_coords: tuple[int, ...],
+    ) -> None:
+        resolution = int(volume.shape[0])
+        if resolution <= 1:
+            return
+        sample_set = set(int(v) for v in sample_coords)
+        valid_samples: list[tuple[int, int, int]] = []
+        for sz in sample_coords:
+            for sy in sample_coords:
+                for sx in sample_coords:
+                    z = int(sz)
+                    y = int(sy)
+                    x = int(sx)
+                    if bool(solid_probe_mask[z, y, x]):
+                        continue
+                    if (
+                        float(volume[z, y, x, 3]) > 0.0001
+                        or float(visibility_volume[z, y, x, 2]) > 0.0001
+                        or float(visibility_volume[z, y, x, 3]) > 0.0001
+                    ):
+                        valid_samples.append((x, y, z))
+        if not valid_samples:
+            return
+
+        fill_invalid = bool(WORLDSPACE_RC_DILATE_INVALID_PROBES)
+        max_solid_dist = max(1, int(WORLDSPACE_RC_INVALID_PROBE_DILATE_MAX_GRID_DISTANCE))
+        max_solid_dist_sq = max_solid_dist * max_solid_dist
+        solid_radiance_scale = max(0.0, min(1.0, float(WORLDSPACE_RC_INVALID_PROBE_DILATE_RADIANCE_SCALE)))
+
+        for z in range(resolution):
+            z_sampled = z in sample_set
+            for y in range(resolution):
+                yz_sampled = z_sampled and y in sample_set
+                for x in range(resolution):
+                    sampled = yz_sampled and x in sample_set
+                    solid = bool(solid_probe_mask[z, y, x])
+                    valid = (
+                        (not solid)
+                        and (
+                            float(volume[z, y, x, 3]) > 0.0001
+                            or float(visibility_volume[z, y, x, 2]) > 0.0001
+                            or float(visibility_volume[z, y, x, 3]) > 0.0001
+                        )
+                    )
+                    if sampled and valid:
+                        continue
+                    if solid and not fill_invalid:
+                        continue
+                    if sampled and not solid and valid:
+                        continue
+
+                    best_coord = valid_samples[0]
+                    best_dist_sq = 1 << 30
+                    for sx, sy, sz in valid_samples:
+                        dx = int(sx) - x
+                        dy = int(sy) - y
+                        dz = int(sz) - z
+                        dist_sq = dx * dx + dy * dy + dz * dz
+                        if dist_sq < best_dist_sq:
+                            best_dist_sq = dist_sq
+                            best_coord = (sx, sy, sz)
+                            if dist_sq == 0:
+                                break
+                    if solid and best_dist_sq > max_solid_dist_sq:
+                        continue
+
+                    sx, sy, sz = best_coord
+                    volume[z, y, x, :] = volume[sz, sy, sx, :]
+                    visibility_volume[z, y, x, :] = visibility_volume[sz, sy, sx, :]
+                    if solid:
+                        volume[z, y, x, 0:3] = (volume[z, y, x, 0:3].astype(np.float32) * solid_radiance_scale).astype(np.float16)
+                        volume[z, y, x, 3] = np.float16(float(volume[z, y, x, 3]) * solid_radiance_scale)
+                        visibility_volume[z, y, x, 2] = np.float16(float(visibility_volume[z, y, x, 2]) * solid_radiance_scale)
+
+    def _worldspace_rc_temporal_blend(self, cascade_index: int, new_volume: np.ndarray, new_visibility_volume: np.ndarray, min_corner: tuple[float, float, float], full_extent: float) -> tuple[np.ndarray, np.ndarray]:
+        prev_volume = self._worldspace_rc_cpu_radiance_volumes[cascade_index]
+        prev_visibility = self._worldspace_rc_cpu_visibility_volumes[cascade_index]
+        prev_min_corner = self._worldspace_rc_active_mins[cascade_index]
+        resolution = max(2, int(WORLDSPACE_RC_GRID_RESOLUTION))
+        cell_world = full_extent / float(max(1, resolution - 1))
+        if prev_volume is None or prev_visibility is None:
+            return new_volume, new_visibility_volume
+        shift = max(abs(float(min_corner[i]) - float(prev_min_corner[i])) for i in range(3))
+        if shift > cell_world * 2.5:
+            return new_volume, new_visibility_volume
+        blend_alpha = float(WORLDSPACE_RC_TEMPORAL_BLEND_ALPHA) / (1.0 + 0.15 * float(cascade_index))
+        blend_alpha = min(0.80, max(0.10, blend_alpha))
+        prev_volume_f = prev_volume.astype(np.float32)
+        prev_visibility_f = prev_visibility.astype(np.float32)
+        new_volume_f = new_volume.astype(np.float32)
+        new_visibility_f = new_visibility_volume.astype(np.float32)
+        blended_volume = prev_volume_f * (1.0 - blend_alpha) + new_volume_f * blend_alpha
+        blended_visibility = prev_visibility_f * (1.0 - blend_alpha) + new_visibility_f * blend_alpha
+        return blended_volume.astype(np.float16), blended_visibility.astype(np.float16)
+
+    def _update_worldspace_radiance_cascades(self) -> None:
+        if len(self.worldspace_rc_textures) != 4 or len(self.worldspace_rc_visibility_textures) != 4 or self.worldspace_rc_volume_params_buffer is None:
+            return
+        self._worldspace_rc_frame_index += 1
+        resolution = max(4, int(WORLDSPACE_RC_GRID_RESOLUTION))
+        base_half_extent = max(float(BLOCK_SIZE) * 4.0, float(WORLDSPACE_RC_BASE_HALF_EXTENT_WORLD))
+        camera_pos = tuple(float(v) for v in self.camera.position)
+        target_signatures: list[tuple[float, ...]] = []
+        target_mins: list[tuple[float, float, float]] = []
+        target_inv_extents: list[tuple[float, float, float]] = []
+        for cascade_index in range(4):
+            half_extent = base_half_extent * (float(WORLDSPACE_RC_INTERVAL_SCALE) ** float(cascade_index))
+            full_extent = half_extent * 2.0
+            snap = max(float(WORLDSPACE_RC_UPDATE_QUANTIZE_WORLD), full_extent / max(1.0, float(resolution - 1)))
+            center_x = math.floor(camera_pos[0] / snap) * snap
+            center_y = math.floor(camera_pos[1] / snap) * snap
+            center_z = math.floor(camera_pos[2] / snap) * snap
+            min_corner = (center_x - half_extent, center_y - half_extent, center_z - half_extent)
+            inv_extent = (1.0 / full_extent, 1.0 / full_extent, 1.0 / full_extent)
+            target_signatures.append((round(min_corner[0], 4), round(min_corner[1], 4), round(min_corner[2], 4), round(full_extent, 4)))
+            target_mins.append(min_corner)
+            target_inv_extents.append(inv_extent)
+
+        dirty_indices = [i for i in range(4) if target_signatures[i] != self._worldspace_rc_active_signatures[i]]
+        if any(sig is None for sig in self._worldspace_rc_active_signatures):
+            max_updates = max(1, int(WORLDSPACE_RC_INITIAL_MAX_CASCADES_PER_FRAME))
+        else:
+            max_updates = max(1, int(WORLDSPACE_RC_UPDATE_MAX_CASCADES_PER_FRAME))
+
+        updated_any = False
+        material_cache: dict[tuple[int, int, int], int] = {}
+        sky_visibility_cache: dict[tuple[int, int, int], float] = {}
+        normal_cache: dict[tuple[int, int, int], tuple[float, float, float]] = {}
+        probe_trace_cache: dict[tuple[int, int, int, int], tuple[tuple[float, float, float], float, float, float, float, float]] = {}
+        updates_done = 0
+        search_order = [((self._worldspace_rc_update_cursor + offset) % 4) for offset in range(4)]
+        for cascade_index in search_order:
+            if cascade_index not in dirty_indices:
+                continue
+            base_frame_stride = max(1, int(WORLDSPACE_RC_UPDATE_FRAME_INTERVAL))
+            frame_stride = base_frame_stride << cascade_index
+            if self._worldspace_rc_active_signatures[cascade_index] is not None:
+                frames_since = self._worldspace_rc_frame_index - int(self._worldspace_rc_last_update_frame[cascade_index])
+                if frames_since < frame_stride:
+                    continue
+            min_corner = target_mins[cascade_index]
+            full_extent = 1.0 / target_inv_extents[cascade_index][0]
+            max_distance = full_extent * 0.5
+            volume = np.zeros((resolution, resolution, resolution, 4), dtype=np.float16)
+            visibility_volume = np.zeros((resolution, resolution, resolution, 4), dtype=np.float16)
+            solid_probe_mask = np.zeros((resolution, resolution, resolution), dtype=np.bool_)
+            stride_values = tuple(int(v) for v in WORLDSPACE_RC_CASCADE_PROBE_STRIDES) if bool(WORLDSPACE_RC_SPARSE_UPDATE_ENABLED) else (1, 1, 1, 1)
+            stride_index = min(cascade_index, max(0, len(stride_values) - 1))
+            probe_stride = max(1, int(stride_values[stride_index])) if stride_values else 1
+            sample_coords = self._worldspace_rc_sparse_sample_coords(resolution, probe_stride)
+            sample_coord_set = set(sample_coords)
+            for z in range(resolution):
+                fz = z / max(1, resolution - 1)
+                wz = min_corner[2] + full_extent * fz
+                for y in range(resolution):
+                    fy = y / max(1, resolution - 1)
+                    wy = min_corner[1] + full_extent * fy
+                    for x in range(resolution):
+                        fx = x / max(1, resolution - 1)
+                        wx = min_corner[0] + full_extent * fx
+                        probe_bx = int(math.floor(wx / BLOCK_SIZE))
+                        probe_by = int(math.floor(wy / BLOCK_SIZE))
+                        probe_bz = int(math.floor(wz / BLOCK_SIZE))
+                        probe_inside_solid = self._worldspace_rc_solid_at(probe_bx, probe_by, probe_bz, material_cache)
+                        solid_probe_mask[z, y, x] = probe_inside_solid
+                        if probe_inside_solid or x not in sample_coord_set or y not in sample_coord_set or z not in sample_coord_set:
+                            continue
+                        rgb, alpha, mean_distance, mean_distance_sq, hit_fraction, sky_access = self._trace_worldspace_rc_probe(
+                            (wx, wy, wz),
+                            max_distance,
+                            cascade_index,
+                            material_cache,
+                            sky_visibility_cache,
+                            normal_cache,
+                            probe_trace_cache,
+                        )
+                        volume[z, y, x, 0] = np.float16(rgb[0])
+                        volume[z, y, x, 1] = np.float16(rgb[1])
+                        volume[z, y, x, 2] = np.float16(rgb[2])
+                        volume[z, y, x, 3] = np.float16(alpha)
+                        visibility_volume[z, y, x, 0] = np.float16(mean_distance)
+                        visibility_volume[z, y, x, 1] = np.float16(mean_distance_sq)
+                        visibility_volume[z, y, x, 2] = np.float16(hit_fraction)
+                        visibility_volume[z, y, x, 3] = np.float16(sky_access)
+            self._worldspace_rc_fill_sparse_probe_volume(volume, visibility_volume, solid_probe_mask, sample_coords)
+            raw_volume = volume
+            raw_visibility_volume = visibility_volume
+            filtered_volume = self._worldspace_rc_filter_volume(volume)
+            filtered_visibility_volume = self._worldspace_rc_filter_volume(visibility_volume)
+            sky_filter_gate = np.power(
+                np.clip(raw_visibility_volume[..., 3:4].astype(np.float32), 0.0, 1.0),
+                max(0.25, float(WORLDSPACE_RC_SPATIAL_FILTER_SKY_POWER)),
+            ).astype(np.float32)
+            volume = (raw_volume.astype(np.float32) * (1.0 - sky_filter_gate) + filtered_volume.astype(np.float32) * sky_filter_gate).astype(np.float16)
+            visibility_volume = filtered_visibility_volume
+            visibility_volume[..., 3] = np.minimum(filtered_visibility_volume[..., 3], raw_visibility_volume[..., 3]).astype(np.float16)
+            self._worldspace_rc_fill_sparse_probe_volume(volume, visibility_volume, solid_probe_mask, sample_coords)
+            volume, visibility_volume = self._worldspace_rc_temporal_blend(cascade_index, volume, visibility_volume, min_corner, full_extent)
+            self._worldspace_rc_fill_sparse_probe_volume(volume, visibility_volume, solid_probe_mask, sample_coords)
+            self.device.queue.write_texture(
+                {"texture": self.worldspace_rc_textures[cascade_index], "mip_level": 0, "origin": (0, 0, 0)},
+                volume.tobytes(),
+                {"offset": 0, "bytes_per_row": resolution * 8, "rows_per_image": resolution},
+                (resolution, resolution, resolution),
+            )
+            self.device.queue.write_texture(
+                {"texture": self.worldspace_rc_visibility_textures[cascade_index], "mip_level": 0, "origin": (0, 0, 0)},
+                visibility_volume.tobytes(),
+                {"offset": 0, "bytes_per_row": resolution * 8, "rows_per_image": resolution},
+                (resolution, resolution, resolution),
+            )
+            self._worldspace_rc_cpu_radiance_volumes[cascade_index] = volume
+            self._worldspace_rc_cpu_visibility_volumes[cascade_index] = visibility_volume
+            self._worldspace_rc_active_signatures[cascade_index] = target_signatures[cascade_index]
+            self._worldspace_rc_active_mins[cascade_index] = target_mins[cascade_index]
+            self._worldspace_rc_active_inv_extents[cascade_index] = target_inv_extents[cascade_index]
+            self._worldspace_rc_last_update_frame[cascade_index] = self._worldspace_rc_frame_index
+            self._worldspace_rc_update_cursor = (cascade_index + 1) % 4
+            updates_done += 1
+            updated_any = True
+            if updates_done >= max_updates:
+                break
+
+        params = np.zeros((8, 4), dtype=np.float32)
+        for cascade_index in range(4):
+            params[cascade_index, 0:3] = self._worldspace_rc_active_mins[cascade_index]
+            params[4 + cascade_index, 0:3] = self._worldspace_rc_active_inv_extents[cascade_index]
+        self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, params.tobytes())
+        if updated_any:
+            signature_parts: list[float] = []
+            for cascade_index in range(4):
+                active_sig = self._worldspace_rc_active_signatures[cascade_index]
+                if active_sig is None:
+                    signature_parts.extend([0.0, 0.0, 0.0, 0.0])
+                else:
+                    signature_parts.extend(list(active_sig))
+            self._worldspace_rc_signature = tuple(signature_parts)
 
     @profile
     def _submit_render(self, meshes=None):
@@ -2320,7 +2985,7 @@ class TerrainRenderer:
         swapchain_acquire_ms = (time.perf_counter() - acquire_start) * 1000.0
         color_view = current_texture.create_view()
 
-        use_postprocess = bool(self.volumetric_lighting_enabled or self.final_present_enabled)
+        use_postprocess = bool(self.final_present_enabled)
         if use_postprocess:
             self._ensure_postprocess_targets()
             assert self.scene_color_view is not None
@@ -2328,12 +2993,21 @@ class TerrainRenderer:
 
             scene_color_attachment_view = self.scene_color_msaa_view if self.postprocess_msaa_sample_count > 1 else self.scene_color_view
             scene_resolve_target = self.scene_color_view if self.postprocess_msaa_sample_count > 1 else None
+            scene_gbuffer_attachment_view = self.scene_gbuffer_msaa_view if self.postprocess_msaa_sample_count > 1 else self.scene_gbuffer_view
+            scene_gbuffer_resolve_target = self.scene_gbuffer_view if self.postprocess_msaa_sample_count > 1 else None
             scene_pass = encoder.begin_render_pass(
                 color_attachments=[
                     {
                         "view": scene_color_attachment_view,
                         "resolve_target": scene_resolve_target,
                         "clear_value": (0.60, 0.80, 0.98, 1.0),
+                        "load_op": wgpu.LoadOp.clear,
+                        "store_op": wgpu.StoreOp.store,
+                    },
+                    {
+                        "view": scene_gbuffer_attachment_view,
+                        "resolve_target": scene_gbuffer_resolve_target,
+                        "clear_value": (0.0, 0.0, 0.0, 0.0),
                         "load_op": wgpu.LoadOp.clear,
                         "store_op": wgpu.StoreOp.store,
                     }
@@ -2350,56 +3024,15 @@ class TerrainRenderer:
             self._draw_visible_batches_to_pass(scene_pass, visible_batches, use_gpu_visibility, use_indirect)
             scene_pass.end()
 
-            if self.volumetric_lighting_enabled:
-                assert self.occlusion_mask_view is not None
-                assert self.volumetric_shaft_view is not None
-                assert self.occlusion_mask_pipeline is not None
-                assert self.radial_blur_pipeline is not None
-                assert self.composite_pipeline is not None
-                assert self.radial_blur_bind_group is not None
-                assert self.composite_bind_group is not None
-
-                mask_color_attachment_view = self.occlusion_mask_msaa_view if self.postprocess_msaa_sample_count > 1 else self.occlusion_mask_view
-                mask_resolve_target = self.occlusion_mask_view if self.postprocess_msaa_sample_count > 1 else None
-                mask_pass = encoder.begin_render_pass(
+            if self.radiance_cascades_enabled:
+                assert self.gi_color_view is not None
+                assert self.gi_compose_pipeline is not None
+                assert self.gi_compose_bind_group is not None
+                self._update_worldspace_radiance_cascades()
+                gi_compose_pass = encoder.begin_render_pass(
                     color_attachments=[
                         {
-                            "view": mask_color_attachment_view,
-                            "resolve_target": mask_resolve_target,
-                            "clear_value": (1.0, 1.0, 1.0, 1.0),
-                            "load_op": wgpu.LoadOp.clear,
-                            "store_op": wgpu.StoreOp.store,
-                        }
-                    ],
-                    depth_stencil_attachment={
-                        "view": self.postprocess_depth_view,
-                        "depth_clear_value": 1.0,
-                        "depth_load_op": wgpu.LoadOp.clear,
-                        "depth_store_op": wgpu.StoreOp.store,
-                    },
-                )
-                mask_pass.set_pipeline(self.occlusion_mask_pipeline)
-                mask_pass.set_bind_group(0, self.camera_bind_group)
-                self._draw_visible_batches_to_pass(mask_pass, visible_batches, use_gpu_visibility, use_indirect)
-                mask_pass.end()
-
-                light_uv, light_strength = self._project_directional_light_to_screen(right, up, forward)
-                radial_params = np.array([
-                    light_uv[0],
-                    light_uv[1],
-                    float(VOLUMETRIC_LIGHTING_DENSITY),
-                    float(VOLUMETRIC_LIGHTING_WEIGHT),
-                    float(VOLUMETRIC_LIGHTING_DECAY),
-                    float(VOLUMETRIC_LIGHTING_EXPOSURE),
-                    float(VOLUMETRIC_LIGHTING_STRENGTH) * float(light_strength),
-                    float(VOLUMETRIC_LIGHTING_SAMPLES),
-                ], dtype=np.float32)
-                self.device.queue.write_buffer(self.radial_blur_params_buffer, 0, radial_params.tobytes())
-
-                blur_pass = encoder.begin_render_pass(
-                    color_attachments=[
-                        {
-                            "view": self.volumetric_shaft_view,
+                            "view": self.gi_color_view,
                             "resolve_target": None,
                             "clear_value": (0.0, 0.0, 0.0, 1.0),
                             "load_op": wgpu.LoadOp.clear,
@@ -2407,30 +3040,16 @@ class TerrainRenderer:
                         }
                     ],
                 )
-                blur_pass.set_pipeline(self.radial_blur_pipeline)
-                blur_pass.set_bind_group(0, self.radial_blur_bind_group)
-                blur_pass.draw(3, 1, 0, 0)
-                blur_pass.end()
-
-                composite_target_view = self.composite_color_view if self.final_present_enabled else color_view
-                composite_pass = encoder.begin_render_pass(
-                    color_attachments=[
-                        {
-                            "view": composite_target_view,
-                            "resolve_target": None,
-                            "clear_value": (0.0, 0.0, 0.0, 1.0),
-                            "load_op": wgpu.LoadOp.clear,
-                            "store_op": wgpu.StoreOp.store,
-                        }
-                    ],
-                )
-                composite_pass.set_pipeline(self.composite_pipeline)
-                composite_pass.set_bind_group(0, self.composite_bind_group)
-                composite_pass.draw(3, 1, 0, 0)
-                composite_pass.end()
+                gi_compose_pass.set_pipeline(self.gi_compose_pipeline)
+                gi_compose_pass.set_bind_group(0, self.gi_compose_bind_group)
+                gi_compose_pass.draw(3, 1, 0, 0)
+                gi_compose_pass.end()
 
             if self.final_present_enabled:
-                source_bind_group = self.final_composite_bind_group if self.volumetric_lighting_enabled else self.final_scene_bind_group
+                if self.radiance_cascades_enabled:
+                    source_bind_group = self.final_gi_bind_group
+                else:
+                    source_bind_group = self.final_scene_bind_group
                 assert source_bind_group is not None
                 assert self.final_present_pipeline is not None
                 final_pass = encoder.begin_render_pass(
