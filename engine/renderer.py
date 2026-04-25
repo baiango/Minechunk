@@ -2687,7 +2687,6 @@ class TerrainRenderer:
         air_material = int(AIR)
         solid_below_world_material = 1
         block_at = self.world.block_at
-        material_cache_get = material_cache.get
         floor = math.floor
         step_size = max(block_size, float(max_distance) / float(effective_step_count))
 
@@ -2705,12 +2704,15 @@ class TerrainRenderer:
                 if by < 0:
                     material = solid_below_world_material
                 else:
-                    key = (bx, by, bz)
-                    material = material_cache_get(key)
-                    if material is None:
-                        material = int(block_at(bx, by, bz))
-                        material_cache[key] = material
+                    # The trace path has very poor material-cache locality: prior
+                    # profiles showed ~3% hit rate, so tuple creation + dict lookup
+                    # cost more than the saved block_at calls.  Probe the world
+                    # directly for air-heavy ray steps, and only publish solid hits
+                    # into material_cache for the later normal / sky helpers.
+                    material = int(block_at(bx, by, bz))
                 if material != air_material:
+                    if by >= 0:
+                        material_cache[(bx, by, bz)] = material
                     color = self._worldspace_rc_material_rgb(material)
                     if cheap_hit_shading:
                         # Far cascades are spatially filtered/merged, so avoid the
