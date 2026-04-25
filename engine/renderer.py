@@ -2653,9 +2653,35 @@ class TerrainRenderer:
         far_hit_sky_visibility = max(0.0, min(1.0, float(origin_sky_visibility)))
         direct_sun_scale = 0.62 if cheap_hit_shading else 1.10
         effective_directions = self._worldspace_rc_effective_trace_directions(cascade_index, origin_sky_visibility)
-        effective_step_count = max(6, int(WORLDSPACE_RC_TRACE_MAX_STEPS) - max(0, int(cascade_index)) * 2)
+        cascade_int = max(0, min(3, int(cascade_index)))
+        base_trace_steps = max(4, int(WORLDSPACE_RC_TRACE_MAX_STEPS))
+        # The ray marcher is now the dominant RC cost. Keep the near cascade at
+        # full quality when the probe can see the sky, but use fewer/larger
+        # steps for far cascades and buried low-sky probes. Far cascades are
+        # filtered and temporally blended, so precise thin-hit marching there
+        # is much less visible than it is in cascade 0.
         if origin_sky_visibility <= 0.04:
-            effective_step_count = max(6, effective_step_count - 2)
+            step_schedule = (
+                max(8, base_trace_steps - 6),
+                max(6, base_trace_steps - 8),
+                max(4, base_trace_steps - 10),
+                max(4, base_trace_steps - 11),
+            )
+        elif origin_sky_visibility <= 0.20:
+            step_schedule = (
+                max(10, base_trace_steps - 4),
+                max(7, base_trace_steps - 7),
+                max(5, base_trace_steps - 9),
+                max(4, base_trace_steps - 10),
+            )
+        else:
+            step_schedule = (
+                base_trace_steps,
+                max(8, base_trace_steps - 5),
+                max(5, base_trace_steps - 8),
+                max(4, base_trace_steps - 10),
+            )
+        effective_step_count = int(step_schedule[cascade_int])
         block_size = float(BLOCK_SIZE)
         inv_block_size = 1.0 / max(block_size, 1e-12)
         air_material = int(AIR)
