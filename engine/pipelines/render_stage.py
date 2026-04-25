@@ -19,7 +19,14 @@ from ..rendering.tile_batcher import build_tile_draw_batches
 from ..rendering.direct_render import build_gpu_visibility_records, visible_render_batches, visible_render_batches_indirect
 from ..rendering.merge_pipeline import merge_chunk_bounds, merge_tile_meshes
 
+try:
+    profile  # type: ignore[name-defined]
+except NameError:  # pragma: no cover - only used outside kernprof
+    def profile(func):
+        return func
 
+
+@profile
 def _mesh_draw_batches(meshes: Iterable[ChunkMesh]) -> tuple[list[ChunkDrawBatch], int, int]:
     draw_batches: list[ChunkDrawBatch] = []
     visible_chunk_count = 0
@@ -46,6 +53,7 @@ def _mesh_draw_batches(meshes: Iterable[ChunkMesh]) -> tuple[list[ChunkDrawBatch
     return draw_batches, visible_chunk_count, visible_vertex_count
 
 
+@profile
 def _group_draw_batches(
     draw_batches: list[ChunkDrawBatch],
 ) -> OrderedDict[tuple[int, int], tuple[wgpu.GPUBuffer, int, list[ChunkDrawBatch]]]:
@@ -58,6 +66,7 @@ def _group_draw_batches(
     return groups
 
 
+@profile
 def visible_render_batches_for_meshes(
     meshes: Iterable[ChunkMesh],
 ) -> tuple[list[tuple[wgpu.GPUBuffer, int, int, int]], float, int, int, int, int]:
@@ -74,6 +83,7 @@ def visible_render_batches_for_meshes(
     return render_batches, 0.0, len(render_batches), 0, visible_chunk_count, visible_vertex_count
 
 
+@profile
 def visible_render_batches_indirect_for_meshes(
     renderer,
     meshes: Iterable[ChunkMesh],
@@ -107,6 +117,7 @@ def visible_render_batches_indirect_for_meshes(
     return render_batches, render_encode_ms, command_count, 0, visible_chunk_count, visible_vertex_count
 
 
+@profile
 def build_gpu_visibility_records_for_meshes(
     renderer,
     meshes: Iterable[ChunkMesh],

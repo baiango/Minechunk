@@ -2318,6 +2318,7 @@ class TerrainRenderer:
             ],
         )
 
+    @profile
     def _draw_visible_batches_to_pass(self, render_pass, visible_batches, use_gpu_visibility: bool, use_indirect: bool) -> None:
         current_vertex_buffer = None
         current_binding_offset = None
@@ -2351,6 +2352,7 @@ class TerrainRenderer:
                     current_binding_offset = binding_offset
                 draw(vertex_count, 1, first_vertex, 0)
 
+    @profile
     def _worldspace_rc_material_rgb(self, material: int) -> tuple[float, float, float]:
         if material == 1:
             return 0.24, 0.22, 0.20
@@ -2366,6 +2368,7 @@ class TerrainRenderer:
             return 0.95, 0.97, 0.98
         return 0.60, 0.80, 0.98
 
+    @profile
     def _worldspace_rc_trace_directions(self) -> tuple[tuple[float, float, float], ...]:
         cached = getattr(self, "_worldspace_rc_trace_dirs", None)
         target_count = max(6, int(WORLDSPACE_RC_TRACE_DIRECTIONS))
@@ -2381,6 +2384,7 @@ class TerrainRenderer:
         self._worldspace_rc_trace_dirs = tuple(directions)
         return self._worldspace_rc_trace_dirs
 
+    @profile
     def _worldspace_rc_solid_at(
         self,
         bx: int,
@@ -2391,23 +2395,16 @@ class TerrainRenderer:
         key = (int(bx), int(by), int(bz))
         material = material_cache.get(key)
         if material is None:
-            lru_cache = getattr(self, "_worldspace_rc_material_lru", None)
-            if lru_cache is not None:
-                cached = lru_cache.get(key)
-                if cached is not None:
-                    material = int(cached)
-                    lru_cache.move_to_end(key)
-            if material is None:
-                material = int(self.world.block_at(key[0], key[1], key[2])) if key[1] >= 0 else 1
-                if lru_cache is not None:
-                    lru_cache[key] = material
-                    lru_cache.move_to_end(key)
-                    max_entries = max(0, int(WORLDSPACE_RC_MATERIAL_CACHE_MAX_ENTRIES))
-                    while max_entries > 0 and len(lru_cache) > max_entries:
-                        lru_cache.popitem(last=False)
+            # The previous cross-frame OrderedDict LRU thrashed heavily during
+            # flying RC updates: the benchmark saw tens of millions of evictions
+            # and only a tiny hit rate. The per-update material_cache already
+            # catches locality inside one cascade refresh, so avoid the global LRU
+            # bookkeeping on this hot path.
+            material = int(self.world.block_at(key[0], key[1], key[2])) if key[1] >= 0 else 1
             material_cache[key] = material
         return material != int(AIR)
 
+    @profile
     def _worldspace_rc_estimate_hit_normal(
         self,
         bx: int,
@@ -2447,7 +2444,16 @@ class TerrainRenderer:
             normal_cache[cache_key] = normal
         return normal
 
-    def _worldspace_rc_hit_sky_visibility(self, bx: int, by: int, bz: int, material_cache: dict[tuple[int, int, int], int], sky_visibility_cache: dict[tuple[int, int, int], float] | None = None) -> float:
+    @profile
+    def _worldspace_rc_hit_sky_visibility(
+        self,
+        bx: int,
+        by: int,
+        bz: int,
+        material_cache: dict[tuple[int, int, int], int],
+        sky_visibility_cache: dict[tuple[int, int, int], float] | None = None,
+        surface_height_cache: dict[tuple[int, int], int] | None = None,
+    ) -> float:
         cache_key = (int(bx), int(by), int(bz))
         if sky_visibility_cache is not None:
             cached = sky_visibility_cache.get(cache_key)
@@ -2459,41 +2465,85 @@ class TerrainRenderer:
         aperture_radius = max(1, int(WORLDSPACE_RC_SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS))
         aperture_power = max(0.25, float(WORLDSPACE_RC_SKY_VISIBILITY_APERTURE_POWER))
         min_aperture = max(0.0, min(0.25, float(WORLDSPACE_RC_SKY_VISIBILITY_MIN_APERTURE)))
+        side_weight = max(0.0, min(1.0, float(WORLDSPACE_RC_SKY_VISIBILITY_SIDE_WEIGHT)))
+        world_height = int(getattr(self.world, "height", 0))
+
+        def surface_height_at_cached(cx: int, cz: int) -> int:
+            column_key = (int(cx), int(cz))
+            if surface_height_cache is not None:
+                cached_height = surface_height_cache.get(column_key)
+                if cached_height is not None:
+                    return int(cached_height)
+            try:
+                height = int(self.world.surface_height_at(column_key[0], column_key[1]))
+            except Exception:
+                height = world_height
+            if surface_height_cache is not None:
+                surface_height_cache[column_key] = height
+            return height
 
         def column_access(sx: int, sz: int) -> float:
+            column_x = cache_key[0] + int(sx)
+            column_z = cache_key[2] + int(sz)
+            surface_height = surface_height_at_cached(column_x, column_z)
+
+            # Terrain blocks are guaranteed air at y >= surface_height. Once the
+            # upward probe reaches that point, the remaining samples are open
+            # without any block_at/material lookup.
+            if cache_key[1] >= surface_height - 1:
+                return 1.0
+
             open_count = 0
             for step in range(1, sample_count + 1):
-                sample_y = by + step * step_blocks
-                if self._worldspace_rc_solid_at(bx + sx, sample_y, bz + sz, material_cache):
+                sample_y = cache_key[1] + step * step_blocks
+                if sample_y >= surface_height:
+                    open_count += sample_count - step + 1
+                    break
+                if self._worldspace_rc_solid_at(column_x, sample_y, column_z, material_cache):
                     break
                 open_count += 1
             return float(open_count) / float(sample_count)
 
-        center_access = column_access(0, 0)
-        if center_access <= 0.0:
+        if cache_key[1] < 0:
             visibility = 0.0
         else:
-            side_offsets = (
-                (aperture_radius, 0),
-                (-aperture_radius, 0),
-                (0, aperture_radius),
-                (0, -aperture_radius),
-                (aperture_radius, aperture_radius),
-                (aperture_radius, -aperture_radius),
-                (-aperture_radius, aperture_radius),
-                (-aperture_radius, -aperture_radius),
-            )
-            side_access = 0.0
-            for sx, sz in side_offsets:
-                side_access += column_access(sx, sz)
-            side_access /= float(len(side_offsets))
-            aperture = max(min_aperture, side_access ** aperture_power)
-            visibility = center_access * aperture
+            center_access = column_access(0, 0)
+            if center_access <= 0.0:
+                visibility = 0.0
+            elif center_access >= 0.999 or side_weight <= 0.0001:
+                visibility = center_access
+            else:
+                # The default side weight is low, so use four cardinal side
+                # columns instead of eight. Diagonals are reserved for high side
+                # weights where the extra aperture detail is explicitly requested.
+                side_offsets = [
+                    (aperture_radius, 0),
+                    (-aperture_radius, 0),
+                    (0, aperture_radius),
+                    (0, -aperture_radius),
+                ]
+                if side_weight >= 0.5:
+                    side_offsets.extend(
+                        [
+                            (aperture_radius, aperture_radius),
+                            (aperture_radius, -aperture_radius),
+                            (-aperture_radius, aperture_radius),
+                            (-aperture_radius, -aperture_radius),
+                        ]
+                    )
+
+                side_access = 0.0
+                for sx, sz in side_offsets:
+                    side_access += column_access(sx, sz)
+                side_access /= float(len(side_offsets))
+                aperture = max(min_aperture, side_access ** aperture_power)
+                visibility = center_access * aperture
 
         if sky_visibility_cache is not None:
             sky_visibility_cache[cache_key] = visibility
         return visibility
 
+    @profile
     def _trace_worldspace_rc_probe(
         self,
         origin: tuple[float, float, float],
@@ -2503,6 +2553,7 @@ class TerrainRenderer:
         sky_visibility_cache: dict[tuple[int, int, int], float],
         normal_cache: dict[tuple[int, int, int], tuple[float, float, float]],
         probe_trace_cache: dict[tuple[int, int, int, int], tuple[tuple[float, float, float], float, float, float, float, float]],
+        surface_height_cache: dict[tuple[int, int], int],
     ) -> tuple[tuple[float, float, float], float, float, float, float, float]:
         directions = self._worldspace_rc_trace_directions()
         sky_rgb = (
@@ -2511,7 +2562,6 @@ class TerrainRenderer:
             0.98 * float(RADIANCE_CASCADES_SKY_STRENGTH),
         )
         sun_dx, sun_dy, sun_dz = normalize3(tuple(float(v) for v in LIGHT_DIRECTION))
-        side_weight = max(0.0, min(1.0, float(WORLDSPACE_RC_SKY_VISIBILITY_SIDE_WEIGHT)))
         direct_sun_strength = max(0.0, float(WORLDSPACE_RC_DIRECT_SUN_STRENGTH))
         indirect_floor = max(0.0, float(WORLDSPACE_RC_INDIRECT_FLOOR))
         accum = np.zeros(3, dtype=np.float32)
@@ -2531,7 +2581,7 @@ class TerrainRenderer:
         cached_trace = probe_trace_cache.get(trace_cache_key)
         if cached_trace is not None:
             return cached_trace
-        origin_sky_visibility = self._worldspace_rc_hit_sky_visibility(origin_bx, origin_by, origin_bz, material_cache, sky_visibility_cache)
+        origin_sky_visibility = self._worldspace_rc_hit_sky_visibility(origin_bx, origin_by, origin_bz, material_cache, sky_visibility_cache, surface_height_cache)
         effective_directions = directions
         if cascade_index >= 2 and len(effective_directions) > 8:
             effective_directions = effective_directions[::2]
@@ -2562,7 +2612,7 @@ class TerrainRenderer:
                     nx, ny, nz = self._worldspace_rc_estimate_hit_normal(bx, by, bz, dx, dy, dz, material_cache, normal_cache)
                     facing = max(0.0, min(1.0, -(nx * dx + ny * dy + nz * dz)))
                     sun_term = max(0.0, nx * sun_dx + ny * sun_dy + nz * sun_dz)
-                    sky_visibility = self._worldspace_rc_hit_sky_visibility(bx, by, bz, material_cache, sky_visibility_cache)
+                    sky_visibility = self._worldspace_rc_hit_sky_visibility(bx, by, bz, material_cache, sky_visibility_cache, surface_height_cache)
                     cave_gate = sky_visibility ** 3.0
                     open_hemi = max(0.0, ny) ** 1.5
                     ambient_sky = cave_gate * (0.10 + 0.90 * open_hemi) * 0.38
@@ -2606,6 +2656,7 @@ class TerrainRenderer:
         probe_trace_cache[trace_cache_key] = result
         return result
 
+    @profile
     def _worldspace_rc_filter_volume(self, volume: np.ndarray) -> np.ndarray:
         passes = max(0, int(WORLDSPACE_RC_SPATIAL_FILTER_PASSES))
         if passes <= 0:
@@ -2631,6 +2682,7 @@ class TerrainRenderer:
             filtered = dst / np.maximum(weights, 1e-6)
         return filtered.astype(np.float16)
 
+    @profile
     def _worldspace_rc_sparse_sample_coords(self, resolution: int, stride: int) -> tuple[int, ...]:
         stride = max(1, int(stride))
         coords = list(range(0, max(1, int(resolution)), stride))
@@ -2639,6 +2691,7 @@ class TerrainRenderer:
             coords.append(last)
         return tuple(sorted(set(int(v) for v in coords)))
 
+    @profile
     def _worldspace_rc_fill_sparse_probe_volume(
         self,
         volume: np.ndarray,
@@ -2649,6 +2702,7 @@ class TerrainRenderer:
         resolution = int(volume.shape[0])
         if resolution <= 1:
             return
+
         sample_set = set(int(v) for v in sample_coords)
         valid_samples: list[tuple[int, int, int]] = []
         for sz in sample_coords:
@@ -2673,6 +2727,48 @@ class TerrainRenderer:
         max_solid_dist_sq = max_solid_dist * max_solid_dist
         solid_radiance_scale = max(0.0, min(1.0, float(WORLDSPACE_RC_INVALID_PROBE_DILATE_RADIANCE_SCALE)))
 
+        # Previous code found the nearest valid sample by scanning every valid
+        # sample for every cell. That created hundreds of millions of distance
+        # checks in the 4096-chunk fly-forward profile. A small 3D multi-source
+        # BFS gives each cell a nearby source in O(resolution^3) time.
+        nearest_x = np.full((resolution, resolution, resolution), -1, dtype=np.int16)
+        nearest_y = np.full((resolution, resolution, resolution), -1, dtype=np.int16)
+        nearest_z = np.full((resolution, resolution, resolution), -1, dtype=np.int16)
+        nearest_dist = np.full((resolution, resolution, resolution), 32767, dtype=np.int16)
+
+        queue: deque[tuple[int, int, int]] = deque()
+        for x, y, z in valid_samples:
+            nearest_x[z, y, x] = np.int16(x)
+            nearest_y[z, y, x] = np.int16(y)
+            nearest_z[z, y, x] = np.int16(z)
+            nearest_dist[z, y, x] = np.int16(0)
+            queue.append((x, y, z))
+
+        neighbor_offsets = (
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        )
+        while queue:
+            x, y, z = queue.popleft()
+            next_dist = int(nearest_dist[z, y, x]) + 1
+            for dx, dy, dz in neighbor_offsets:
+                nx = x + dx
+                ny = y + dy
+                nz = z + dz
+                if nx < 0 or nx >= resolution or ny < 0 or ny >= resolution or nz < 0 or nz >= resolution:
+                    continue
+                if next_dist >= int(nearest_dist[nz, ny, nx]):
+                    continue
+                nearest_dist[nz, ny, nx] = np.int16(next_dist)
+                nearest_x[nz, ny, nx] = nearest_x[z, y, x]
+                nearest_y[nz, ny, nx] = nearest_y[z, y, x]
+                nearest_z[nz, ny, nx] = nearest_z[z, y, x]
+                queue.append((nx, ny, nz))
+
         for z in range(resolution):
             z_sampled = z in sample_set
             for y in range(resolution):
@@ -2688,29 +2784,25 @@ class TerrainRenderer:
                             or float(visibility_volume[z, y, x, 3]) > 0.0001
                         )
                     )
-                    if sampled and valid:
+
+                    # Keep already-valid air cells. This makes the post-filter and
+                    # post-temporal fill calls cheap instead of re-interpolating the
+                    # whole volume after it has already been populated.
+                    if valid:
                         continue
                     if solid and not fill_invalid:
                         continue
-                    if sampled and not solid and valid:
+
+                    sx = int(nearest_x[z, y, x])
+                    sy = int(nearest_y[z, y, x])
+                    sz = int(nearest_z[z, y, x])
+                    if sx < 0 or sy < 0 or sz < 0:
                         continue
 
-                    best_coord = valid_samples[0]
-                    best_dist_sq = 1 << 30
-                    for sx, sy, sz in valid_samples:
-                        dx = int(sx) - x
-                        dy = int(sy) - y
-                        dz = int(sz) - z
-                        dist_sq = dx * dx + dy * dy + dz * dz
-                        if dist_sq < best_dist_sq:
-                            best_dist_sq = dist_sq
-                            best_coord = (sx, sy, sz)
-                            if dist_sq == 0:
-                                break
-                    if solid and best_dist_sq > max_solid_dist_sq:
+                    dist_sq = (sx - x) * (sx - x) + (sy - y) * (sy - y) + (sz - z) * (sz - z)
+                    if solid and dist_sq > max_solid_dist_sq:
                         continue
 
-                    sx, sy, sz = best_coord
                     volume[z, y, x, :] = volume[sz, sy, sx, :]
                     visibility_volume[z, y, x, :] = visibility_volume[sz, sy, sx, :]
                     if solid:
@@ -2718,6 +2810,7 @@ class TerrainRenderer:
                         volume[z, y, x, 3] = np.float16(float(volume[z, y, x, 3]) * solid_radiance_scale)
                         visibility_volume[z, y, x, 2] = np.float16(float(visibility_volume[z, y, x, 2]) * solid_radiance_scale)
 
+    @profile
     def _worldspace_rc_temporal_blend(self, cascade_index: int, new_volume: np.ndarray, new_visibility_volume: np.ndarray, min_corner: tuple[float, float, float], full_extent: float) -> tuple[np.ndarray, np.ndarray]:
         prev_volume = self._worldspace_rc_cpu_radiance_volumes[cascade_index]
         prev_visibility = self._worldspace_rc_cpu_visibility_volumes[cascade_index]
@@ -2739,6 +2832,7 @@ class TerrainRenderer:
         blended_visibility = prev_visibility_f * (1.0 - blend_alpha) + new_visibility_f * blend_alpha
         return blended_volume.astype(np.float16), blended_visibility.astype(np.float16)
 
+    @profile
     def _update_worldspace_radiance_cascades(self) -> None:
         if len(self.worldspace_rc_textures) != 4 or len(self.worldspace_rc_visibility_textures) != 4 or self.worldspace_rc_volume_params_buffer is None:
             return
@@ -2771,6 +2865,7 @@ class TerrainRenderer:
         updated_any = False
         material_cache: dict[tuple[int, int, int], int] = {}
         sky_visibility_cache: dict[tuple[int, int, int], float] = {}
+        surface_height_cache: dict[tuple[int, int], int] = {}
         normal_cache: dict[tuple[int, int, int], tuple[float, float, float]] = {}
         probe_trace_cache: dict[tuple[int, int, int, int], tuple[tuple[float, float, float], float, float, float, float, float]] = {}
         updates_done = 0
@@ -2819,6 +2914,7 @@ class TerrainRenderer:
                             sky_visibility_cache,
                             normal_cache,
                             probe_trace_cache,
+                            surface_height_cache,
                         )
                         volume[z, y, x, 0] = np.float16(rgb[0])
                         volume[z, y, x, 1] = np.float16(rgb[1])
