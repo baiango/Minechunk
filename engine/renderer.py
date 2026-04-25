@@ -2590,7 +2590,15 @@ class TerrainRenderer:
         effective_step_count = max(6, int(WORLDSPACE_RC_TRACE_MAX_STEPS) - max(0, int(cascade_index)) * 2)
         if origin_sky_visibility <= 0.04:
             effective_step_count = max(6, effective_step_count - 2)
-        step_size = max(float(BLOCK_SIZE), float(max_distance) / float(effective_step_count))
+        block_size = float(BLOCK_SIZE)
+        inv_block_size = 1.0 / max(block_size, 1e-12)
+        air_material = int(AIR)
+        solid_below_world_material = 1
+        block_at = self.world.block_at
+        material_cache_get = material_cache.get
+        floor = math.floor
+        step_size = max(block_size, float(max_distance) / float(effective_step_count))
+
         for dx, dy, dz in effective_directions:
             dist = step_size * 0.5
             hit = False
@@ -2599,15 +2607,18 @@ class TerrainRenderer:
                 wx = ox + dx * dist
                 wy = oy + dy * dist
                 wz = oz + dz * dist
-                bx = int(math.floor(wx / BLOCK_SIZE))
-                by = int(math.floor(wy / BLOCK_SIZE))
-                bz = int(math.floor(wz / BLOCK_SIZE))
-                key = (bx, by, bz)
-                material = material_cache.get(key)
-                if material is None:
-                    material = int(self.world.block_at(bx, by, bz)) if by >= 0 else 1
-                    material_cache[key] = material
-                if material != int(AIR):
+                bx = int(floor(wx * inv_block_size))
+                by = int(floor(wy * inv_block_size))
+                bz = int(floor(wz * inv_block_size))
+                if by < 0:
+                    material = solid_below_world_material
+                else:
+                    key = (bx, by, bz)
+                    material = material_cache_get(key)
+                    if material is None:
+                        material = int(block_at(bx, by, bz))
+                        material_cache[key] = material
+                if material != air_material:
                     color = self._worldspace_rc_material_rgb(material)
                     nx, ny, nz = self._worldspace_rc_estimate_hit_normal(bx, by, bz, dx, dy, dz, material_cache, normal_cache)
                     facing = max(0.0, min(1.0, -(nx * dx + ny * dy + nz * dz)))
@@ -2936,9 +2947,10 @@ class TerrainRenderer:
             volume = (raw_volume.astype(np.float32) * (1.0 - sky_filter_gate) + filtered_volume.astype(np.float32) * sky_filter_gate).astype(np.float16)
             visibility_volume = filtered_visibility_volume
             visibility_volume[..., 3] = np.minimum(filtered_visibility_volume[..., 3], raw_visibility_volume[..., 3]).astype(np.float16)
-            self._worldspace_rc_fill_sparse_probe_volume(volume, visibility_volume, solid_probe_mask, sample_coords)
+            # One sparse fill is enough now that it populates the full volume by
+            # multi-source BFS. Re-filling after the filter and temporal blend
+            # was another ~15-16s in the profiled 4096-chunk flight benchmark.
             volume, visibility_volume = self._worldspace_rc_temporal_blend(cascade_index, volume, visibility_volume, min_corner, full_extent)
-            self._worldspace_rc_fill_sparse_probe_volume(volume, visibility_volume, solid_probe_mask, sample_coords)
             self.device.queue.write_texture(
                 {"texture": self.worldspace_rc_textures[cascade_index], "mip_level": 0, "origin": (0, 0, 0)},
                 volume.tobytes(),
