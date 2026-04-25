@@ -2649,6 +2649,9 @@ class TerrainRenderer:
         if cached_trace is not None:
             return cached_trace
         origin_sky_visibility = self._worldspace_rc_hit_sky_visibility(origin_bx, origin_by, origin_bz, material_cache, sky_visibility_cache, surface_height_cache)
+        cheap_hit_shading = int(cascade_index) >= 1
+        far_hit_sky_visibility = max(0.0, min(1.0, float(origin_sky_visibility)))
+        direct_sun_scale = 0.62 if cheap_hit_shading else 1.10
         effective_directions = self._worldspace_rc_effective_trace_directions(cascade_index, origin_sky_visibility)
         effective_step_count = max(6, int(WORLDSPACE_RC_TRACE_MAX_STEPS) - max(0, int(cascade_index)) * 2)
         if origin_sky_visibility <= 0.04:
@@ -2683,14 +2686,25 @@ class TerrainRenderer:
                         material_cache[key] = material
                 if material != air_material:
                     color = self._worldspace_rc_material_rgb(material)
-                    nx, ny, nz = self._worldspace_rc_estimate_hit_normal(bx, by, bz, dx, dy, dz, material_cache, normal_cache)
-                    facing = max(0.0, min(1.0, -(nx * dx + ny * dy + nz * dz)))
-                    sun_term = max(0.0, nx * sun_dx + ny * sun_dy + nz * sun_dz)
-                    sky_visibility = self._worldspace_rc_hit_sky_visibility(bx, by, bz, material_cache, sky_visibility_cache, surface_height_cache)
+                    if cheap_hit_shading:
+                        # Far cascades are spatially filtered/merged, so avoid the
+                        # expensive per-hit sky aperture probe and six-neighbor
+                        # normal estimate.  Reuse the probe's sky access and shade
+                        # against the ray-opposed normal, which preserves the broad
+                        # directional response without extra block lookups.
+                        facing = 1.0
+                        sky_visibility = far_hit_sky_visibility
+                        open_hemi = max(0.0, -dy) ** 1.5
+                        sun_term = max(0.0, -(dx * sun_dx + dy * sun_dy + dz * sun_dz))
+                    else:
+                        nx, ny, nz = self._worldspace_rc_estimate_hit_normal(bx, by, bz, dx, dy, dz, material_cache, normal_cache)
+                        facing = max(0.0, min(1.0, -(nx * dx + ny * dy + nz * dz)))
+                        sun_term = max(0.0, nx * sun_dx + ny * sun_dy + nz * sun_dz)
+                        sky_visibility = self._worldspace_rc_hit_sky_visibility(bx, by, bz, material_cache, sky_visibility_cache, surface_height_cache)
+                        open_hemi = max(0.0, ny) ** 1.5
                     cave_gate = sky_visibility ** 3.0
-                    open_hemi = max(0.0, ny) ** 1.5
                     ambient_sky = cave_gate * (0.10 + 0.90 * open_hemi) * 0.38
-                    direct_sun = cave_gate * sun_term * direct_sun_strength * 1.10
+                    direct_sun = cave_gate * sun_term * direct_sun_strength * direct_sun_scale
                     falloff = 1.0 - min(1.0, dist / max(max_distance, 1e-4))
                     range_term = 0.16 + 0.84 * falloff
                     facing_term = 0.20 + 0.80 * facing
