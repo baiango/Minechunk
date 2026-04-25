@@ -25,8 +25,7 @@ def _renderer_module():
     return renderer_module
 
 def _terrain_mesher(renderer):
-    terrain_label = renderer.world.terrain_backend_label()
-    if terrain_label == "Metal":
+    if meshing_stage.selected_mesher_kind(renderer) == "metal":
         return metal_mesher
     return wgpu_mesher
 
@@ -136,7 +135,7 @@ def _chunk_prep_backlog_target(renderer) -> int:
 
 def _chunk_prep_pipeline_backlog(renderer, terrain_backend_label: str) -> int:
     backlog = len(renderer._pending_chunk_coords) + len(renderer._pending_voxel_mesh_results)
-    if terrain_backend_label == "Wgpu":
+    if terrain_backend_label in ("Wgpu", "Metal"):
         backlog += int(getattr(renderer, "_pending_surface_gpu_batches_chunk_total", 0))
     return backlog
 
@@ -149,7 +148,7 @@ def service_background_gpu_work(renderer) -> None:
         mesher.process_gpu_buffer_cleanup(renderer)
     mesh_cache.process_deferred_mesh_output_frees(renderer)
     if renderer.use_gpu_meshing:
-        if renderer.world.terrain_backend_label() == "Wgpu" and hasattr(mesher, "drain_pending_surface_gpu_batches_to_meshing"):
+        if hasattr(mesher, "drain_pending_surface_gpu_batches_to_meshing"):
             mesher.drain_pending_surface_gpu_batches_to_meshing(renderer)
         if hasattr(mesher, "finalize_pending_gpu_mesh_batches"):
             mesher.finalize_pending_gpu_mesh_batches(renderer)
@@ -166,78 +165,49 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
 
     prep_start = time.perf_counter()
     terrain_backend_label = renderer.world.terrain_backend_label()
-    using_wgpu_terrain = terrain_backend_label == "Wgpu"
-    using_metal_terrain = terrain_backend_label == "Metal"
-    mesher = _terrain_mesher(renderer)
-    if renderer.use_gpu_meshing:
-        if using_wgpu_terrain:
-            ready_surface_batches = renderer.world.poll_ready_chunk_surface_gpu_batches()
-            chunk_stream_drained = 0
-            chunk_stream_bytes = 0.0
-            if ready_surface_batches:
-                ready_surface_batches.sort(
-                    key=lambda batch: min(
-                        (
-                            chunk_prep_priority(
-                                renderer,
-                                int(chunk_x),
-                                0,
-                                int(chunk_z),
-                                current_origin[0],
-                                current_origin[1],
-                                current_origin[2],
-                            )
-                            for chunk_x, chunk_z in batch.chunks
-                        ),
-                        default=(0.0, 0, 0),
-                    )
-                )
-                for surface_batch in ready_surface_batches:
-                    batch_chunk_count = len(surface_batch.chunks)
-                    chunk_stream_drained += batch_chunk_count
-                    chunk_stream_bytes += float(batch_chunk_count * int(surface_batch.cell_count) * 8)
-                staged_meshes = meshing_stage.enqueue_surface_gpu_batches_for_meshing(renderer, ready_surface_batches)
-                if staged_meshes:
-                    for mesh in staged_meshes:
-                        mesh_cache.store_chunk_mesh(renderer, mesh)
-                meshing_stage.drain_pending_surface_gpu_batches_to_meshing(renderer)
-        elif using_metal_terrain:
-            ready_results = renderer.world.poll_ready_chunk_voxel_batches()
-            chunk_stream_bytes = 0.0
-            chunk_stream_drained = 0
-            drain_budget = max(1, renderer.mesh_batch_size)
-            ready_results.sort(
-                key=lambda result: chunk_prep_priority(
-                    renderer,
-                    int(result.chunk_x),
-                    int(getattr(result, "chunk_y", 0)),
-                    int(result.chunk_z),
-                    current_origin[0],
-                    current_origin[1],
-                    current_origin[2],
+    native_surface_handoff = (
+        bool(renderer.use_gpu_meshing)
+        and meshing_stage.can_use_native_surface_gpu_handoff(renderer)
+    )
+
+    if renderer.use_gpu_meshing and native_surface_handoff:
+        # Zero-copy path: terrain GPU buffers are native to the selected mesher
+        # backend, so WGPU->WGPU and Metal->Metal surface batches can go
+        # directly into the matching GPU surface expansion + meshing path.
+        ready_surface_batches = renderer.world.poll_ready_chunk_surface_gpu_batches()
+        chunk_stream_drained = 0
+        chunk_stream_bytes = 0.0
+        if ready_surface_batches:
+            ready_surface_batches.sort(
+                key=lambda batch: min(
+                    (
+                        chunk_prep_priority(
+                            renderer,
+                            int(chunk_x),
+                            int(chunk_y),
+                            int(chunk_z),
+                            current_origin[0],
+                            current_origin[1],
+                            current_origin[2],
+                        )
+                        for chunk_x, chunk_y, chunk_z in batch.chunks
+                    ),
+                    default=(0.0, 0, 0, 0, 0),
                 )
             )
-            for result in ready_results:
-                chunk_stream_bytes += float(result.blocks.nbytes + result.materials.nbytes)
-            for result in ready_results:
-                key = (int(result.chunk_x), int(getattr(result, "chunk_y", 0)), int(result.chunk_z))
-                renderer._pending_chunk_coords.discard(key)
-                renderer._pending_voxel_mesh_results.append(result)
-            while renderer._pending_voxel_mesh_results and drain_budget > 0:
-                batch_size = min(renderer.mesh_batch_size, len(renderer._pending_voxel_mesh_results))
-                batch_size = min(batch_size, drain_budget)
-                batch = [renderer._pending_voxel_mesh_results.popleft() for _ in range(batch_size)]
-                chunk_stream_drained += len(batch)
-                drain_budget -= len(batch)
-                if not batch:
-                    continue
-                meshes = meshing_stage.make_chunk_mesh_batch_from_terrain(renderer, batch)
-                for mesh in meshes:
-                    mesh_cache.store_chunk_mesh(renderer, mesh)
-        else:
-            chunk_stream_drained = 0
-            chunk_stream_bytes = 0.0
+            for surface_batch in ready_surface_batches:
+                batch_chunk_count = len(surface_batch.chunks)
+                chunk_stream_drained += batch_chunk_count
+                chunk_stream_bytes += float(batch_chunk_count * int(surface_batch.cell_count) * 8)
+            staged_meshes = meshing_stage.enqueue_surface_gpu_batches_for_meshing(renderer, ready_surface_batches)
+            if staged_meshes:
+                mesh_cache.store_chunk_meshes(renderer, list(staged_meshes))
+            meshing_stage.drain_pending_surface_gpu_batches_to_meshing(renderer)
     else:
+        # Portable path: any terrain backend can feed any mesher by returning
+        # neutral CPU-side ChunkVoxelResult arrays.  This is intentionally used
+        # for CPU->GPU and cross-API GPU pairs such as WGPU terrain -> Metal
+        # mesher or Metal terrain -> WGPU mesher.
         ready_results = renderer.world.poll_ready_chunk_voxel_batches()
         chunk_stream_bytes = 0.0
         chunk_stream_drained = 0

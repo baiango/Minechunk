@@ -356,6 +356,12 @@ def process_gpu_buffer_cleanup(renderer) -> None:
 
 @profile
 def get_voxel_surface_expand_bind_group(renderer, surface_batch: ChunkSurfaceGpuBatch, blocks_buffer, materials_buffer, params_buffer, coords_buffer) -> object:
+    device_kind = str(getattr(surface_batch, "device_kind", "") or "").strip().lower()
+    source = str(getattr(surface_batch, "source", "") or "").strip().lower()
+    if device_kind and device_kind != "wgpu":
+        raise TypeError(f"WGPU mesher cannot bind {device_kind!r} terrain surface buffers; use ChunkVoxelResult fallback.")
+    if not device_kind and "metal" in source:
+        raise TypeError("WGPU mesher cannot bind Metal terrain surface buffers; use ChunkVoxelResult fallback.")
     cache_key = (
         id(surface_batch.heights_buffer),
         id(surface_batch.materials_buffer),

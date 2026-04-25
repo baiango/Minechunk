@@ -39,16 +39,34 @@ VERTICES_PER_FACE = 6
 VERTEX_COMPONENTS = 12
 
 
+@njit(cache=True, fastmath=True, inline="always")
+def _mix_u32(value: int) -> int:
+    value = value & 0xFFFFFFFF
+    value = (value ^ (value >> 16)) & 0xFFFFFFFF
+    value = (value * 0x7FEB352D) & 0xFFFFFFFF
+    value = (value ^ (value >> 15)) & 0xFFFFFFFF
+    value = (value * 0x846CA68B) & 0xFFFFFFFF
+    value = (value ^ (value >> 16)) & 0xFFFFFFFF
+    return value
+
+
 @njit(cache=True, fastmath=True)
 def _hash2(ix: int, iy: int, seed: int) -> float:
-    value = math.sin(ix * 127.1 + iy * 311.7 + seed * 74.7) * 43758.5453123
-    return value - math.floor(value)
+    h = ((ix & 0xFFFFFFFF) * 0x9E3779B9) & 0xFFFFFFFF
+    h = (h ^ (((iy & 0xFFFFFFFF) * 0x85EBCA6B) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    h = (h ^ (((seed & 0xFFFFFFFF) * 0xC2B2AE35) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    h = _mix_u32(h)
+    return float(h & 0x00FFFFFF) / 16777215.0
 
 
 @njit(cache=True, fastmath=True)
 def _hash3(ix: int, iy: int, iz: int, seed: int) -> float:
-    value = math.sin(ix * 127.1 + iy * 311.7 + iz * 74.7 + seed * 19.19) * 43758.5453123
-    return value - math.floor(value)
+    h = ((ix & 0xFFFFFFFF) * 0x9E3779B9) & 0xFFFFFFFF
+    h = (h ^ (((iy & 0xFFFFFFFF) * 0x85EBCA6B) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    h = (h ^ (((iz & 0xFFFFFFFF) * 0xC2B2AE35) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    h = (h ^ (((seed & 0xFFFFFFFF) * 0x27D4EB2F) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    h = _mix_u32(h)
+    return float(h & 0x00FFFFFF) / 16777215.0
 
 
 @njit(cache=True, fastmath=True)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import sys
+from collections import OrderedDict
+
 import numpy as np
 
 from .backends.cpu_terrain_backend import CpuTerrainBackend
@@ -14,8 +17,11 @@ else:
 
 try:
     from .backends.wgpu_terrain_backend import WgpuTerrainBackend
-except Exception:  # pragma: no cover - optional during Metal-only deployments
+except Exception as exc:  # pragma: no cover - optional during Metal-only deployments
     WgpuTerrainBackend = None  # type: ignore[assignment]
+    WGPU_TERRAIN_IMPORT_ERROR = exc
+else:
+    WGPU_TERRAIN_IMPORT_ERROR = None
 
 from .types import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
 
@@ -26,7 +32,18 @@ from .kernels import (
     STONE,
     terrain_block_material_at,
 )
-from ..world_constants import BLOCK_SIZE, CHUNK_SIZE, CHUNK_WORLD_SIZE, WORLD_HEIGHT_BLOCKS
+from ..world_constants import BLOCK_SIZE, CHUNK_SIZE, CHUNK_WORLD_SIZE, WORLD_HEIGHT_BLOCKS, VERTICAL_CHUNK_STACK_ENABLED
+
+
+def _allow_gpu_backend_fallback() -> bool:
+    value = os.environ.get("MINECHUNK_ALLOW_METAL_FALLBACK", "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def _format_backend_error(exc: BaseException | None) -> str:
+    if exc is None:
+        return "unknown error"
+    return f"{type(exc).__name__}: {exc!s}"
 
 def _create_preferred_gpu_backend(
     gpu_device,
@@ -85,7 +102,9 @@ def _create_preferred_gpu_backend(
                 chunks_per_poll=chunks_per_poll,
             )
         except Exception as exc:
-            errors.append(f"wgpu terrain backend could not be created ({exc!s})")
+            errors.append(f"wgpu terrain backend could not be created ({_format_backend_error(exc)})")
+    elif WgpuTerrainBackend is None and WGPU_TERRAIN_IMPORT_ERROR is not None:
+        errors.append(f"wgpu terrain backend import failed ({_format_backend_error(WGPU_TERRAIN_IMPORT_ERROR)})")
 
     if not errors:
         if gpu_device is None:
@@ -119,13 +138,19 @@ class VoxelWorld:
         self.height = int(WORLD_HEIGHT_BLOCKS)
         self.block_size = float(BLOCK_SIZE)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
+        self._collision_block_chunk_cache: OrderedDict[tuple[int, int, int], np.ndarray] = OrderedDict()
+        try:
+            self._collision_block_chunk_cache_limit = max(0, int(os.environ.get("MINECHUNK_COLLISION_CHUNK_CACHE", "256")))
+        except Exception:
+            self._collision_block_chunk_cache_limit = 256
         self._backend = CpuTerrainBackend(
             self.seed,
             self.height,
             self.chunk_size,
             chunks_per_poll=self.terrain_batch_size,
         )
-        if prefer_gpu_terrain and not VERTICAL_CHUNK_STACK_ENABLED:
+        self._gpu_backend_error: BaseException | None = None
+        if prefer_gpu_terrain:
             try:
                 self._backend = _create_preferred_gpu_backend(
                     gpu_device,
@@ -136,10 +161,16 @@ class VoxelWorld:
                     prefer_metal_backend=prefer_metal_backend,
                 )
             except Exception as exc:
-                print(
-                    f"Warning: GPU terrain backend could not be created ({exc!s}); using CPU terrain.",
-                    file=sys.stderr,
-                )
+                self._gpu_backend_error = exc
+                message = f"GPU terrain backend could not be created ({_format_backend_error(exc)})"
+                if prefer_metal_backend and not _allow_gpu_backend_fallback():
+                    raise RuntimeError(
+                        "ENGINE_MODE_METAL was requested, but the Metal terrain backend did not initialize. "
+                        + message
+                        + "; refusing to silently run the CPU backend. "
+                        + "Install/verify pyobjc-framework-Metal or run with --allow-metal-fallback to permit fallback."
+                    ) from exc
+                print(f"Warning: {message}; using CPU terrain.", file=sys.stderr)
                 self._backend = CpuTerrainBackend(
                     self.seed,
                     self.height,
@@ -147,8 +178,64 @@ class VoxelWorld:
                     chunks_per_poll=self.terrain_batch_size,
                 )
 
+    def _block_to_stacked_chunk_local(self, x: int, y: int, z: int) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        chunk_x = int(x) // self.chunk_size
+        chunk_y = int(y) // self.chunk_size if VERTICAL_CHUNK_STACK_ENABLED else 0
+        chunk_z = int(z) // self.chunk_size
+        local_x = int(x) - chunk_x * self.chunk_size
+        local_y = int(y) - chunk_y * self.chunk_size if VERTICAL_CHUNK_STACK_ENABLED else int(y)
+        local_z = int(z) - chunk_z * self.chunk_size
+        return (chunk_x, chunk_y, chunk_z), (local_x, local_y, local_z)
+
+    def clear_collision_block_cache(self) -> None:
+        self._collision_block_chunk_cache.clear()
+
+    def _collision_blocks_for_chunk(self, chunk_x: int, chunk_y: int, chunk_z: int) -> np.ndarray:
+        key = (int(chunk_x), int(chunk_y), int(chunk_z))
+        cached = self._collision_block_chunk_cache.get(key)
+        if cached is not None:
+            self._collision_block_chunk_cache.move_to_end(key)
+            return cached
+
+        blocks, _materials = self.chunk_voxel_grid(key[0], key[1], key[2])
+        blocks = np.ascontiguousarray(blocks, dtype=np.uint8)
+        cache_limit = int(getattr(self, "_collision_block_chunk_cache_limit", 0))
+        if cache_limit > 0:
+            self._collision_block_chunk_cache[key] = blocks
+            self._collision_block_chunk_cache.move_to_end(key)
+            while len(self._collision_block_chunk_cache) > cache_limit:
+                self._collision_block_chunk_cache.popitem(last=False)
+        return blocks
+
     def block_at(self, x: int, y: int, z: int) -> int:
-        return int(terrain_block_material_at(int(x), int(y), int(z), self.seed, self.height))
+        x = int(x)
+        y = int(y)
+        z = int(z)
+        if y < 0 or y >= self.height:
+            return int(AIR)
+
+        # In GPU terrain modes, rendering is built from backend-generated chunk
+        # voxel payloads, not from the CPU scalar sampler below.  Sampling the
+        # active backend's chunk grid keeps collision aligned with the visible
+        # mesh even when WGPU/Metal use their own shader math and precision.
+        if self.terrain_backend_label() != "CPU":
+            chunk_key, local = self._block_to_stacked_chunk_local(x, y, z)
+            local_x, local_y, local_z = local
+            blocks = self._collision_blocks_for_chunk(*chunk_key)
+            sample_x = local_x + 1
+            sample_z = local_z + 1
+            if (
+                local_y < 0
+                or local_y >= int(blocks.shape[0])
+                or sample_z < 0
+                or sample_z >= int(blocks.shape[1])
+                or sample_x < 0
+                or sample_x >= int(blocks.shape[2])
+            ):
+                return int(AIR)
+            return int(STONE if int(blocks[local_y, sample_z, sample_x]) != 0 else AIR)
+
+        return int(terrain_block_material_at(x, y, z, self.seed, self.height))
 
     def surface_profile_at(self, x: int, z: int) -> tuple[int, int]:
         return self._backend.surface_profile_at(x, z)

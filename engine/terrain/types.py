@@ -36,6 +36,12 @@ class ChunkSurfaceGpuBatch:
     materials_buffer: object
     cell_count: int
     source: str
+    # Device API that owns heights_buffer/materials_buffer.  This is part of
+    # the terrain -> mesher contract: a GPU mesher may only zero-copy consume
+    # surface buffers from the same backend kind.  Mismatched pairs must go
+    # through the neutral ChunkVoxelResult path instead of binding foreign
+    # buffers (for example, Metal cannot bind a wgpu.GPUBuffer).
+    device_kind: str = ""
 
 
 @dataclass(frozen=True)

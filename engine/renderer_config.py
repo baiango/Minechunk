@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 from . import render_constants as render_consts
 from .render_utils import clamp
@@ -128,7 +129,12 @@ class Camera:
         self.pitch = clamp(self.pitch, -1.45, 1.45)
 
 
-engine_mode = ENGINE_MODE_METAL
+_DEFAULT_ENGINE_MODE = ENGINE_MODE_METAL
+_engine_mode_env = os.environ.get("MINECHUNK_ENGINE_MODE", "").strip().lower()
+if _engine_mode_env in (ENGINE_MODE_CPU, ENGINE_MODE_WGPU, ENGINE_MODE_METAL):
+    engine_mode = _engine_mode_env
+else:
+    engine_mode = _DEFAULT_ENGINE_MODE
 chunk_prep_request_budget_cap = 8 if engine_mode != ENGINE_MODE_CPU else 2
 chunk_prep_bootstrap_displayed_ratio_threshold = 0.05
 chunk_prep_use_screen_border_raycast = False

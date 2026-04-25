@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 import sys
 from collections import OrderedDict, deque
@@ -74,6 +75,11 @@ def _engine_mode_uses_gpu_path() -> bool:
     return engine_mode != ENGINE_MODE_CPU
 
 
+def _allow_metal_fallback() -> bool:
+    value = os.environ.get("MINECHUNK_ALLOW_METAL_FALLBACK", "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
 class TerrainRenderer:
     def __init__(
         self,
@@ -92,9 +98,6 @@ class TerrainRenderer:
         default_use_gpu = _engine_mode_uses_gpu_path()
         self.use_gpu_terrain = default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)
         self.use_gpu_meshing = default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)
-        if VERTICAL_CHUNK_STACK_ENABLED:
-            self.use_gpu_terrain = False
-            self.use_gpu_meshing = False
         self.terrain_batch_size = max(1, int(terrain_batch_size))
         if mesh_batch_size is None:
             self.mesh_batch_size = max(1, int(self.terrain_batch_size))
@@ -142,15 +145,23 @@ class TerrainRenderer:
             prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
         )
+        if engine_mode == ENGINE_MODE_METAL and self.world.terrain_backend_label() != "Metal" and not _allow_metal_fallback():
+            failure = getattr(self.world, "_gpu_backend_error", None)
+            detail = f" ({type(failure).__name__}: {failure!s})" if failure is not None else ""
+            raise RuntimeError(
+                "ENGINE_MODE_METAL was requested, but the active terrain backend is "
+                f"{self.world.terrain_backend_label()!r}{detail}. Refusing CPU/WGPU fallback. "
+                "Run `python3 -m pip install -r requirements.txt`, or launch with --allow-metal-fallback."
+            )
         self.mesh_backend_label = "CPU"
-        self._using_metal_meshing = bool(self.use_gpu_meshing and self.world.terrain_backend_label() == "Metal")
+        self._using_metal_meshing = bool(self.use_gpu_meshing and engine_mode == ENGINE_MODE_METAL)
         if self.use_gpu_meshing:
             self.mesh_backend_label = "Metal" if self._using_metal_meshing else "Wgpu"
         if self._using_metal_meshing:
             metal_mesher.prewarm_metal_chunk_mesher(self)
         if self.use_gpu_terrain and self.world.terrain_backend_label() == "Metal":
             print(
-                "Info: Metal terrain backend active; renderer will use the Metal mesher for chunk meshing.",
+                "Info: Metal terrain backend active; native Metal surface handoff will be used when the mesher is Metal.",
                 file=sys.stderr,
             )
         self._log_backend_diagnostics()
@@ -352,7 +363,7 @@ class TerrainRenderer:
         self._gpu_mesh_deferred_batch_resource_releases: deque[tuple[int, AsyncVoxelMeshBatchResources]] = deque()
         self._gpu_mesh_deferred_surface_batch_releases: deque[tuple[int, list[object]]] = deque()
         self._async_voxel_mesh_batch_pool: deque[AsyncVoxelMeshBatchResources] = deque()
-        self._voxel_surface_expand_bind_group_cache: OrderedDict[tuple[int, int, int, int, int], object] = OrderedDict()
+        self._voxel_surface_expand_bind_group_cache: OrderedDict[tuple[int, int, int, int, int, int], object] = OrderedDict()
         self.profiling_enabled = False
         self.profile_window_start = 0.0
         self.profile_next_report = 0.0
@@ -615,6 +626,11 @@ class TerrainRenderer:
                     "binding": 4,
                     "visibility": wgpu.ShaderStage.COMPUTE,
                     "buffer": {"type": "uniform"},
+                },
+                {
+                    "binding": 5,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "read-only-storage"},
                 },
             ]
         )
@@ -1283,6 +1299,9 @@ class TerrainRenderer:
         mesh_backend_label = getattr(self, "mesh_backend_label", "CPU")
         print(
             "Info: Backend diagnostics: "
+            f"engine_mode={engine_mode}, "
+            f"use_gpu_terrain={self.use_gpu_terrain}, "
+            f"use_gpu_meshing={self.use_gpu_meshing}, "
             f"render_backend={self.render_backend_label}, "
             f"render_device={type(self.device).__name__}, "
             f"terrain_backend={type(terrain_backend).__name__}, "
@@ -1329,24 +1348,34 @@ class TerrainRenderer:
         self._voxel_surface_expand_bind_group_cache.clear()
         while self._pending_gpu_mesh_batches:
             pending = self._pending_gpu_mesh_batches.popleft()
-            if pending.readback_buffer.map_state != "unmapped":
+            if hasattr(pending, "slot") or hasattr(pending, "surface_release_callbacks"):
                 try:
-                    pending.readback_buffer.unmap()
+                    metal_mesher.destroy_async_voxel_mesh_batch_resources(pending)
                 except Exception:
                     pass
-            if pending.resources is not None:
-                wgpu_mesher.destroy_async_voxel_mesh_batch_resources(pending.resources)
+                continue
+            readback_buffer = getattr(pending, "readback_buffer", None)
+            if readback_buffer is not None and getattr(readback_buffer, "map_state", "unmapped") != "unmapped":
+                try:
+                    readback_buffer.unmap()
+                except Exception:
+                    pass
+            resources = getattr(pending, "resources", None)
+            if resources is not None:
+                wgpu_mesher.destroy_async_voxel_mesh_batch_resources(resources)
                 continue
             for buffer in (
-                pending.blocks_buffer,
-                pending.materials_buffer,
-                pending.coords_buffer,
-                pending.column_totals_buffer,
-                pending.chunk_totals_buffer,
-                pending.chunk_offsets_buffer,
-                pending.params_buffer,
-                pending.readback_buffer,
+                getattr(pending, "blocks_buffer", None),
+                getattr(pending, "materials_buffer", None),
+                getattr(pending, "coords_buffer", None),
+                getattr(pending, "column_totals_buffer", None),
+                getattr(pending, "chunk_totals_buffer", None),
+                getattr(pending, "chunk_offsets_buffer", None),
+                getattr(pending, "params_buffer", None),
+                readback_buffer,
             ):
+                if buffer is None:
+                    continue
                 try:
                     buffer.destroy()
                 except Exception:
@@ -1382,14 +1411,21 @@ class TerrainRenderer:
             prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
         )
-        self._using_metal_meshing = bool(self.use_gpu_meshing and self.world.terrain_backend_label() == "Metal")
+        if engine_mode == ENGINE_MODE_METAL and self.world.terrain_backend_label() != "Metal" and not _allow_metal_fallback():
+            failure = getattr(self.world, "_gpu_backend_error", None)
+            detail = f" ({type(failure).__name__}: {failure!s})" if failure is not None else ""
+            raise RuntimeError(
+                "ENGINE_MODE_METAL was requested after reset, but the active terrain backend is "
+                f"{self.world.terrain_backend_label()!r}{detail}. Refusing CPU/WGPU fallback."
+            )
+        self._using_metal_meshing = bool(self.use_gpu_meshing and engine_mode == ENGINE_MODE_METAL)
         if self.use_gpu_meshing:
             self.mesh_backend_label = "Metal" if self._using_metal_meshing else "Wgpu"
         if self._using_metal_meshing:
             metal_mesher.prewarm_metal_chunk_mesher(self)
         if self.use_gpu_terrain and self.world.terrain_backend_label() == "Metal":
             print(
-                "Info: Metal terrain backend active; renderer will use the Metal mesher for chunk meshing.",
+                "Info: Metal terrain backend active; native Metal surface handoff will be used when the mesher is Metal.",
                 file=sys.stderr,
             )
         self._log_backend_diagnostics()
