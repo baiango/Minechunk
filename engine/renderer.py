@@ -2382,7 +2382,75 @@ class TerrainRenderer:
             theta = golden_angle * float(i)
             directions.append((math.cos(theta) * radius, y, math.sin(theta) * radius))
         self._worldspace_rc_trace_dirs = tuple(directions)
+        self._worldspace_rc_trace_dir_subset_cache = {}
         return self._worldspace_rc_trace_dirs
+
+    def _worldspace_rc_effective_trace_directions(
+        self,
+        cascade_index: int,
+        origin_sky_visibility: float,
+    ) -> tuple[tuple[float, float, float], ...]:
+        """Return a cached adaptive ray set for one RC cascade.
+
+        Far cascades are filtered and temporally blended, so they do not need
+        the same angular density as the near cascade. Keep cascade 0 at full
+        quality, mildly thin cascade 1, then aggressively thin the far two
+        cascades. Dark/underground probes get one more reduction because sky
+        rays contribute very little there.
+        """
+        directions = self._worldspace_rc_trace_directions()
+        base_count = len(directions)
+        cascade = max(0, int(cascade_index))
+        low_sky = bool(origin_sky_visibility <= 0.04)
+        cache_key = (base_count, cascade, low_sky)
+        subset_cache = getattr(self, "_worldspace_rc_trace_dir_subset_cache", None)
+        if subset_cache is None:
+            subset_cache = {}
+            self._worldspace_rc_trace_dir_subset_cache = subset_cache
+        cached_subset = subset_cache.get(cache_key)
+        if cached_subset is not None:
+            return cached_subset
+
+        if cascade <= 0:
+            target_count = base_count
+        elif cascade == 1:
+            target_count = max(12, (base_count * 3 + 3) // 4)
+        elif cascade == 2:
+            target_count = max(6, (base_count + 1) // 2)
+        else:
+            target_count = max(4, (base_count + 3) // 4)
+
+        if low_sky and cascade >= 1:
+            min_dark_count = 6 if cascade == 1 else 4
+            target_count = max(min_dark_count, (target_count * 2 + 2) // 3)
+        target_count = max(1, min(base_count, int(target_count)))
+
+        if target_count >= base_count:
+            subset = directions
+        else:
+            # Evenly pick directions across the Fibonacci sphere instead of
+            # slicing with a fixed stride, which biases toward early samples.
+            indices: list[int] = []
+            seen: set[int] = set()
+            for i in range(target_count):
+                idx = int((float(i) + 0.5) * float(base_count) / float(target_count))
+                idx = min(base_count - 1, max(0, idx))
+                if idx not in seen:
+                    indices.append(idx)
+                    seen.add(idx)
+            # Rare small-count duplicate guard. Fill holes deterministically.
+            if len(indices) < target_count:
+                for idx in range(base_count):
+                    if idx in seen:
+                        continue
+                    indices.append(idx)
+                    seen.add(idx)
+                    if len(indices) >= target_count:
+                        break
+            subset = tuple(directions[idx] for idx in indices[:target_count])
+
+        subset_cache[cache_key] = subset
+        return subset
 
     @profile
     def _worldspace_rc_solid_at(
@@ -2555,7 +2623,6 @@ class TerrainRenderer:
         probe_trace_cache: dict[tuple[int, int, int, int], tuple[tuple[float, float, float], float, float, float, float, float]],
         surface_height_cache: dict[tuple[int, int], int],
     ) -> tuple[tuple[float, float, float], float, float, float, float, float]:
-        directions = self._worldspace_rc_trace_directions()
         sky_rgb = (
             0.60 * float(RADIANCE_CASCADES_SKY_STRENGTH),
             0.80 * float(RADIANCE_CASCADES_SKY_STRENGTH),
@@ -2582,11 +2649,7 @@ class TerrainRenderer:
         if cached_trace is not None:
             return cached_trace
         origin_sky_visibility = self._worldspace_rc_hit_sky_visibility(origin_bx, origin_by, origin_bz, material_cache, sky_visibility_cache, surface_height_cache)
-        effective_directions = directions
-        if cascade_index >= 2 and len(effective_directions) > 8:
-            effective_directions = effective_directions[::2]
-        elif cascade_index >= 1 and origin_sky_visibility <= 0.04 and len(effective_directions) > 12:
-            effective_directions = effective_directions[::2]
+        effective_directions = self._worldspace_rc_effective_trace_directions(cascade_index, origin_sky_visibility)
         effective_step_count = max(6, int(WORLDSPACE_RC_TRACE_MAX_STEPS) - max(0, int(cascade_index)) * 2)
         if origin_sky_visibility <= 0.04:
             effective_step_count = max(6, effective_step_count - 2)
