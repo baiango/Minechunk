@@ -187,6 +187,16 @@ class TerrainRenderer:
         self.depth_view = None
         self.depth_size = (0, 0)
         self.radiance_cascades_enabled = bool(RADIANCE_CASCADES_ENABLED)
+        self.rc_debug_mode = 0
+        self.rc_debug_mode_names = (
+            "off",
+            "cascade contribution",
+            "sky/open signal",
+            "normal",
+            "cascade confidence",
+            "rc radiance",
+            "rc light",
+        )
         self.final_present_enabled = True
         self._postprocess_size = (0, 0)
         self.postprocess_msaa_sample_count = 4 if int(POSTPROCESS_MSAA_SAMPLE_COUNT) > 1 else 1
@@ -223,7 +233,15 @@ class TerrainRenderer:
         self._worldspace_rc_active_inv_extents = [(0.0, 0.0, 0.0) for _ in range(4)]
         self._worldspace_rc_last_update_frame = [-1000000, -1000000, -1000000, -1000000]
         self._worldspace_rc_update_cursor = 0
+        self._worldspace_rc_convergence_frames_remaining = 0
         self._worldspace_rc_frame_index = 0
+        self._worldspace_rc_last_scheduled_updates: list[int] = []
+        self._worldspace_rc_last_dirty_indices: list[int] = []
+        self._worldspace_rc_last_stable_refresh_indices: list[int] = []
+        self._worldspace_rc_last_history_reject_updates: list[int] = []
+        self._worldspace_rc_last_update_kind = "init"
+        self._worldspace_rc_last_interval_bands = [(0.0, 0.0) for _ in range(4)]
+        self._worldspace_rc_last_snapshot_path: str | None = None
         self.worldspace_rc_trace_bind_group_layout = None
         self.worldspace_rc_filter_bind_group_layout = None
         self.worldspace_rc_trace_pipeline = None
@@ -1225,6 +1243,14 @@ class TerrainRenderer:
         self.worldspace_rc_filter_bind_groups = []
         self.worldspace_rc_filter_pingpong_bind_groups = []
         self._worldspace_rc_signature = None
+        self._worldspace_rc_active_signatures = [None, None, None, None]
+        self._worldspace_rc_last_update_frame = [-1000000, -1000000, -1000000, -1000000]
+        self._worldspace_rc_last_scheduled_updates = []
+        self._worldspace_rc_last_dirty_indices = []
+        self._worldspace_rc_last_stable_refresh_indices = []
+        self._worldspace_rc_last_history_reject_updates = []
+        self._worldspace_rc_last_update_kind = "resize"
+        self._worldspace_rc_last_interval_bands = [(0.0, 0.0) for _ in range(4)]
         self.postprocess_depth_texture = None
         self.postprocess_depth_view = None
         if self.profiling_enabled and self.profile_hud_lines:
@@ -1258,6 +1284,12 @@ class TerrainRenderer:
             self._jump_queued = False
         if is_new_press and key == "g":
             self.radiance_cascades_enabled = not self.radiance_cascades_enabled
+        if is_new_press and key == "f6":
+            self.rc_debug_mode = (int(self.rc_debug_mode) + 1) % len(self.rc_debug_mode_names)
+            self._write_gi_params()
+            print(f"Info: RC debug mode = {self.rc_debug_mode} ({self.rc_debug_mode_names[self.rc_debug_mode]})")
+        if is_new_press and key == "f7":
+            self._dump_worldspace_rc_diagnostics()
         if is_new_press and key == "space":
             self._jump_queued = True
 
@@ -2257,6 +2289,24 @@ class TerrainRenderer:
             file=sys.stderr,
         )
 
+    def _write_gi_params(self) -> None:
+        if self.gi_params_buffer is None:
+            return
+        # merge_control.x is used by the world-space RC compose shader as a
+        # lightweight debug visualization mode. The legacy screen-space cascade
+        # pass is not submitted in the current WGPU RC path.
+        gi_params = np.array([
+            float(RADIANCE_CASCADES_STRENGTH),
+            float(RADIANCE_CASCADES_BIAS),
+            float(RADIANCE_CASCADES_SKY_STRENGTH),
+            float(RADIANCE_CASCADES_HIT_THICKNESS),
+            float(self.rc_debug_mode),
+            float(RADIANCE_CASCADES_MERGE_STRENGTH),
+            float(RADIANCE_CASCADES_CASCADE_COUNT),
+            float(WORLDSPACE_RC_GRID_RESOLUTION),
+        ], dtype=np.float32)
+        self.device.queue.write_buffer(self.gi_params_buffer, 0, gi_params.tobytes())
+
     def _ensure_postprocess_targets(self) -> None:
         width, height = self.canvas.get_physical_size()
         target_size = (max(1, int(width)), max(1, int(height)))
@@ -2412,17 +2462,7 @@ class TerrainRenderer:
 
         self._write_final_present_params(target_size[0], target_size[1])
 
-        gi_params = np.array([
-            float(RADIANCE_CASCADES_STRENGTH),
-            float(RADIANCE_CASCADES_BIAS),
-            float(RADIANCE_CASCADES_SKY_STRENGTH),
-            float(RADIANCE_CASCADES_HIT_THICKNESS),
-            float(RADIANCE_CASCADES_MERGE_OVERLAP),
-            float(RADIANCE_CASCADES_MERGE_STRENGTH),
-            float(RADIANCE_CASCADES_CASCADE_COUNT),
-            float(WORLDSPACE_RC_GRID_RESOLUTION),
-        ], dtype=np.float32)
-        self.device.queue.write_buffer(self.gi_params_buffer, 0, gi_params.tobytes())
+        self._write_gi_params()
 
         for cascade_index in range(cascade_count):
             cascade_params = np.array([
@@ -2574,6 +2614,116 @@ class TerrainRenderer:
                     current_binding_offset = binding_offset
                 draw(vertex_count, 1, first_vertex, 0)
 
+    def _worldspace_rc_interval_band(self, cascade_index: int) -> tuple[float, float]:
+        """Return the canonical world-space distance interval for one RC cascade.
+
+        The RC volume extent still controls spatial coverage, but interval tracing
+        should use a clean geometric band: C0 = [0, R0], C1 = [R0, R1], etc.
+        A small overlap makes the local/far handoff continuous instead of a hard
+        boundary where one interval stops exactly where the next starts.
+        """
+        ci = max(0, int(cascade_index))
+        base_interval = max(float(BLOCK_SIZE) * 4.0, float(WORLDSPACE_RC_INTERVAL_BASE_WORLD))
+        scale = max(1.000001, float(WORLDSPACE_RC_INTERVAL_SCALE))
+        if ci <= 0:
+            start = 0.0
+            end = base_interval
+        else:
+            start = base_interval * (scale ** float(ci - 1))
+            end = base_interval * (scale ** float(ci))
+        overlap = max(0.0, min(0.45, float(WORLDSPACE_RC_INTERVAL_OVERLAP)))
+        if ci > 0:
+            length = max(float(BLOCK_SIZE), end - start)
+            start = max(0.0, start - length * overlap)
+        return float(start), float(max(start + float(BLOCK_SIZE), end))
+
+    def _worldspace_rc_active_direction_count(self, cascade_index: int) -> int:
+        direction_count = max(1, int(WORLDSPACE_RC_DIRECTION_COUNT))
+        if int(cascade_index) <= 0:
+            return min(direction_count, 4)
+        if int(cascade_index) == 1:
+            return min(direction_count, 8)
+        if int(cascade_index) == 2:
+            return min(direction_count, 12)
+        return direction_count
+
+    def _format_worldspace_rc_cascade_list(self, values) -> str:
+        vals = [int(v) for v in list(values or [])]
+        return "-" if not vals else ",".join(f"C{v}" for v in vals)
+
+    def _dump_worldspace_rc_diagnostics(self) -> None:
+        """Write a compact RC diagnostic snapshot for screenshot triage."""
+        try:
+            out_dir = os.path.join(os.getcwd(), "rc_diagnostics")
+            os.makedirs(out_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            frame = int(getattr(self, "_worldspace_rc_frame_index", 0))
+            path = os.path.join(out_dir, f"rc_snapshot_{stamp}_frame_{frame}.txt")
+            debug_mode = int(getattr(self, "rc_debug_mode", 0))
+            debug_names = tuple(getattr(self, "rc_debug_mode_names", ("off",)))
+            debug_name = debug_names[debug_mode] if 0 <= debug_mode < len(debug_names) else "unknown"
+            last_updates = list(getattr(self, "_worldspace_rc_last_update_frame", []))
+            ages: list[str] = []
+            for idx in range(4):
+                try:
+                    last_update = int(last_updates[idx])
+                except Exception:
+                    last_update = -1000000
+                ages.append("--" if last_update < -999000 else str(max(0, frame - last_update)))
+
+            lines: list[str] = []
+            lines.append("Minechunk RC Diagnostic Snapshot")
+            lines.append(f"timestamp={stamp}")
+            lines.append(f"frame={frame}")
+            lines.append(f"engine_mode={engine_mode}")
+            lines.append(f"render_backend={self.render_backend_label}")
+            lines.append(f"terrain_backend={self.world.terrain_backend_label()}")
+            lines.append(f"mesh_backend={self.mesh_backend_label}")
+            lines.append(f"rc_enabled={bool(self.radiance_cascades_enabled)}")
+            lines.append(f"debug_mode={debug_mode}:{debug_name}")
+            lines.append("")
+            lines.append("field:")
+            lines.append(f"  resolution={int(WORLDSPACE_RC_GRID_RESOLUTION)}")
+            lines.append(f"  direction_count={int(WORLDSPACE_RC_DIRECTION_COUNT)}")
+            lines.append(f"  active_direction_counts={[self._worldspace_rc_active_direction_count(i) for i in range(4)]}")
+            lines.append(f"  filter_passes={int(WORLDSPACE_RC_SPATIAL_FILTER_PASSES)}")
+            lines.append(f"  temporal_alpha={float(WORLDSPACE_RC_TEMPORAL_BLEND_ALPHA):.4f}")
+            lines.append(f"  bounce_feedback={float(WORLDSPACE_RC_BOUNCE_FEEDBACK_STRENGTH):.4f}")
+            lines.append(f"  base_interval_world={float(WORLDSPACE_RC_INTERVAL_BASE_WORLD):.6f}")
+            lines.append(f"  interval_scale={float(WORLDSPACE_RC_INTERVAL_SCALE):.6f}")
+            lines.append(f"  interval_overlap={float(WORLDSPACE_RC_INTERVAL_OVERLAP):.6f}")
+            lines.append("")
+            lines.append("scheduler:")
+            lines.append(f"  update_kind={getattr(self, '_worldspace_rc_last_update_kind', 'unknown')}")
+            lines.append(f"  scheduled={self._format_worldspace_rc_cascade_list(getattr(self, '_worldspace_rc_last_scheduled_updates', []))}")
+            lines.append(f"  dirty={self._format_worldspace_rc_cascade_list(getattr(self, '_worldspace_rc_last_dirty_indices', []))}")
+            lines.append(f"  stable_refresh={self._format_worldspace_rc_cascade_list(getattr(self, '_worldspace_rc_last_stable_refresh_indices', []))}")
+            lines.append(f"  history_reject={self._format_worldspace_rc_cascade_list(getattr(self, '_worldspace_rc_last_history_reject_updates', []))}")
+            lines.append(f"  convergence_burst_frames_left={int(getattr(self, '_worldspace_rc_convergence_frames_remaining', 0))}")
+            lines.append(f"  update_cursor={int(getattr(self, '_worldspace_rc_update_cursor', 0))}")
+            lines.append(f"  cascade_age_frames=C0:{ages[0]} C1:{ages[1]} C2:{ages[2]} C3:{ages[3]}")
+            lines.append("")
+            lines.append("intervals:")
+            for idx in range(4):
+                start, end = self._worldspace_rc_interval_band(idx)
+                lines.append(f"  C{idx}: start={start:.6f} end={end:.6f} length={(end - start):.6f}")
+            lines.append("")
+            lines.append("active_signatures:")
+            for idx, sig in enumerate(getattr(self, '_worldspace_rc_active_signatures', [])):
+                lines.append(f"  C{idx}: {sig}")
+            lines.append("")
+            lines.append("active_volume_min_inv_extent:")
+            for idx in range(4):
+                mins = getattr(self, '_worldspace_rc_active_mins', [(0.0, 0.0, 0.0)] * 4)[idx]
+                inv = getattr(self, '_worldspace_rc_active_inv_extents', [(0.0, 0.0, 0.0)] * 4)[idx]
+                lines.append(f"  C{idx}: min={mins} inv_extent={inv}")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            self._worldspace_rc_last_snapshot_path = path
+            print(f"Info: RC diagnostics snapshot written to {path}", file=sys.stderr)
+        except Exception as exc:
+            print(f"Warning: failed to write RC diagnostics snapshot: {exc!r}", file=sys.stderr)
+
     def _make_worldspace_rc_update_params(
         self,
         cascade_index: int,
@@ -2583,9 +2733,9 @@ class TerrainRenderer:
         temporal_history_weight: float,
     ) -> np.ndarray:
         max_distance = float(full_extent) * 0.5
-        interval_scale = max(1.000001, float(WORLDSPACE_RC_INTERVAL_SCALE))
-        interval_start = 0.0 if int(cascade_index) <= 0 else max_distance / interval_scale
-        interval_end = max_distance
+        interval_start, interval_end = self._worldspace_rc_interval_band(cascade_index)
+        interval_start = min(float(interval_start), max_distance)
+        interval_end = min(max_distance, max(float(interval_end), interval_start + float(BLOCK_SIZE)))
         seed = float(getattr(self.world, "seed", 0))
         world_height = float(self.world.height)
         light_dir = tuple(float(v) for v in LIGHT_DIRECTION)
@@ -2674,8 +2824,13 @@ class TerrainRenderer:
         target_mins: list[tuple[float, float, float]] = []
         target_inv_extents: list[tuple[float, float, float]] = []
 
+        target_interval_bands: list[tuple[float, float]] = []
         for cascade_index in range(4):
-            half_extent = base_half_extent * (float(WORLDSPACE_RC_INTERVAL_SCALE) ** float(cascade_index))
+            interval_start, interval_end = self._worldspace_rc_interval_band(cascade_index)
+            # Canonical RC interval end controls the cascade volume radius. This
+            # keeps spatial coverage and distance interval math coherent: C0 is
+            # the nearest band, C1 begins around C0's end, and so on.
+            half_extent = max(base_half_extent * (float(WORLDSPACE_RC_INTERVAL_SCALE) ** float(cascade_index)), interval_end)
             full_extent = half_extent * 2.0
             snap = max(float(WORLDSPACE_RC_UPDATE_QUANTIZE_WORLD), full_extent / max(1.0, float(resolution - 1)))
             center_x = math.floor((camera_pos[0] / snap) + 0.5) * snap
@@ -2683,20 +2838,43 @@ class TerrainRenderer:
             center_z = math.floor((camera_pos[2] / snap) + 0.5) * snap
             min_corner = (center_x - half_extent, center_y - half_extent, center_z - half_extent)
             inv_extent = (1.0 / full_extent, 1.0 / full_extent, 1.0 / full_extent)
-            target_signatures.append((round(min_corner[0], 4), round(min_corner[1], 4), round(min_corner[2], 4), round(full_extent, 4)))
+            target_signatures.append((round(min_corner[0], 4), round(min_corner[1], 4), round(min_corner[2], 4), round(full_extent, 4), round(interval_start, 4), round(interval_end, 4)))
             target_mins.append(min_corner)
             target_inv_extents.append(inv_extent)
+            target_interval_bands.append((interval_start, interval_end))
+        self._worldspace_rc_last_interval_bands = target_interval_bands
 
         dirty_indices = [i for i in range(4) if target_signatures[i] != self._worldspace_rc_active_signatures[i]]
+        if dirty_indices:
+            # After a recenter/move, spend a short burst of stable refresh frames
+            # re-converging temporal directional radiance. History is rejected for
+            # the dirty update itself, then allowed again once the volume is stable.
+            self._worldspace_rc_convergence_frames_remaining = max(
+                int(self._worldspace_rc_convergence_frames_remaining),
+                max(0, int(WORLDSPACE_RC_CONVERGENCE_BURST_FRAMES)),
+            )
+
         stable_refresh_indices: list[int] = []
         if not dirty_indices and all(sig is not None for sig in self._worldspace_rc_active_signatures):
             # v32 temporal accumulation only helps when the previous field uses
             # the same world-space volume. If the camera has not crossed a snap
-            # boundary, refresh one stable cascade per frame so it can converge
-            # without blending stale history from old volume positions.
-            stable_refresh_indices = [self._worldspace_rc_update_cursor]
+            # boundary, refresh stable cascades so the multi-bounce/directional
+            # field converges. During a post-move burst, refresh more than one
+            # cascade per frame in far-to-near order; outside the burst, keep the
+            # old low-cost one-cascade refresh.
+            stable_budget = max(1, int(WORLDSPACE_RC_STABLE_REFRESH_CASCADES_PER_FRAME))
+            if int(self._worldspace_rc_convergence_frames_remaining) > 0:
+                stable_budget = max(stable_budget, int(WORLDSPACE_RC_CONVERGENCE_REFRESH_CASCADES_PER_FRAME))
+            stable_budget = min(4, max(1, stable_budget))
+            cursor = int(self._worldspace_rc_update_cursor) % 4
+            stable_refresh_indices = [((cursor - offset) % 4) for offset in range(stable_budget)]
 
         if not dirty_indices and not stable_refresh_indices:
+            self._worldspace_rc_last_dirty_indices = []
+            self._worldspace_rc_last_stable_refresh_indices = []
+            self._worldspace_rc_last_scheduled_updates = []
+            self._worldspace_rc_last_history_reject_updates = []
+            self._worldspace_rc_last_update_kind = "idle"
             self._write_worldspace_rc_volume_params_for_schedule(target_mins, target_inv_extents, set())
             return
 
@@ -2705,7 +2883,7 @@ class TerrainRenderer:
         elif dirty_indices:
             max_updates = max(1, int(WORLDSPACE_RC_UPDATE_MAX_CASCADES_PER_FRAME))
         else:
-            max_updates = 1
+            max_updates = min(4, max(1, len(stable_refresh_indices)))
 
         updates_done = 0
         updated_any = False
@@ -2723,9 +2901,18 @@ class TerrainRenderer:
         else:
             # Stable refresh also walks far-to-near over time, so temporal
             # convergence feeds the next closer interval on following frames.
-            cursor = int(self._worldspace_rc_update_cursor)
-            search_order = [cursor]
+            # v42 can refresh a small pair during post-move convergence bursts.
+            search_order = list(update_candidates)
         scheduled_updates = set(search_order[:max_updates])
+        history_reject_updates = [
+            i for i in sorted(scheduled_updates, reverse=True)
+            if self._worldspace_rc_active_signatures[i] != target_signatures[i]
+        ]
+        self._worldspace_rc_last_dirty_indices = list(dirty_indices)
+        self._worldspace_rc_last_stable_refresh_indices = list(stable_refresh_indices)
+        self._worldspace_rc_last_scheduled_updates = list(search_order[:max_updates])
+        self._worldspace_rc_last_history_reject_updates = history_reject_updates
+        self._worldspace_rc_last_update_kind = "dirty" if dirty_indices else "stable"
         self._write_worldspace_rc_volume_params_for_schedule(target_mins, target_inv_extents, scheduled_updates)
 
         for cascade_index in search_order:
@@ -2787,6 +2974,12 @@ class TerrainRenderer:
             updated_any = True
             if updates_done >= max_updates:
                 break
+
+        if not dirty_indices and updated_any and int(self._worldspace_rc_convergence_frames_remaining) > 0:
+            self._worldspace_rc_convergence_frames_remaining = max(
+                0,
+                int(self._worldspace_rc_convergence_frames_remaining) - 1,
+            )
 
         self._write_worldspace_rc_volume_params_for_schedule(target_mins, target_inv_extents, set())
 

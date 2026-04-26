@@ -655,6 +655,44 @@ def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
     camera_block_y = camera_y / max(renderer.world.block_size, 1e-9)
     camera_block_z = camera_z / max(renderer.world.block_size, 1e-9)
 
+    rc_debug_mode = int(getattr(renderer, "rc_debug_mode", 0))
+    rc_debug_names = tuple(getattr(renderer, "rc_debug_mode_names", ("off",)))
+    rc_debug_name = rc_debug_names[rc_debug_mode] if 0 <= rc_debug_mode < len(rc_debug_names) else "unknown"
+    rc_frame = int(getattr(renderer, "_worldspace_rc_frame_index", 0))
+    rc_burst = int(getattr(renderer, "_worldspace_rc_convergence_frames_remaining", 0))
+    rc_kind = str(getattr(renderer, "_worldspace_rc_last_update_kind", "unknown"))
+
+    def _fmt_cascade_list(values) -> str:
+        vals = [int(v) for v in list(values or [])]
+        return "-" if not vals else ",".join(f"C{v}" for v in vals)
+
+    rc_scheduled = _fmt_cascade_list(getattr(renderer, "_worldspace_rc_last_scheduled_updates", []))
+    rc_dirty = _fmt_cascade_list(getattr(renderer, "_worldspace_rc_last_dirty_indices", []))
+    rc_reject = _fmt_cascade_list(getattr(renderer, "_worldspace_rc_last_history_reject_updates", []))
+    rc_last_updates = list(getattr(renderer, "_worldspace_rc_last_update_frame", []))
+    rc_ages: list[str] = []
+    for idx in range(4):
+        try:
+            last_update = int(rc_last_updates[idx])
+        except Exception:
+            last_update = -1000000
+        rc_ages.append("--" if last_update < -999000 else str(max(0, rc_frame - last_update)))
+    rc_age_text = "/".join(rc_ages)
+    rc_resolution = int(getattr(render_consts, "WORLDSPACE_RC_GRID_RESOLUTION", 0))
+    rc_directions = int(getattr(render_consts, "WORLDSPACE_RC_DIRECTION_COUNT", 0))
+    rc_filter_passes = int(getattr(render_consts, "WORLDSPACE_RC_SPATIAL_FILTER_PASSES", 0))
+    rc_temporal_alpha = float(getattr(render_consts, "WORLDSPACE_RC_TEMPORAL_BLEND_ALPHA", 0.0))
+    rc_interval_bands = list(getattr(renderer, "_worldspace_rc_last_interval_bands", []))
+    if len(rc_interval_bands) < 4:
+        rc_interval_bands = [getattr(renderer, "_worldspace_rc_interval_band", lambda i: (0.0, 0.0))(i) for i in range(4)]
+    rc_interval_text = " ".join(
+        f"C{idx}:{float(band[0]):.1f}-{float(band[1]):.1f}"
+        for idx, band in enumerate(rc_interval_bands[:4])
+    )
+    rc_snapshot_path = str(getattr(renderer, "_worldspace_rc_last_snapshot_path", "") or "-")
+    if len(rc_snapshot_path) > 54:
+        rc_snapshot_path = "..." + rc_snapshot_path[-51:]
+
     lines = [
         f"FRAME BREAKDOWN @ DIMENSION {renderer.render_dimension_chunks}x{renderer.render_dimension_chunks} CHUNKS",
         f"MOVE SPEED: {renderer._current_move_speed / max(renderer.world.block_size, 1e-9):5.1f} B/S",
@@ -666,6 +704,12 @@ def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
         f"CHUNK DIMS: {renderer_module.CHUNK_SIZE}x{renderer_module.CHUNK_SIZE}x{renderer_module.CHUNK_SIZE}",
         f"BACKEND POLL SIZE: {renderer.terrain_batch_size}",
         f"MESH DRAIN SIZE: {renderer.mesh_batch_size}",
+        f"RC: {'ON' if renderer.radiance_cascades_enabled else 'OFF'} DEBUG {rc_debug_mode}:{rc_debug_name}",
+        f"RC FIELD: RES {rc_resolution} DIRS {rc_directions} FILTER {rc_filter_passes} TEMP {rc_temporal_alpha:.2f}",
+        f"RC UPDATE: {rc_kind.upper()} SCHED {rc_scheduled} DIRTY {rc_dirty} REJECT {rc_reject} BURST {rc_burst}",
+        f"RC AGE C0/C1/C2/C3: {rc_age_text} FRAMES",
+        f"RC INTERVALS: {rc_interval_text}",
+        f"RC SNAPSHOT F7: {rc_snapshot_path}",
         f"MESH SLABS: {slab_count}  USED {slab_used_bytes / (1024.0 * 1024.0):4.1f} MIB  FREE {slab_free_bytes / (1024.0 * 1024.0):4.1f} MIB",
         f"MESH BIGGEST GAP: {slab_largest_free_bytes / (1024.0 * 1024.0):4.1f} MIB  ALLOCS {slab_alloc_count}",
         f"CPU FRAME ISSUE: {avg_issue_encode:5.1f} MS",

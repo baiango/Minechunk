@@ -836,6 +836,11 @@ fn cascade_edge_blend(uvw: vec3f) -> f32 {
     return smoothstep(PROBE_CASCADE_BLEND_EDGE_START, PROBE_CASCADE_BLEND_EDGE_END, edge_dist);
 }
 
+fn smootherstep01(v: f32) -> f32 {
+    let t = clamp(v, 0.0, 1.0);
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
 fn normalize_direction_descriptor(v: vec4f) -> vec4f {
     let len_v = length(v.xyz);
     let dir = select(vec3f(0.0, 1.0, 0.0), v.xyz / max(len_v, 0.0001), len_v > 0.0001);
@@ -956,9 +961,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     // RC is a positive lighting field, but direct daylight should not be
     // injected as a hard per-probe floor. Use a smooth sky-visibility baseline
     // for open upward terrain, then add probe-traced indirect radiance on top.
+    let rc_debug_mode = i32(params.merge_control.x + 0.5);
     var rc_indirect = vec3f(0.0, 0.0, 0.0);
     var sky_signal_accum = 0.0;
     var sky_signal_weight = 0.0;
+    var debug_cascade_contrib = vec3f(0.0, 0.0, 0.0);
+    var debug_cascade_confidence = vec3f(0.0, 0.0, 0.0);
     for (var i: u32 = 0u; i < 4u; i = i + 1u) {
         if (i >= cascade_count) {
             break;
@@ -1047,12 +1055,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
         let cascade_alpha = saturate(cascade_weight_sum * PROBE_CASCADE_BLEND_CONFIDENCE_SCALE);
         let cascade_sky_access = select(0.0, cascade_sky_access_sum / cascade_sky_access_weight, cascade_sky_access_weight > 0.0001);
         let edge_blend = cascade_edge_blend(uvw);
+        let transition_blend = smootherstep01(edge_blend);
         var boundary_blend = 1.0;
         if (i + 1u < cascade_count) {
-            boundary_blend = mix(PROBE_CASCADE_BLEND_MIN_WEIGHT, 1.0, edge_blend);
+            boundary_blend = mix(PROBE_CASCADE_BLEND_MIN_WEIGHT, 1.0, transition_blend);
         }
         let cascade_preference = mix(1.0, PROBE_CASCADE_BLEND_FAR_BIAS, f32(i) / max(1.0, f32(cascade_count - 1u)));
-        let confidence = clamp(cascade_alpha * boundary_blend * cascade_preference, 0.0, 1.0);
+        let raw_confidence = clamp(cascade_alpha * boundary_blend * cascade_preference, 0.0, 1.0);
+        let confidence = smoothstep(0.025, 0.92, raw_confidence);
 
         // Probe radiance is indirect/additive only. Dark cascades add zero; they
         // never reduce light by participating in a normalized average.
@@ -1064,7 +1074,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
         } else if (i >= 3u) {
             cascade_add_weight = 0.18;
         }
-        rc_indirect = rc_indirect + cascade_rgb_raw * confidence * cascade_add_weight;
+        let edge_handoff_damper = select(1.0, mix(0.82, 1.0, transition_blend), i + 1u < cascade_count);
+        let cascade_contribution = cascade_rgb_raw * confidence * cascade_add_weight * edge_handoff_damper;
+        rc_indirect = rc_indirect + cascade_contribution;
+
+        var cascade_debug_color = vec3f(1.0, 0.22, 0.08);
+        if (i == 1u) {
+            cascade_debug_color = vec3f(0.20, 1.0, 0.22);
+        } else if (i == 2u) {
+            cascade_debug_color = vec3f(0.18, 0.36, 1.0);
+        } else if (i >= 3u) {
+            cascade_debug_color = vec3f(1.0, 0.28, 1.0);
+        }
+        let cascade_contribution_luma = dot(cascade_contribution, vec3f(0.2126, 0.7152, 0.0722));
+        debug_cascade_contrib = debug_cascade_contrib + cascade_debug_color * cascade_contribution_luma;
+        debug_cascade_confidence = debug_cascade_confidence + cascade_debug_color * confidence * 0.35;
 
         // Sky visibility is a smooth daylight mask, not visible probe radiance.
         // Weight C1 most strongly so the open-sky baseline is broad instead of
@@ -1078,8 +1102,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
             sky_cascade_weight = 0.15;
         }
         let sky_signal = smoothstep(0.18, 0.72, cascade_sky_access);
-        sky_signal_accum = sky_signal_accum + sky_signal * confidence * sky_cascade_weight;
-        sky_signal_weight = sky_signal_weight + confidence * sky_cascade_weight;
+        let sky_transition_weight = mix(0.72, 1.0, transition_blend);
+        sky_signal_accum = sky_signal_accum + sky_signal * confidence * sky_cascade_weight * sky_transition_weight;
+        sky_signal_weight = sky_signal_weight + confidence * sky_cascade_weight * sky_transition_weight;
     }
 
     let smoothed_sky_signal = smoothstep(0.06, 0.84, sky_signal_accum / max(sky_signal_weight, 0.0001));
@@ -1093,6 +1118,26 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     let sky_baseline = vec3f(0.38, 0.40, 0.38) * open_sky * mix(0.34, 1.0, hemisphere);
     let rc_indirect_soft = rc_indirect / (vec3f(1.0, 1.0, 1.0) + rc_indirect);
     let rc_light = max(sky_baseline + rc_indirect_soft * 0.36, vec3f(0.0, 0.0, 0.0));
+
+    if (rc_debug_mode == 1) {
+        let dbg = debug_cascade_contrib / (vec3f(1.0, 1.0, 1.0) + debug_cascade_contrib);
+        return vec4f(clamp(dbg * 2.4, vec3f(0.0), vec3f(1.0)), 1.0);
+    }
+    if (rc_debug_mode == 2) {
+        return vec4f(vec3f(open_sky), 1.0);
+    }
+    if (rc_debug_mode == 3) {
+        return vec4f(normal * 0.5 + vec3f(0.5), 1.0);
+    }
+    if (rc_debug_mode == 4) {
+        return vec4f(clamp(debug_cascade_confidence, vec3f(0.0), vec3f(1.0)), 1.0);
+    }
+    if (rc_debug_mode == 5) {
+        return vec4f(clamp(rc_indirect_soft * 2.2, vec3f(0.0), vec3f(1.0)), 1.0);
+    }
+    if (rc_debug_mode == 6) {
+        return vec4f(clamp(rc_light, vec3f(0.0), vec3f(1.0)), 1.0);
+    }
 
     let lit = clamp(albedo * rc_light * strength, vec3f(0.0, 0.0, 0.0), vec3f(1.0, 1.0, 1.0));
     return vec4f(lit, 1.0);
@@ -1188,9 +1233,32 @@ const SKY_VISIBILITY_APERTURE_POWER: f32 = __SKY_VISIBILITY_APERTURE_POWER__;
 const SKY_VISIBILITY_MIN_APERTURE: f32 = __SKY_VISIBILITY_MIN_APERTURE__;
 const RC_DIRECTION_COUNT: i32 = 16;
 const RC_TEMPORAL_ALPHA: f32 = __RC_TEMPORAL_ALPHA__;
+const RC_BOUNCE_FEEDBACK_STRENGTH: f32 = __RC_BOUNCE_FEEDBACK_STRENGTH__;
+const RC_FEEDBACK_MAX_LUMA: f32 = 0.42;
+const RC_INTERVAL_MAX_LUMA: f32 = 1.15;
+const RC_FAR_MERGE_MAX_LUMA: f32 = 0.90;
+const RC_FAR_MERGE_RINGING_VARIANCE_SCALE: f32 = 7.5;
+const RC_FAR_MERGE_MIN_STABILITY: f32 = 0.42;
+const RC_MERGE_CONTINUITY_FEATHER: f32 = __RC_MERGE_CONTINUITY_FEATHER__;
 
 fn saturate(v: f32) -> f32 {
     return clamp(v, 0.0, 1.0);
+}
+
+fn smootherstep01(v: f32) -> f32 {
+    let t = clamp(v, 0.0, 1.0);
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+fn rc_luma(rgb: vec3f) -> f32 {
+    return dot(max(rgb, vec3f(0.0, 0.0, 0.0)), vec3f(0.2126, 0.7152, 0.0722));
+}
+
+fn rc_clamp_luma(rgb: vec3f, max_luma: f32) -> vec3f {
+    let safe_rgb = max(rgb, vec3f(0.0, 0.0, 0.0));
+    let luma = rc_luma(safe_rgb);
+    let scale = min(1.0, max_luma / max(luma, 0.0001));
+    return safe_rgb * scale;
 }
 
 fn seed_u32() -> u32 {
@@ -1687,6 +1755,43 @@ fn stable_tangent_a(ray_dir: vec3f) -> vec3f {
     return normalize(cross(up, ray_dir));
 }
 
+fn local_interval_visibility(origin: vec3f, ray_dir: vec3f, start_dist: f32, end_dist: f32, block_size: f32) -> f32 {
+    // Cheap local visibility for far-cascade interval merge. The primary trace
+    // can miss a thin blocker when interval steps are coarse; this denser guard
+    // prevents the farther cascade from leaking through local geometry.
+    let dir_n = normalize(ray_dir);
+    let safe_start = max(0.0, start_dist);
+    let safe_end = max(safe_start, end_dist);
+    let span = safe_end - safe_start;
+    if (span <= block_size * 0.25) {
+        return 1.0;
+    }
+
+    let step_len = max(block_size * 0.75, span / 12.0);
+    var dist = safe_start + step_len * 0.5;
+    var clear_samples = 0.0;
+    var total_samples = 0.0;
+
+    loop {
+        if (dist >= safe_end || total_samples >= 16.0) {
+            break;
+        }
+        let p = origin + dir_n * dist;
+        let b = block_coord_from_world(p, block_size);
+        total_samples = total_samples + 1.0;
+        if (!solid_at_block(b.x, b.y, b.z)) {
+            clear_samples = clear_samples + 1.0;
+        }
+        dist = dist + step_len;
+    }
+
+    if (total_samples <= 0.0) {
+        return 1.0;
+    }
+    let clear_ratio = clear_samples / total_samples;
+    return smoothstep(0.72, 0.98, clear_ratio);
+}
+
 fn sample_src_world_rc_angular_spatial(index: u32, world_pos: vec3f, resolution: i32, ray_dir: vec3f, active_count: i32, footprint_radius: f32) -> vec4f {
     // Spatially forked interval merge: gather the next cascade over a tiny
     // ray-stable footprint around the interval endpoint, then perform the same
@@ -1700,6 +1805,9 @@ fn sample_src_world_rc_angular_spatial(index: u32, world_pos: vec3f, resolution:
     var rgb_accum = vec3f(0.0, 0.0, 0.0);
     var alpha_accum = 0.0;
     var weight_accum = 0.0;
+    var luma_accum = 0.0;
+    var luma_sq_accum = 0.0;
+    var footprint_weight_accum = 0.0;
 
     for (var tap: i32 = 0; tap < 5; tap = tap + 1) {
         var tap_offset = vec3f(0.0, 0.0, 0.0);
@@ -1723,16 +1831,84 @@ fn sample_src_world_rc_angular_spatial(index: u32, world_pos: vec3f, resolution:
         if (a <= 0.0001) {
             continue;
         }
+        let safe_rgb = rc_clamp_luma(probe.rgb, RC_FAR_MERGE_MAX_LUMA);
+        let tap_luma = rc_luma(safe_rgb);
         let w = tap_weight * a;
-        rgb_accum = rgb_accum + probe.rgb * w;
+        rgb_accum = rgb_accum + safe_rgb * w;
         alpha_accum = alpha_accum + a * tap_weight;
         weight_accum = weight_accum + w;
+        luma_accum = luma_accum + tap_luma * tap_weight;
+        luma_sq_accum = luma_sq_accum + tap_luma * tap_luma * tap_weight;
+        footprint_weight_accum = footprint_weight_accum + tap_weight;
     }
 
     if (weight_accum <= 0.0001) {
         return vec4f(0.0, 0.0, 0.0, 0.0);
     }
-    return vec4f(rgb_accum / weight_accum, saturate(alpha_accum / max(0.0001, 0.42 + 0.145 * 4.0)));
+
+    // Ringing guard: if the spatial fork footprint contains very different
+    // radiance values, reduce confidence instead of letting one hot/dark tap
+    // create a hard bright/dark ring at the cascade transition.
+    let mean_luma = luma_accum / max(footprint_weight_accum, 0.0001);
+    let mean_luma_sq = luma_sq_accum / max(footprint_weight_accum, 0.0001);
+    let luma_variance = max(0.0, mean_luma_sq - mean_luma * mean_luma);
+    let ringing_stability = mix(
+        1.0,
+        RC_FAR_MERGE_MIN_STABILITY,
+        saturate(luma_variance * RC_FAR_MERGE_RINGING_VARIANCE_SCALE),
+    );
+    let alpha = saturate(alpha_accum / max(0.0001, 0.42 + 0.145 * 4.0)) * ringing_stability;
+    return vec4f(rgb_accum / weight_accum, alpha);
+}
+
+fn rough_diffuse_feedback_response(normal: vec3f, incoming_dir: vec3f, outgoing_dir: vec3f) -> f32 {
+    let n = normalize(normal);
+    let l = normalize(incoming_dir);
+    let v = normalize(outgoing_dir);
+    let ndotl_front = saturate(dot(n, l));
+    let ndotl_back = saturate(dot(n, -l)) * 0.18;
+    let ndotl = max(ndotl_front, ndotl_back);
+    let ndotv = max(saturate(dot(n, v)), 0.08);
+    let lt = l - n * dot(n, l);
+    let vt = v - n * dot(n, v);
+    let lt_len = length(lt);
+    let vt_len = length(vt);
+    var side_scatter = 0.0;
+    if (lt_len > 0.0001 && vt_len > 0.0001) {
+        side_scatter = max(0.0, dot(lt / lt_len, vt / vt_len));
+    }
+    let wrapped = saturate((dot(n, l) + 0.35) / 1.35) * 0.22;
+    let rough_energy = 0.84 + 0.16 * side_scatter;
+    return clamp(max(ndotl, wrapped) * (0.72 + 0.28 * ndotv) * rough_energy, 0.0, 1.0);
+}
+
+fn sample_src_world_rc_bounce(index: u32, world_pos: vec3f, normal: vec3f, outgoing_dir: vec3f, resolution: i32, active_count: i32) -> vec3f {
+    // Previous-frame multi-bounce estimate for a hit surface. This samples the
+    // directional RC history at the hit point and integrates it with a rough
+    // diffuse response toward the outgoing ray direction. The caller gates it
+    // with temporal history validity so moved cascades do not smear stale light.
+    let count = clamp(active_count, 1, RC_DIRECTION_COUNT);
+    var accum = vec3f(0.0, 0.0, 0.0);
+    var weight_accum = 0.0;
+    for (var slot: i32 = 0; slot < RC_DIRECTION_COUNT; slot = slot + 1) {
+        if (slot >= count) {
+            continue;
+        }
+        let probe = sample_src_world_rc_dir(index, world_pos, resolution, slot);
+        let a = saturate(probe.a);
+        if (a <= 0.0001) {
+            continue;
+        }
+        let incoming_dir = rc_direction_basis(slot, count);
+        let response = rough_diffuse_feedback_response(normal, incoming_dir, outgoing_dir);
+        let w = a * response;
+        accum = accum + probe.rgb * w;
+        weight_accum = weight_accum + w;
+    }
+    if (weight_accum <= 0.0001) {
+        return vec3f(0.0, 0.0, 0.0);
+    }
+    return accum / max(f32(count) * 0.35, 1.0);
 }
 
 fn sample_src_world_rc_vis(index: u32, world_pos: vec3f, resolution: i32) -> vec4f {
@@ -1951,14 +2127,15 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let color = material_rgb(material);
                 var facing = 1.0;
                 var sky_visibility = far_hit_sky_visibility;
-                var open_hemi = pow(max(0.0, -dir.y), 1.5);
-                var sun_term = max(0.0, -dot(dir, sun_dir));
+                var hit_normal = normalize(-dir);
+                var open_hemi = pow(max(0.0, hit_normal.y), 1.5);
+                var sun_term = max(0.0, dot(hit_normal, sun_dir));
                 if (!cheap_hit_shading) {
-                    let n = estimate_hit_normal(b.x, b.y, b.z, dir);
-                    facing = saturate(-dot(n, dir));
-                    sun_term = max(0.0, dot(n, sun_dir));
+                    hit_normal = estimate_hit_normal(b.x, b.y, b.z, dir);
+                    facing = saturate(-dot(hit_normal, dir));
+                    sun_term = max(0.0, dot(hit_normal, sun_dir));
                     sky_visibility = sky_visibility_at_block(b.x, b.y, b.z);
-                    open_hemi = pow(max(0.0, n.y), 1.5);
+                    open_hemi = pow(max(0.0, hit_normal.y), 1.5);
                 }
 
                 let sky_open = saturate(sky_visibility);
@@ -1971,10 +2148,20 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let range_term = 0.30 + 0.70 * falloff;
                 let facing_term = 0.40 + 0.60 * facing;
                 let bounce_scale = (indirect_floor + occluded_bounce + ambient_sky + direct_sun) * range_term * facing_term;
-                let hit_radiance = color * bounce_scale;
+                let hit_slot = rc_direction_slot(dir, active_dir_count);
+                let local_direction_history = saturate(dir_opacity[hit_slot] / expected_samples_per_direction);
+                let feedback_transmittance_gate = 1.0 - local_direction_history * 0.65;
+                let outgoing_to_probe = normalize(-dir);
+                let hit_feedback_pos = sample_pos + hit_normal * (block_size * 0.75);
+                let history_gate = saturate(rc.light_dir.w);
+                let previous_bounce_raw = sample_src_world_rc_bounce(cascade_index, hit_feedback_pos, hit_normal, outgoing_to_probe, resolution_i, active_dir_count);
+                let previous_bounce = rc_clamp_luma(previous_bounce_raw, RC_FEEDBACK_MAX_LUMA);
+                let bounced_radiance_raw = previous_bounce * color * RC_BOUNCE_FEEDBACK_STRENGTH * history_gate * feedback_transmittance_gate * (0.25 + 0.75 * range_term) * (0.35 + 0.65 * facing);
+                let bounced_radiance = rc_clamp_luma(bounced_radiance_raw, RC_FEEDBACK_MAX_LUMA);
+                let direct_hit_radiance = rc_clamp_luma(color * bounce_scale, RC_INTERVAL_MAX_LUMA);
+                let hit_radiance = rc_clamp_luma(direct_hit_radiance + bounced_radiance, RC_INTERVAL_MAX_LUMA);
                 accum = accum + hit_radiance;
                 let hit_energy = max(max(hit_radiance.r, hit_radiance.g), hit_radiance.b) * (0.35 + 0.65 * facing);
-                let hit_slot = rc_direction_slot(dir, active_dir_count);
                 dir_buckets[hit_slot] = dir_buckets[hit_slot] + hit_radiance;
                 let hit_interval_opacity = saturate((0.35 + 0.65 * facing) * (0.35 + 0.65 * (1.0 - interval_t)));
                 dir_opacity[hit_slot] = dir_opacity[hit_slot] + hit_interval_opacity;
@@ -1999,13 +2186,24 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let far_footprint_radius = max(block_size * 1.5, interval_length * mix(0.030, 0.055, f32(current_cascade) / 3.0));
                 let far_probe = sample_src_world_rc_angular_spatial(current_cascade + 1u, merge_world_pos, resolution_i, dir, far_active_dir_count, far_footprint_radius);
                 let far_vis = sample_src_world_rc_vis(current_cascade + 1u, merge_world_pos, resolution_i);
-                let far_conf = saturate(far_probe.a);
-                if (far_conf > 0.035) {
-                    let far_sky_open = saturate(far_vis.w);
-                    let merge_scale = mix(0.72, 0.40, f32(current_cascade) / 3.0);
+                let local_merge_visibility = local_interval_visibility(
+                    origin,
+                    dir,
+                    interval_start + block_size * 0.35,
+                    interval_end + step_size * 0.25,
+                    block_size,
+                );
+                let visibility_gate = smoothstep(0.10, 0.96, local_merge_visibility);
+                let far_conf = smoothstep(0.025, 0.22, saturate(far_probe.a)) * visibility_gate;
+                if (far_conf > 0.020) {
+                    let far_sky_open = saturate(far_vis.w) * visibility_gate;
+                    let merge_scale = mix(0.66, 0.36, f32(current_cascade) / 3.0);
                     let local_interval_opacity = saturate(dir_opacity[current_merge_slot] / expected_samples_per_direction);
-                    let interval_transmittance = 1.0 - local_interval_opacity;
-                    let merged_radiance = far_probe.rgb * far_conf * merge_scale * interval_transmittance;
+                    let open_interval = 1.0 - local_interval_opacity;
+                    let continuity_feather = clamp(RC_MERGE_CONTINUITY_FEATHER, 0.04, 0.48);
+                    let interval_transmittance = smootherstep01(smoothstep(0.04, 0.92, open_interval)) * visibility_gate;
+                    let continuity_gate = smoothstep(0.0, continuity_feather, interval_transmittance);
+                    let merged_radiance = rc_clamp_luma(far_probe.rgb * far_conf * merge_scale * interval_transmittance * continuity_gate, RC_FAR_MERGE_MAX_LUMA);
                     accum = accum + merged_radiance;
                     dir_buckets[current_merge_slot] = dir_buckets[current_merge_slot] + merged_radiance;
                     dir_opacity[current_merge_slot] = dir_opacity[current_merge_slot] + far_conf * interval_transmittance * 0.70;
@@ -2023,7 +2221,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 // softer contribution so open terrain and cave mouths do not fall off
                 // into black while avoiding the harsh cave-mouth hotspots.
                 let sky_fill = mix(0.08, 0.13, saturate(origin_sky_visibility));
-                let sky_radiance = sky_rgb * sky_ray_weight * sky_fill;
+                let sky_radiance = rc_clamp_luma(sky_rgb * sky_ray_weight * sky_fill, RC_INTERVAL_MAX_LUMA);
                 accum = accum + sky_radiance;
                 let sky_slot = rc_direction_slot(dir, active_dir_count);
                 dir_buckets[sky_slot] = dir_buckets[sky_slot] + sky_radiance;
@@ -2078,12 +2276,12 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
         let previous_alpha = saturate(previous.a) * active_scale;
         let has_history = temporal_history_weight > 0.5 && previous_alpha > 0.001 && traced_alpha > 0.001;
         let new_weight = select(1.0, RC_TEMPORAL_ALPHA, has_history);
-        let temporal_rgb = mix(previous.rgb, traced_rgb, new_weight);
+        let temporal_rgb = rc_clamp_luma(mix(previous.rgb, traced_rgb, new_weight), RC_INTERVAL_MAX_LUMA);
         let temporal_alpha = max(traced_alpha, mix(previous_alpha, traced_alpha, new_weight));
         textureStore(
             dst_volume,
             vec3i(coord.x + store_slot * resolution_i, coord.y, coord.z),
-            vec4f(max(temporal_rgb, vec3f(0.0, 0.0, 0.0)), temporal_alpha),
+            vec4f(temporal_rgb, temporal_alpha),
         );
     }
     textureStore(dst_visibility, coord, out_descriptor);
@@ -2123,6 +2321,17 @@ fn normalize_direction_descriptor(v: vec4f) -> vec4f {
     let len_v = length(v.xyz);
     let dir = select(vec3f(0.0, 1.0, 0.0), v.xyz / max(len_v, 0.0001), len_v > 0.0001);
     return vec4f(dir * saturate(len_v), saturate(v.w));
+}
+
+fn filter_rc_luma(rgb: vec3f) -> f32 {
+    return dot(max(rgb, vec3f(0.0, 0.0, 0.0)), vec3f(0.2126, 0.7152, 0.0722));
+}
+
+fn filter_clamp_luma(rgb: vec3f, max_luma: f32) -> vec3f {
+    let safe_rgb = max(rgb, vec3f(0.0, 0.0, 0.0));
+    let luma = filter_rc_luma(safe_rgb);
+    let scale = min(1.0, max_luma / max(luma, 0.0001));
+    return safe_rgb * scale;
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -2237,7 +2446,7 @@ fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
 
         filtered_volume = filtered_volume / max(volume_weight, 0.0001);
         var out_volume = raw_volume * (1.0 - directional_filter_gate) + filtered_volume * directional_filter_gate;
-        out_volume = vec4f(max(out_volume.rgb, vec3f(0.0, 0.0, 0.0)), clamp(out_volume.a, 0.0, 1.0));
+        out_volume = vec4f(filter_clamp_luma(out_volume.rgb, 1.15), clamp(out_volume.a, 0.0, 1.0));
         textureStore(dst_volume, atlas_coord, out_volume);
     }
 
@@ -2253,6 +2462,8 @@ WORLDSPACE_RC_TRACE_SHADER = (
     .replace("__SKY_VISIBILITY_APERTURE_POWER__", f"{float(render_consts.WORLDSPACE_RC_SKY_VISIBILITY_APERTURE_POWER):.8f}")
     .replace("__SKY_VISIBILITY_MIN_APERTURE__", f"{float(render_consts.WORLDSPACE_RC_SKY_VISIBILITY_MIN_APERTURE):.8f}")
     .replace("__RC_TEMPORAL_ALPHA__", f"{float(render_consts.WORLDSPACE_RC_TEMPORAL_BLEND_ALPHA):.8f}")
+    .replace("__RC_BOUNCE_FEEDBACK_STRENGTH__", f"{float(getattr(render_consts, 'WORLDSPACE_RC_BOUNCE_FEEDBACK_STRENGTH', 0.18)):.8f}")
+    .replace("__RC_MERGE_CONTINUITY_FEATHER__", f"{float(getattr(render_consts, 'WORLDSPACE_RC_MERGE_CONTINUITY_FEATHER', 0.22)):.8f}")
 )
 
 
