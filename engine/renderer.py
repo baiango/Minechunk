@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import math
 import os
+import struct
 import time
 import sys
+import zlib
 from collections import OrderedDict, deque
 
 import numpy as np
@@ -197,6 +199,9 @@ class TerrainRenderer:
             "rc radiance",
             "rc light",
         )
+        self._pending_rc_debug_capture_request: dict | None = None
+        self._pending_rc_debug_readbacks: list[dict] = []
+        self._worldspace_rc_last_capture_paths: list[str] = []
         self.final_present_enabled = True
         self._postprocess_size = (0, 0)
         self.postprocess_msaa_sample_count = 4 if int(POSTPROCESS_MSAA_SAMPLE_COUNT) > 1 else 1
@@ -210,6 +215,7 @@ class TerrainRenderer:
         self.scene_gbuffer_msaa_view = None
         self.gi_color_texture = None
         self.gi_color_view = None
+        self._gi_color_size = (0, 0)
         self.gi_cascade_textures = []
         self.gi_cascade_views = []
         self.gi_cascade_param_buffers = []
@@ -1227,6 +1233,7 @@ class TerrainRenderer:
         self.scene_gbuffer_msaa_view = None
         self.gi_color_texture = None
         self.gi_color_view = None
+        self._gi_color_size = (0, 0)
         self.gi_cascade_textures = []
         self.gi_cascade_views = []
         self.gi_cascade_param_buffers = []
@@ -1290,6 +1297,7 @@ class TerrainRenderer:
             print(f"Info: RC debug mode = {self.rc_debug_mode} ({self.rc_debug_mode_names[self.rc_debug_mode]})")
         if is_new_press and key == "f7":
             self._dump_worldspace_rc_diagnostics()
+            self._queue_worldspace_rc_debug_image_dump()
         if is_new_press and key == "space":
             self._jump_queued = True
 
@@ -2289,23 +2297,26 @@ class TerrainRenderer:
             file=sys.stderr,
         )
 
-    def _write_gi_params(self) -> None:
-        if self.gi_params_buffer is None:
-            return
+    def _make_gi_params(self, rc_debug_mode: int | None = None) -> np.ndarray:
         # merge_control.x is used by the world-space RC compose shader as a
         # lightweight debug visualization mode. The legacy screen-space cascade
         # pass is not submitted in the current WGPU RC path.
-        gi_params = np.array([
+        debug_mode = int(self.rc_debug_mode if rc_debug_mode is None else rc_debug_mode)
+        return np.array([
             float(RADIANCE_CASCADES_STRENGTH),
             float(RADIANCE_CASCADES_BIAS),
             float(RADIANCE_CASCADES_SKY_STRENGTH),
             float(RADIANCE_CASCADES_HIT_THICKNESS),
-            float(self.rc_debug_mode),
+            float(debug_mode),
             float(RADIANCE_CASCADES_MERGE_STRENGTH),
             float(RADIANCE_CASCADES_CASCADE_COUNT),
             float(WORLDSPACE_RC_GRID_RESOLUTION),
         ], dtype=np.float32)
-        self.device.queue.write_buffer(self.gi_params_buffer, 0, gi_params.tobytes())
+
+    def _write_gi_params(self) -> None:
+        if self.gi_params_buffer is None:
+            return
+        self.device.queue.write_buffer(self.gi_params_buffer, 0, self._make_gi_params().tobytes())
 
     def _ensure_postprocess_targets(self) -> None:
         width, height = self.canvas.get_physical_size()
@@ -2381,6 +2392,7 @@ class TerrainRenderer:
             usage=texture_usage,
         )
         self.gi_color_view = self.gi_color_texture.create_view()
+        self._gi_color_size = (gi_target_size[0], gi_target_size[1])
         worldspace_resolution = max(4, int(WORLDSPACE_RC_GRID_RESOLUTION))
         worldspace_direction_count = max(1, int(WORLDSPACE_RC_DIRECTION_COUNT))
         worldspace_radiance_width = worldspace_resolution * worldspace_direction_count
@@ -2723,6 +2735,247 @@ class TerrainRenderer:
             print(f"Info: RC diagnostics snapshot written to {path}", file=sys.stderr)
         except Exception as exc:
             print(f"Warning: failed to write RC diagnostics snapshot: {exc!r}", file=sys.stderr)
+
+    def _safe_rc_debug_filename_component(self, value: str) -> str:
+        text = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value).strip())
+        text = "_".join(part for part in text.split("_") if part)
+        return text or "mode"
+
+    def _queue_worldspace_rc_debug_image_dump(self) -> None:
+        """Queue one-shot PNG captures for every RC compose debug mode."""
+        try:
+            out_dir = os.path.join(os.getcwd(), "rc_diagnostics")
+            os.makedirs(out_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            frame = int(getattr(self, "_worldspace_rc_frame_index", 0))
+            mode_count = max(1, len(tuple(getattr(self, "rc_debug_mode_names", ("off",)))))
+            self._pending_rc_debug_capture_request = {
+                "out_dir": out_dir,
+                "stamp": stamp,
+                "frame": frame,
+                "modes": list(range(mode_count)),
+            }
+            self._worldspace_rc_last_snapshot_path = os.path.join(out_dir, f"rc_debug_images_{stamp}_frame_{frame}")
+            print(
+                f"Info: queued RC debug PNG capture for {mode_count} mode(s) into {out_dir}",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(f"Warning: failed to queue RC debug PNG capture: {exc!r}", file=sys.stderr)
+
+    def _align_copy_bytes_per_row(self, unpadded_bytes_per_row: int) -> int:
+        alignment = 256
+        return ((max(1, int(unpadded_bytes_per_row)) + alignment - 1) // alignment) * alignment
+
+    def _encode_pending_rc_debug_captures(self, encoder) -> None:
+        request = self._pending_rc_debug_capture_request
+        if request is None:
+            return
+        self._pending_rc_debug_capture_request = None
+        if not self.radiance_cascades_enabled:
+            print("Warning: F7 RC debug PNG capture skipped because radiance cascades are disabled.", file=sys.stderr)
+            return
+        if (
+            self.gi_compose_pipeline is None
+            or self.gi_compose_bind_group_layout is None
+            or self.scene_color_view is None
+            or self.scene_gbuffer_view is None
+            or self.postprocess_sampler is None
+            or self.camera_buffer is None
+            or self.worldspace_rc_volume_params_buffer is None
+            or len(self.worldspace_rc_views) < 4
+            or len(self.worldspace_rc_visibility_views) < 4
+        ):
+            print("Warning: F7 RC debug PNG capture skipped because RC compose resources are not ready.", file=sys.stderr)
+            return
+
+        width, height = (int(self._gi_color_size[0]), int(self._gi_color_size[1]))
+        if width <= 0 or height <= 0:
+            print("Warning: F7 RC debug PNG capture skipped because the GI target has no size.", file=sys.stderr)
+            return
+
+        mode_names = tuple(getattr(self, "rc_debug_mode_names", ("off",)))
+        modes = [int(mode) for mode in request.get("modes", [])]
+        out_dir = str(request.get("out_dir", os.path.join(os.getcwd(), "rc_diagnostics")))
+        stamp = str(request.get("stamp", time.strftime("%Y%m%d_%H%M%S")))
+        frame = int(request.get("frame", getattr(self, "_worldspace_rc_frame_index", 0)))
+        bytes_per_pixel = 8 if POSTPROCESS_GI_FORMAT == "rgba16float" else 4
+        unpadded_bpr = width * bytes_per_pixel
+        padded_bpr = self._align_copy_bytes_per_row(unpadded_bpr)
+        readback_size = padded_bpr * height
+        encoded_count = 0
+
+        for mode in modes:
+            if mode < 0 or mode >= len(mode_names):
+                continue
+            mode_name = mode_names[mode]
+            mode_slug = self._safe_rc_debug_filename_component(mode_name)
+            path = os.path.join(out_dir, f"rc_debug_{stamp}_frame_{frame:06d}_{mode:02d}_{mode_slug}.png")
+            params_buffer = self.device.create_buffer(
+                size=32,
+                usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+            )
+            self.device.queue.write_buffer(params_buffer, 0, self._make_gi_params(mode).tobytes())
+            capture_texture = self.device.create_texture(
+                size=(width, height, 1),
+                format=POSTPROCESS_GI_FORMAT,
+                usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC,
+            )
+            capture_view = capture_texture.create_view()
+            capture_bind_group = self.device.create_bind_group(
+                layout=self.gi_compose_bind_group_layout,
+                entries=[
+                    {"binding": 0, "resource": self.scene_color_view},
+                    {"binding": 1, "resource": self.scene_gbuffer_view},
+                    {"binding": 2, "resource": self.worldspace_rc_views[0]},
+                    {"binding": 3, "resource": self.worldspace_rc_views[1]},
+                    {"binding": 4, "resource": self.worldspace_rc_views[2]},
+                    {"binding": 5, "resource": self.worldspace_rc_views[3]},
+                    {"binding": 6, "resource": self.worldspace_rc_visibility_views[0]},
+                    {"binding": 7, "resource": self.worldspace_rc_visibility_views[1]},
+                    {"binding": 8, "resource": self.worldspace_rc_visibility_views[2]},
+                    {"binding": 9, "resource": self.worldspace_rc_visibility_views[3]},
+                    {"binding": 10, "resource": self.postprocess_sampler},
+                    {"binding": 11, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+                    {"binding": 12, "resource": {"buffer": params_buffer, "offset": 0, "size": 32}},
+                    {"binding": 13, "resource": {"buffer": self.worldspace_rc_volume_params_buffer, "offset": 0, "size": 256}},
+                ],
+            )
+            capture_pass = encoder.begin_render_pass(
+                color_attachments=[
+                    {
+                        "view": capture_view,
+                        "resolve_target": None,
+                        "clear_value": (0.0, 0.0, 0.0, 1.0),
+                        "load_op": wgpu.LoadOp.clear,
+                        "store_op": wgpu.StoreOp.store,
+                    }
+                ],
+            )
+            capture_pass.set_pipeline(self.gi_compose_pipeline)
+            capture_pass.set_bind_group(0, capture_bind_group)
+            capture_pass.draw(3, 1, 0, 0)
+            capture_pass.end()
+
+            readback_buffer = self.device.create_buffer(
+                size=readback_size,
+                usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ,
+            )
+            encoder.copy_texture_to_buffer(
+                {"texture": capture_texture, "mip_level": 0, "origin": (0, 0, 0)},
+                {"buffer": readback_buffer, "offset": 0, "bytes_per_row": padded_bpr, "rows_per_image": height},
+                (width, height, 1),
+            )
+            self._pending_rc_debug_readbacks.append(
+                {
+                    "path": path,
+                    "width": width,
+                    "height": height,
+                    "format": POSTPROCESS_GI_FORMAT,
+                    "bytes_per_pixel": bytes_per_pixel,
+                    "unpadded_bpr": unpadded_bpr,
+                    "padded_bpr": padded_bpr,
+                    "size": readback_size,
+                    "buffer": readback_buffer,
+                    "texture": capture_texture,
+                    "params_buffer": params_buffer,
+                    "bind_group": capture_bind_group,
+                }
+            )
+            encoded_count += 1
+
+        if encoded_count > 0:
+            print(f"Info: encoded F7 RC debug PNG captures for {encoded_count} mode(s).", file=sys.stderr)
+
+    def _png_chunk(self, chunk_type: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + chunk_type
+            + payload
+            + struct.pack(">I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
+        )
+
+    def _write_rgba8_png(self, path: str, rgba: np.ndarray) -> None:
+        rgba = np.ascontiguousarray(rgba, dtype=np.uint8)
+        height, width, channels = rgba.shape
+        if channels != 4:
+            raise ValueError(f"expected RGBA8 image with 4 channels, got {channels}")
+        scanlines = bytearray()
+        for y in range(height):
+            scanlines.append(0)
+            scanlines.extend(rgba[y].tobytes())
+        payload = b"\x89PNG\r\n\x1a\n"
+        payload += self._png_chunk(
+            b"IHDR",
+            struct.pack(">IIBBBBB", int(width), int(height), 8, 6, 0, 0, 0),
+        )
+        payload += self._png_chunk(b"IDAT", zlib.compress(bytes(scanlines), level=4))
+        payload += self._png_chunk(b"IEND", b"")
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(payload)
+
+    def _readback_to_rgba8(self, mapped, *, width: int, height: int, texture_format: str, padded_bpr: int) -> np.ndarray:
+        if texture_format == "rgba16float":
+            row_pixels = padded_bpr // 8
+            values = np.frombuffer(mapped, dtype=np.float16, count=(padded_bpr * height) // 2)
+            image_f16 = values.reshape((height, row_pixels, 4))[:, :width, :]
+            image_f32 = np.nan_to_num(image_f16.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
+            rgb = np.clip(image_f32[:, :, 0:3], 0.0, 1.0)
+            alpha = np.clip(image_f32[:, :, 3:4], 0.0, 1.0)
+            out = np.empty((height, width, 4), dtype=np.uint8)
+            out[:, :, 0:3] = (rgb * 255.0 + 0.5).astype(np.uint8)
+            out[:, :, 3:4] = (alpha * 255.0 + 0.5).astype(np.uint8)
+            return out
+        if texture_format == "rgba8unorm":
+            raw = np.frombuffer(mapped, dtype=np.uint8, count=padded_bpr * height)
+            rows = raw.reshape((height, padded_bpr))[:, : width * 4]
+            return rows.reshape((height, width, 4)).copy()
+        raise ValueError(f"unsupported screenshot texture format: {texture_format!r}")
+
+    def _drain_pending_rc_debug_readbacks(self) -> None:
+        if not self._pending_rc_debug_readbacks:
+            return
+        pending = self._pending_rc_debug_readbacks
+        self._pending_rc_debug_readbacks = []
+        saved_paths: list[str] = []
+        for item in pending:
+            buffer = item.get("buffer")
+            path = str(item.get("path", ""))
+            try:
+                size = int(item.get("size", 0))
+                if getattr(buffer, "map_state", "unmapped") != "unmapped":
+                    buffer.unmap()
+                buffer.map_sync(wgpu.MapMode.READ, 0, size)
+                try:
+                    mapped = buffer.read_mapped(0, size, copy=False)
+                    rgba = self._readback_to_rgba8(
+                        mapped,
+                        width=int(item["width"]),
+                        height=int(item["height"]),
+                        texture_format=str(item["format"]),
+                        padded_bpr=int(item["padded_bpr"]),
+                    )
+                finally:
+                    if getattr(buffer, "map_state", "unmapped") != "unmapped":
+                        buffer.unmap()
+                self._write_rgba8_png(path, rgba)
+                saved_paths.append(path)
+            except Exception as exc:
+                print(f"Warning: failed to save F7 RC debug PNG {path!r}: {exc!r}", file=sys.stderr)
+            finally:
+                for resource_name in ("buffer", "texture", "params_buffer"):
+                    resource = item.get(resource_name)
+                    destroy = getattr(resource, "destroy", None)
+                    if callable(destroy):
+                        try:
+                            destroy()
+                        except Exception:
+                            pass
+        if saved_paths:
+            self._worldspace_rc_last_capture_paths = saved_paths
+            self._worldspace_rc_last_snapshot_path = os.path.dirname(saved_paths[0])
+            print(f"Info: saved {len(saved_paths)} F7 RC debug PNG(s) into {os.path.dirname(saved_paths[0])}", file=sys.stderr)
 
     def _make_worldspace_rc_update_params(
         self,
@@ -3156,6 +3409,8 @@ class TerrainRenderer:
                 gi_compose_pass.draw(3, 1, 0, 0)
                 gi_compose_pass.end()
 
+            self._encode_pending_rc_debug_captures(encoder)
+
             if self.final_present_enabled:
                 if self.radiance_cascades_enabled:
                     source_bind_group = self.final_gi_bind_group
@@ -3329,6 +3584,7 @@ class TerrainRenderer:
             queue_submit_start = time.perf_counter()
             self.device.queue.submit([command_buffer])
             queue_submit_ms = (time.perf_counter() - queue_submit_start) * 1000.0
+            self._drain_pending_rc_debug_readbacks()
 
             self.pipeline.service_background_gpu_work()
             _, chunk_stream_ms = self.pipeline.prepare_chunks(dt)
