@@ -2628,6 +2628,30 @@ class TerrainRenderer:
             dtype=np.float32,
         )
 
+    def _write_worldspace_rc_volume_params_for_schedule(
+        self,
+        target_mins: list[tuple[float, float, float]],
+        target_inv_extents: list[tuple[float, float, float]],
+        scheduled_updates: set[int] | None = None,
+    ) -> None:
+        if self.worldspace_rc_volume_params_buffer is None:
+            return
+        scheduled_updates = scheduled_updates or set()
+        params = np.zeros((8, 4), dtype=np.float32)
+        for cascade_index in range(4):
+            if cascade_index in scheduled_updates:
+                params[cascade_index, 0:3] = target_mins[cascade_index]
+                params[4 + cascade_index, 0:3] = target_inv_extents[cascade_index]
+                continue
+
+            if self._worldspace_rc_active_signatures[cascade_index] is not None:
+                params[cascade_index, 0:3] = self._worldspace_rc_active_mins[cascade_index]
+                params[4 + cascade_index, 0:3] = self._worldspace_rc_active_inv_extents[cascade_index]
+            else:
+                params[cascade_index, 0:3] = target_mins[cascade_index]
+                params[4 + cascade_index, 0:3] = target_inv_extents[cascade_index]
+        self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, params.tobytes())
+
     @profile
     def _update_worldspace_radiance_cascades(self, encoder) -> None:
         if (
@@ -2673,11 +2697,7 @@ class TerrainRenderer:
             stable_refresh_indices = [self._worldspace_rc_update_cursor]
 
         if not dirty_indices and not stable_refresh_indices:
-            params = np.zeros((8, 4), dtype=np.float32)
-            for cascade_index in range(4):
-                params[cascade_index, 0:3] = self._worldspace_rc_active_mins[cascade_index]
-                params[4 + cascade_index, 0:3] = self._worldspace_rc_active_inv_extents[cascade_index]
-            self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, params.tobytes())
+            self._write_worldspace_rc_volume_params_for_schedule(target_mins, target_inv_extents, set())
             return
 
         if dirty_indices and any(sig is None for sig in self._worldspace_rc_active_signatures):
@@ -2695,10 +2715,20 @@ class TerrainRenderer:
             (resolution + 3) // 4,
         )
         update_candidates = dirty_indices if dirty_indices else stable_refresh_indices
-        search_order = [((self._worldspace_rc_update_cursor + offset) % 4) for offset in range(4)]
+        if dirty_indices:
+            # Real RC interval merge wants far cascades available before near
+            # cascades trace and fork into them. Updating C3 -> C2 -> C1 -> C0
+            # prevents C0 from merging stale C1/C2/C3 fields after camera motion.
+            search_order = [i for i in (3, 2, 1, 0) if i in update_candidates]
+        else:
+            # Stable refresh also walks far-to-near over time, so temporal
+            # convergence feeds the next closer interval on following frames.
+            cursor = int(self._worldspace_rc_update_cursor)
+            search_order = [cursor]
+        scheduled_updates = set(search_order[:max_updates])
+        self._write_worldspace_rc_volume_params_for_schedule(target_mins, target_inv_extents, scheduled_updates)
+
         for cascade_index in search_order:
-            if cascade_index not in update_candidates:
-                continue
             base_frame_stride = max(1, int(WORLDSPACE_RC_UPDATE_FRAME_INTERVAL))
             # Keep every cascade spatially current while moving. Staggering farther
             # cascades makes open-sky terrain sample old/out-of-range volumes for
@@ -2752,17 +2782,13 @@ class TerrainRenderer:
             self._worldspace_rc_active_mins[cascade_index] = target_mins[cascade_index]
             self._worldspace_rc_active_inv_extents[cascade_index] = target_inv_extents[cascade_index]
             self._worldspace_rc_last_update_frame[cascade_index] = self._worldspace_rc_frame_index
-            self._worldspace_rc_update_cursor = (cascade_index + 1) % 4
+            self._worldspace_rc_update_cursor = (cascade_index - 1) % 4
             updates_done += 1
             updated_any = True
             if updates_done >= max_updates:
                 break
 
-        params = np.zeros((8, 4), dtype=np.float32)
-        for cascade_index in range(4):
-            params[cascade_index, 0:3] = self._worldspace_rc_active_mins[cascade_index]
-            params[4 + cascade_index, 0:3] = self._worldspace_rc_active_inv_extents[cascade_index]
-        self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, params.tobytes())
+        self._write_worldspace_rc_volume_params_for_schedule(target_mins, target_inv_extents, set())
 
         if updated_any:
             signature_parts: list[float] = []
