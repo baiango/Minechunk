@@ -76,3 +76,14 @@ This pass targets the remaining high-risk renderer concentration: setup code and
 - `engine/collision/walk_solver.py` now also owns free-fly camera motion, so camera update behavior is fully outside the renderer.
 
 `TerrainRenderer` is now mostly an orchestration shell: device/world bootstrap, runtime state fields, resize invalidation, backend diagnostics, small camera helpers, and the draw-frame loop. The extracted modules still mutate renderer state for compatibility, but the biggest remaining monolith—the renderer class—is now small enough to audit by eye.
+
+## One-pass split 4: shader assets instead of Python shader dumps
+
+This pass removes the largest non-runtime blob from Python source. `engine/render_shaders.py` is now a small shader loader and token-substitution module instead of a 3.5k-line pile of embedded WGSL strings.
+
+- `engine/shader_loader.py` owns cached loading of checked-in shader assets.
+- `engine/shaders/*.wgsl` now stores render, GI, world-space RC, voxel meshing, visibility, HUD, blit, and postprocess shader source.
+- `engine/shaders/terrain_surface.wgsl` and `engine/shaders/terrain_surface.metal` now store the WGPU and Metal terrain surface compute shaders.
+- `engine/render_shaders.py` still owns compile-time token replacement for RC/GI constants, so existing renderer code can continue importing the same shader constants.
+
+A hash check against the previous embedded-string module confirmed the exported shader constants are byte-for-byte identical after loading and token replacement. This should make shader diffs, editor highlighting, copy/paste into shader tools, and RC shader debugging much easier without changing the graphics path.

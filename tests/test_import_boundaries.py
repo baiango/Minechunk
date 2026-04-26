@@ -12,6 +12,7 @@ LOW_LEVEL_MODULES = [
     ROOT / "engine" / "profiling_runtime.py",
     ROOT / "engine" / "world_reset.py",
     ROOT / "engine" / "render_contract.py",
+    ROOT / "engine" / "shader_loader.py",
     ROOT / "engine" / "meshing" / "cpu_mesher.py",
     ROOT / "engine" / "meshing" / "gpu_mesher.py",
     ROOT / "engine" / "meshing" / "metal_mesher.py",

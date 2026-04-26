@@ -232,7 +232,8 @@ The checked-in config now uses `ENGINE_MODE_WGPU`. With stacked chunks enabled, 
 - `engine/terrain/backends/wgpu_terrain_backend.py` — WGPU terrain surface backend
 - `engine/terrain/kernels/core.py` — CPU terrain noise, cave carving, and fallback voxel fill kernels
 - `engine/meshing/gpu_mesher.py` — WGPU surface expansion and voxel mesh batching
-- `engine/render_shaders.py` — WGSL render, terrain expansion, meshing, and visibility shaders
+- `engine/render_shaders.py` — Python shader loader/token substitution for checked-in shader assets
+- `engine/shaders/` — WGSL/MSL shader source files for render, terrain, meshing, RC, visibility, HUD, and postprocess passes
 - `engine/pipelines/chunk_pipeline.py` — chunk request queueing, meshing handoff, cache insertion
 - `engine/pipelines/profiling.py` — HUD generation and profiling text
 - `docs/` — screenshots
