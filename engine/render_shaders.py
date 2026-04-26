@@ -740,6 +740,7 @@ const SKY_GROUND: vec3f = vec3f(__SKY_GROUND_R__, __SKY_GROUND_G__, __SKY_GROUND
 const SKY_SUN_GLOW: vec3f = vec3f(__SKY_SUN_R__, __SKY_SUN_G__, __SKY_SUN_B__);
 const SKY_SUN_DIR: vec3f = vec3f(__SKY_SUN_DIR_X__, __SKY_SUN_DIR_Y__, __SKY_SUN_DIR_Z__);
 const PI: f32 = 3.14159265358979323846;
+const RC_DIRECTION_COUNT: i32 = 4;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -838,6 +839,29 @@ fn normalize_direction_descriptor(v: vec4f) -> vec4f {
     let len_v = length(v.xyz);
     let dir = select(vec3f(0.0, 1.0, 0.0), v.xyz / max(len_v, 0.0001), len_v > 0.0001);
     return vec4f(dir * saturate(len_v), saturate(v.w));
+}
+
+fn rc_direction_basis(slot: i32) -> vec3f {
+    // Four tetrahedral angular intervals. This is the first real 3D RC storage
+    // step: each probe stores RGB radiance per angular interval in an X-atlas.
+    if (slot == 0) {
+        return normalize(vec3f(1.0, 1.0, 1.0));
+    } else if (slot == 1) {
+        return normalize(vec3f(-1.0, 1.0, -1.0));
+    } else if (slot == 2) {
+        return normalize(vec3f(-1.0, -1.0, 1.0));
+    }
+    return normalize(vec3f(1.0, -1.0, -1.0));
+}
+
+fn load_world_rc_dir(index: u32, slot: i32, coord: vec3i, resolution: i32) -> vec4f {
+    let atlas_coord = vec3i(coord.x + slot * resolution, coord.y, coord.z);
+    switch (index) {
+        case 0u: { return textureLoad(rc0_tex, atlas_coord, 0); }
+        case 1u: { return textureLoad(rc1_tex, atlas_coord, 0); }
+        case 2u: { return textureLoad(rc2_tex, atlas_coord, 0); }
+        default: { return textureLoad(rc3_tex, atlas_coord, 0); }
+    }
 }
 
 fn safe_normalize3(v: vec3f, fallback: vec3f) -> vec3f {
@@ -955,12 +979,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
                     let wx = select(1.0 - frac.x, frac.x, ox == 1u);
                     let tri_weight = wx * wy * wz;
                     let coord = vec3i(base_x + i32(ox), base_y + i32(oy), base_z + i32(oz));
-                    let probe = load_world_rc(i, coord);
                     let probe_vis = load_world_rc_vis(i, coord);
-                    let probe_alpha = saturate(probe.a);
-                    if (probe_alpha <= 0.0001) {
-                        continue;
-                    }
+                    let sky_access = saturate(probe_vis.w);
 
                     let probe_uvw = vec3f(f32(coord.x), f32(coord.y), f32(coord.z)) / f32(max_index);
                     let probe_world = min_corner + probe_uvw / inv_extent;
@@ -971,34 +991,38 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
                     }
                     let probe_dir = to_probe / probe_dist;
                     let backface = saturate((dot(normal, probe_dir) + PROBE_BACKFACE_SOFTNESS) / (1.0 + PROBE_BACKFACE_SOFTNESS));
-                    let dir_len = length(probe_vis.xyz);
-                    let incoming_dir = select(vec3f(0.0, 1.0, 0.0), probe_vis.xyz / max(dir_len, 0.0001), dir_len > 0.0001);
-                    let sky_access = saturate(probe_vis.w);
-
-                    // v23: visibility now carries a dominant incoming direction
-                    // descriptor: xyz = dominant radiance direction * anisotropy,
-                    // w = hard sky/open confidence. This is closer to directional
-                    // 3D RC than scalar probe lobes, while still using one RGB
-                    // radiance value per probe for this incremental patch.
-                    let directional_anisotropy = saturate(dir_len);
-                    let terrain_roughness = 0.82;
-                    let eon_response = eon_rough_diffuse_response(normal, view_dir, incoming_dir, terrain_roughness, albedo_luma);
-                    let sky_hemi_response = sky_access * upward_surface;
-                    let receiver_response = max(eon_response, sky_hemi_response * 0.62);
-                    let directional_response = clamp(
-                        mix(0.20, 1.08, receiver_response) * mix(0.60, 1.0, directional_anisotropy),
-                        0.075,
-                        1.08,
-                    );
-
-                    let validity = mix(0.10, 1.0, probe_alpha);
+                    let geometric_weight = max(0.18, backface);
                     let open_probe_gate = smoothstep(0.06, 0.55, sky_access);
                     let open_surface_probe_gate = mix(1.0, open_probe_gate, upward_surface);
-                    let geometric_weight = max(0.18, backface);
-                    let structural_weight = tri_weight * geometric_weight * validity * validity * probe_alpha * open_surface_probe_gate;
-                    let exposure_weight = tri_weight * max(0.20, geometric_weight) * validity * probe_alpha * open_surface_probe_gate;
+                    let terrain_roughness = 0.82;
 
-                    cascade_accum = cascade_accum + probe.rgb * structural_weight * directional_response;
+                    var probe_alpha_max = 0.0;
+                    var probe_directional_sum = vec3f(0.0, 0.0, 0.0);
+                    var probe_directional_weight = 0.0;
+                    for (var dir_slot: i32 = 0; dir_slot < RC_DIRECTION_COUNT; dir_slot = dir_slot + 1) {
+                        let dir_probe = load_world_rc_dir(i, dir_slot, coord, resolution);
+                        let dir_alpha = saturate(dir_probe.a);
+                        if (dir_alpha <= 0.0001) {
+                            continue;
+                        }
+                        let incoming_dir = rc_direction_basis(dir_slot);
+                        let eon_response = eon_rough_diffuse_response(normal, view_dir, incoming_dir, terrain_roughness, albedo_luma);
+                        let sky_hemi_response = sky_access * upward_surface * saturate(incoming_dir.y);
+                        let receiver_response = max(eon_response, sky_hemi_response * 0.55);
+                        let directional_response = clamp(mix(0.05, 1.12, receiver_response), 0.0, 1.12);
+                        probe_directional_sum = probe_directional_sum + dir_probe.rgb * dir_alpha * directional_response;
+                        probe_directional_weight = probe_directional_weight + dir_alpha;
+                        probe_alpha_max = max(probe_alpha_max, dir_alpha);
+                    }
+                    if (probe_directional_weight <= 0.0001 || probe_alpha_max <= 0.0001) {
+                        continue;
+                    }
+
+                    let validity = mix(0.10, 1.0, probe_alpha_max);
+                    let structural_weight = tri_weight * geometric_weight * validity * validity * probe_alpha_max * open_surface_probe_gate;
+                    let exposure_weight = tri_weight * max(0.20, geometric_weight) * validity * probe_alpha_max * open_surface_probe_gate;
+
+                    cascade_accum = cascade_accum + probe_directional_sum * structural_weight;
                     cascade_weight_sum = cascade_weight_sum + structural_weight;
                     cascade_sky_access_sum = cascade_sky_access_sum + sky_access * exposure_weight;
                     cascade_sky_access_weight = cascade_sky_access_weight + exposure_weight;
@@ -1152,6 +1176,7 @@ const SKY_VISIBILITY_SIDE_WEIGHT: f32 = __SKY_VISIBILITY_SIDE_WEIGHT__;
 const SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS: i32 = __SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS__;
 const SKY_VISIBILITY_APERTURE_POWER: f32 = __SKY_VISIBILITY_APERTURE_POWER__;
 const SKY_VISIBILITY_MIN_APERTURE: f32 = __SKY_VISIBILITY_MIN_APERTURE__;
+const RC_DIRECTION_COUNT: i32 = 4;
 
 fn saturate(v: f32) -> f32 {
     return clamp(v, 0.0, 1.0);
@@ -1498,6 +1523,30 @@ fn normalize_direction_descriptor(v: vec4f) -> vec4f {
     return vec4f(dir * saturate(len_v), saturate(v.w));
 }
 
+fn rc_direction_basis(slot: i32) -> vec3f {
+    if (slot == 0) {
+        return normalize(vec3f(1.0, 1.0, 1.0));
+    } else if (slot == 1) {
+        return normalize(vec3f(-1.0, 1.0, -1.0));
+    } else if (slot == 2) {
+        return normalize(vec3f(-1.0, -1.0, 1.0));
+    }
+    return normalize(vec3f(1.0, -1.0, -1.0));
+}
+
+fn rc_direction_slot(dir: vec3f) -> i32 {
+    var best_slot = 0;
+    var best_dot = dot(dir, rc_direction_basis(0));
+    for (var slot: i32 = 1; slot < RC_DIRECTION_COUNT; slot = slot + 1) {
+        let d = dot(dir, rc_direction_basis(slot));
+        if (d > best_dot) {
+            best_dot = d;
+            best_slot = slot;
+        }
+    }
+    return best_slot;
+}
+
 fn load_src_world_rc(index: u32, coord: vec3i) -> vec4f {
     switch (index) {
         case 0u: { return textureLoad(rc0_src_tex, coord, 0); }
@@ -1538,6 +1587,38 @@ fn sample_src_world_rc(index: u32, world_pos: vec3f, resolution: i32) -> vec4f {
                 let wx = select(1.0 - frac.x, frac.x, ox == 1u);
                 let coord = vec3i(base_x + i32(ox), base_y + i32(oy), base_z + i32(oz));
                 accum = accum + load_src_world_rc(index, coord) * (wx * wy * wz);
+            }
+        }
+    }
+    return accum;
+}
+
+fn load_src_world_rc_dir(index: u32, slot: i32, coord: vec3i, resolution: i32) -> vec4f {
+    return load_src_world_rc(index, vec3i(coord.x + slot * resolution, coord.y, coord.z));
+}
+
+fn sample_src_world_rc_dir(index: u32, world_pos: vec3f, resolution: i32, slot: i32) -> vec4f {
+    let min_corner = world_rc.volume_min[index].xyz;
+    let inv_extent = world_rc.volume_inv_extent[index].xyz;
+    let uvw = (world_pos - min_corner) * inv_extent;
+    if (uvw.x < 0.0 || uvw.y < 0.0 || uvw.z < 0.0 || uvw.x > 1.0 || uvw.y > 1.0 || uvw.z > 1.0) {
+        return vec4f(0.0, 0.0, 0.0, 0.0);
+    }
+    let max_index = max(resolution - 1, 1);
+    let grid_f = uvw * f32(max_index);
+    let base_x = i32(clamp(floor(grid_f.x), 0.0, f32(max_index - 1)));
+    let base_y = i32(clamp(floor(grid_f.y), 0.0, f32(max_index - 1)));
+    let base_z = i32(clamp(floor(grid_f.z), 0.0, f32(max_index - 1)));
+    let frac = fract(grid_f);
+    var accum = vec4f(0.0);
+    for (var oz: u32 = 0u; oz < 2u; oz = oz + 1u) {
+        let wz = select(1.0 - frac.z, frac.z, oz == 1u);
+        for (var oy: u32 = 0u; oy < 2u; oy = oy + 1u) {
+            let wy = select(1.0 - frac.y, frac.y, oy == 1u);
+            for (var ox: u32 = 0u; ox < 2u; ox = ox + 1u) {
+                let wx = select(1.0 - frac.x, frac.x, ox == 1u);
+                let coord = vec3i(base_x + i32(ox), base_y + i32(oy), base_z + i32(oz));
+                accum = accum + load_src_world_rc_dir(index, slot, coord, resolution) * (wx * wy * wz);
             }
         }
     }
@@ -1715,6 +1796,10 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let direct_sun_scale = select(1.10, 0.62, cheap_hit_shading);
 
     var accum = vec3f(0.0, 0.0, 0.0);
+    var dir_bucket0 = vec3f(0.0, 0.0, 0.0);
+    var dir_bucket1 = vec3f(0.0, 0.0, 0.0);
+    var dir_bucket2 = vec3f(0.0, 0.0, 0.0);
+    var dir_bucket3 = vec3f(0.0, 0.0, 0.0);
     var direction_vector_accum = vec3f(0.0, 0.0, 0.0);
     var direction_energy_accum = 0.0;
     var hit_count = 0.0;
@@ -1766,6 +1851,16 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let hit_radiance = color * bounce_scale;
                 accum = accum + hit_radiance;
                 let hit_energy = max(max(hit_radiance.r, hit_radiance.g), hit_radiance.b) * (0.35 + 0.65 * facing);
+                let hit_slot = rc_direction_slot(dir);
+                if (hit_slot == 0) {
+                    dir_bucket0 = dir_bucket0 + hit_radiance;
+                } else if (hit_slot == 1) {
+                    dir_bucket1 = dir_bucket1 + hit_radiance;
+                } else if (hit_slot == 2) {
+                    dir_bucket2 = dir_bucket2 + hit_radiance;
+                } else {
+                    dir_bucket3 = dir_bucket3 + hit_radiance;
+                }
                 direction_vector_accum = direction_vector_accum + normalize(dir) * hit_energy;
                 direction_energy_accum = direction_energy_accum + hit_energy;
                 hit_sky_visibility_accum = hit_sky_visibility_accum + sky_visibility * (0.35 + 0.65 * facing);
@@ -1782,18 +1877,24 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
             var merged_from_far = false;
             if (current_cascade + 1u < 4u) {
                 let merge_world_pos = origin + dir * (max_distance * 1.05);
-                let far_probe = sample_src_world_rc(current_cascade + 1u, merge_world_pos, resolution_i);
+                let merge_slot = rc_direction_slot(dir);
+                let far_probe = sample_src_world_rc_dir(current_cascade + 1u, merge_world_pos, resolution_i, merge_slot);
                 let far_vis = sample_src_world_rc_vis(current_cascade + 1u, merge_world_pos, resolution_i);
                 let far_conf = saturate(far_probe.a);
                 if (far_conf > 0.035) {
-                    let far_dir_len = length(far_vis.xyz);
-                    let far_dir = select(dir, far_vis.xyz / max(far_dir_len, 0.0001), far_dir_len > 0.0001);
-                    let far_directional_response = clamp(dot(far_dir, dir) * 0.5 + 0.5, 0.0, 1.0);
                     let far_sky_open = saturate(far_vis.w);
-                    let far_response = clamp(far_directional_response * mix(0.60, 1.12, far_sky_open), 0.0, 1.0);
                     let merge_scale = mix(0.72, 0.40, f32(current_cascade) / 3.0);
-                    let merged_radiance = far_probe.rgb * far_response * far_conf * merge_scale;
+                    let merged_radiance = far_probe.rgb * far_conf * merge_scale;
                     accum = accum + merged_radiance;
+                    if (merge_slot == 0) {
+                        dir_bucket0 = dir_bucket0 + merged_radiance;
+                    } else if (merge_slot == 1) {
+                        dir_bucket1 = dir_bucket1 + merged_radiance;
+                    } else if (merge_slot == 2) {
+                        dir_bucket2 = dir_bucket2 + merged_radiance;
+                    } else {
+                        dir_bucket3 = dir_bucket3 + merged_radiance;
+                    }
                     let merged_energy = max(max(merged_radiance.r, merged_radiance.g), merged_radiance.b);
                     direction_vector_accum = direction_vector_accum + normalize(dir) * merged_energy;
                     direction_energy_accum = direction_energy_accum + merged_energy;
@@ -1810,9 +1911,19 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let sky_fill = mix(0.08, 0.13, saturate(origin_sky_visibility));
                 let sky_radiance = sky_rgb * sky_ray_weight * sky_fill;
                 accum = accum + sky_radiance;
+                let sky_slot = rc_direction_slot(dir);
+                if (sky_slot == 0) {
+                    dir_bucket0 = dir_bucket0 + sky_radiance;
+                } else if (sky_slot == 1) {
+                    dir_bucket1 = dir_bucket1 + sky_radiance;
+                } else if (sky_slot == 2) {
+                    dir_bucket2 = dir_bucket2 + sky_radiance;
+                } else {
+                    dir_bucket3 = dir_bucket3 + sky_radiance;
+                }
                 let sky_energy = max(max(sky_radiance.r, sky_radiance.g), sky_radiance.b);
                 direction_vector_accum = direction_vector_accum + normalize(dir) * sky_energy;
-            direction_energy_accum = direction_energy_accum + sky_energy;
+                direction_energy_accum = direction_energy_accum + sky_energy;
                 sky_count = sky_count + sky_ray_weight;
             }
         }
@@ -1830,7 +1941,6 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let pushed_sky_gate = smoothstep(0.18, 0.72, origin_sky_visibility);
     let pushed_radiance_scale = mix(clamp(rc.controls.y, 0.0, 1.0), 1.0, pushed_sky_gate);
     let solid_radiance_scale = select(1.0, pushed_radiance_scale, origin_was_solid);
-    let rgb = accum * inv_ray_count * solid_radiance_scale;
     let hit_fraction = hit_count * inv_ray_count;
     let sky_fraction = min(1.0, sky_count * inv_ray_count);
     let valid_fraction = saturate(hit_fraction + 0.75 * sky_fraction) * solid_radiance_scale;
@@ -1845,7 +1955,10 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let directional_anisotropy = saturate(direction_len / max(direction_energy_accum, 0.0001));
     let direction_descriptor = vec4f(dominant_dir * directional_anisotropy, probe_sky_access * valid_fraction);
 
-    textureStore(dst_volume, coord, vec4f(rgb, valid_fraction));
+    textureStore(dst_volume, vec3i(coord.x + 0 * resolution_i, coord.y, coord.z), vec4f(dir_bucket0 * inv_ray_count * solid_radiance_scale, valid_fraction));
+    textureStore(dst_volume, vec3i(coord.x + 1 * resolution_i, coord.y, coord.z), vec4f(dir_bucket1 * inv_ray_count * solid_radiance_scale, valid_fraction));
+    textureStore(dst_volume, vec3i(coord.x + 2 * resolution_i, coord.y, coord.z), vec4f(dir_bucket2 * inv_ray_count * solid_radiance_scale, valid_fraction));
+    textureStore(dst_volume, vec3i(coord.x + 3 * resolution_i, coord.y, coord.z), vec4f(dir_bucket3 * inv_ray_count * solid_radiance_scale, valid_fraction));
     textureStore(dst_visibility, coord, direction_descriptor);
 }
 """
@@ -1888,16 +2001,12 @@ fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
     let cascade_index = u32(rc.meta0.y + 0.5);
     let far_filter = clamp(f32(cascade_index) * 0.45, 0.0, 1.0);
 
-    let raw_volume = textureLoad(src_volume, coord, 0);
     let raw_visibility = textureLoad(src_visibility, coord, 0);
     let center_weight = mix(0.34, 0.28, far_filter);
-    var filtered_volume = raw_volume * center_weight;
     var filtered_visibility = raw_visibility * center_weight;
-    var weight = center_weight;
+    var visibility_weight = center_weight;
 
-    // C0 keeps a tight 6-neighbor filter. Far cascades use a 3x3x3 bilateral
-    // filter so they behave like broad irradiance fields instead of visible
-    // probe-grid shadow squares. Visibility.w stores hard sky/open confidence,
+    // Filter metadata once per probe. Visibility.w is hard sky/open confidence,
     // so the bilateral term still blocks open probes from flooding caves.
     for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
         for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
@@ -1920,44 +2029,77 @@ fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
 
                 let nc = coord + vec3i(dx, dy, dz);
                 if (in_bounds(nc, resolution)) {
-                    let neighbor_volume = textureLoad(src_volume, nc, 0);
                     let neighbor_visibility = textureLoad(src_visibility, nc, 0);
-
                     let sky_delta = abs(clamp(neighbor_visibility.w, 0.0, 1.0) - clamp(raw_visibility.w, 0.0, 1.0));
                     let sky_similarity = clamp(1.0 - smoothstep(mix(0.08, 0.12, far_filter), mix(0.55, 0.82, far_filter), sky_delta), 0.0, 1.0);
-                    let neighbor_validity = clamp(neighbor_volume.a, 0.0, 1.0);
-                    let neighbor_weight = geometric_weight * sky_similarity * (0.25 + 0.75 * neighbor_validity);
-
-                    filtered_volume = filtered_volume + neighbor_volume * neighbor_weight;
+                    let neighbor_validity = clamp(neighbor_visibility.w, 0.0, 1.0);
+                    let neighbor_weight = geometric_weight * sky_similarity * (0.35 + 0.65 * neighbor_validity);
                     filtered_visibility = filtered_visibility + neighbor_visibility * neighbor_weight;
-                    weight = weight + neighbor_weight;
+                    visibility_weight = visibility_weight + neighbor_weight;
                 }
             }
         }
     }
 
-    filtered_volume = filtered_volume / max(weight, 0.0001);
-    filtered_visibility = filtered_visibility / max(weight, 0.0001);
+    filtered_visibility = filtered_visibility / max(visibility_weight, 0.0001);
+    let directional_blend = mix(0.62, 0.86, far_filter);
+    var out_visibility = mix(raw_visibility, max(filtered_visibility, vec4f(0.0, 0.0, 0.0, 0.0)), directional_blend);
+    out_visibility = normalize_direction_descriptor(out_visibility);
+    textureStore(dst_visibility, coord, out_visibility);
 
     let sky_filter_power = max(0.25, rc.light0.w);
     let directional_filter_gate = 0.35 + 0.65 * pow(clamp(raw_visibility.w, 0.0, 1.0), sky_filter_power);
-    var out_volume = raw_volume * (1.0 - directional_filter_gate) + filtered_volume * directional_filter_gate;
-    var out_visibility = filtered_visibility;
 
-    // Do not add a colored radiance floor here. Probe filtering should preserve
-    // measured radiance; the compose pass handles open-surface confidence without
-    // tinting the stored RC field blue.
+    // Real 3D RC v25: radiance is stored per angular interval in an X-atlas.
+    // Filter each interval independently so RGB direction buckets do not collapse
+    // back into an isotropic probe value.
+    for (var dir_slot: i32 = 0; dir_slot < 4; dir_slot = dir_slot + 1) {
+        let atlas_coord = vec3i(coord.x + dir_slot * resolution, coord.y, coord.z);
+        let raw_volume = textureLoad(src_volume, atlas_coord, 0);
+        var filtered_volume = raw_volume * center_weight;
+        var volume_weight = center_weight;
 
-    // The visibility texture now stores a dominant directional descriptor:
-    // xyz = dominant radiance direction * anisotropy, w = sky/open confidence.
-    // Filter it, then clamp the vector length back into descriptor range.
-    let directional_blend = mix(0.62, 0.86, far_filter);
-    out_visibility = mix(raw_visibility, max(filtered_visibility, vec4f(0.0, 0.0, 0.0, 0.0)), directional_blend);
-    out_visibility = normalize_direction_descriptor(out_visibility);
-    out_volume = vec4f(max(out_volume.rgb, vec3f(0.0, 0.0, 0.0)), clamp(out_volume.a, 0.0, 1.0));
+        for (var dz2: i32 = -1; dz2 <= 1; dz2 = dz2 + 1) {
+            for (var dy2: i32 = -1; dy2 <= 1; dy2 = dy2 + 1) {
+                for (var dx2: i32 = -1; dx2 <= 1; dx2 = dx2 + 1) {
+                    if (dx2 == 0 && dy2 == 0 && dz2 == 0) {
+                        continue;
+                    }
+                    let manhattan2 = abs(dx2) + abs(dy2) + abs(dz2);
+                    var geometric_weight2 = 0.0;
+                    if (manhattan2 == 1) {
+                        geometric_weight2 = mix(0.160, 0.135, far_filter);
+                    } else if (manhattan2 == 2) {
+                        geometric_weight2 = mix(0.050, 0.070, far_filter);
+                    } else {
+                        geometric_weight2 = mix(0.030, 0.045, far_filter);
+                    }
+                    if (geometric_weight2 <= 0.0001) {
+                        continue;
+                    }
 
-    textureStore(dst_volume, coord, out_volume);
-    textureStore(dst_visibility, coord, out_visibility);
+                    let nc = coord + vec3i(dx2, dy2, dz2);
+                    if (in_bounds(nc, resolution)) {
+                        let neighbor_visibility = textureLoad(src_visibility, nc, 0);
+                        let sky_delta = abs(clamp(neighbor_visibility.w, 0.0, 1.0) - clamp(raw_visibility.w, 0.0, 1.0));
+                        let sky_similarity = clamp(1.0 - smoothstep(mix(0.08, 0.12, far_filter), mix(0.55, 0.82, far_filter), sky_delta), 0.0, 1.0);
+                        let neighbor_coord = vec3i(nc.x + dir_slot * resolution, nc.y, nc.z);
+                        let neighbor_volume = textureLoad(src_volume, neighbor_coord, 0);
+                        let neighbor_validity = clamp(neighbor_volume.a, 0.0, 1.0);
+                        let neighbor_weight = geometric_weight2 * sky_similarity * (0.25 + 0.75 * neighbor_validity);
+                        filtered_volume = filtered_volume + neighbor_volume * neighbor_weight;
+                        volume_weight = volume_weight + neighbor_weight;
+                    }
+                }
+            }
+        }
+
+        filtered_volume = filtered_volume / max(volume_weight, 0.0001);
+        var out_volume = raw_volume * (1.0 - directional_filter_gate) + filtered_volume * directional_filter_gate;
+        out_volume = vec4f(max(out_volume.rgb, vec3f(0.0, 0.0, 0.0)), clamp(out_volume.a, 0.0, 1.0));
+        textureStore(dst_volume, atlas_coord, out_volume);
+    }
+
 }
 """
 

@@ -2332,6 +2332,8 @@ class TerrainRenderer:
         )
         self.gi_color_view = self.gi_color_texture.create_view()
         worldspace_resolution = max(4, int(WORLDSPACE_RC_GRID_RESOLUTION))
+        worldspace_direction_count = max(1, int(WORLDSPACE_RC_DIRECTION_COUNT))
+        worldspace_radiance_width = worldspace_resolution * worldspace_direction_count
         self.worldspace_rc_textures = []
         self.worldspace_rc_views = []
         self.worldspace_rc_visibility_textures = []
@@ -2346,7 +2348,7 @@ class TerrainRenderer:
         rc_texture_usage = wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.STORAGE_BINDING
         for cascade_index in range(4):
             rc_texture = self.device.create_texture(
-                size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
+                size=(worldspace_radiance_width, worldspace_resolution, worldspace_resolution),
                 dimension="3d",
                 format=POSTPROCESS_GI_FORMAT,
                 usage=rc_texture_usage,
@@ -2358,7 +2360,7 @@ class TerrainRenderer:
                 usage=rc_texture_usage,
             )
             scratch_texture = self.device.create_texture(
-                size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
+                size=(worldspace_radiance_width, worldspace_resolution, worldspace_resolution),
                 dimension="3d",
                 format=POSTPROCESS_GI_FORMAT,
                 usage=rc_texture_usage,
