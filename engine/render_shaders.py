@@ -739,6 +739,7 @@ const SKY_ZENITH: vec3f = vec3f(__SKY_ZENITH_R__, __SKY_ZENITH_G__, __SKY_ZENITH
 const SKY_GROUND: vec3f = vec3f(__SKY_GROUND_R__, __SKY_GROUND_G__, __SKY_GROUND_B__);
 const SKY_SUN_GLOW: vec3f = vec3f(__SKY_SUN_R__, __SKY_SUN_G__, __SKY_SUN_B__);
 const SKY_SUN_DIR: vec3f = vec3f(__SKY_SUN_DIR_X__, __SKY_SUN_DIR_Y__, __SKY_SUN_DIR_Z__);
+const PI: f32 = 3.14159265358979323846;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -839,6 +840,64 @@ fn normalize_direction_descriptor(v: vec4f) -> vec4f {
     return vec4f(dir * saturate(len_v), saturate(v.w));
 }
 
+fn safe_normalize3(v: vec3f, fallback: vec3f) -> vec3f {
+    let len_v = length(v);
+    return select(fallback, v / max(len_v, 0.0001), len_v > 0.0001);
+}
+
+fn eon_fon_albedo_approx(mu_in: f32, roughness: f32) -> f32 {
+    let mu = clamp(mu_in, 0.001, 1.0);
+    let r = clamp(roughness, 0.0, 1.0);
+    let mucomp = 1.0 - mu;
+    let mucomp2 = mucomp * mucomp;
+    let gover_pi =
+        0.0571085289 * mucomp
+        - 0.332181442 * mucomp2
+        + 0.491881867 * mucomp * mucomp2
+        + 0.0714429953 * mucomp2 * mucomp2;
+    let constant1_fon = 0.5 - 2.0 / (3.0 * PI);
+    return (1.0 + r * gover_pi) / (1.0 + constant1_fon * r);
+}
+
+fn eon_rough_diffuse_response(n: vec3f, view_dir: vec3f, light_dir: vec3f, roughness: f32, albedo_luma: f32) -> f32 {
+    let mu_i = saturate(dot(n, light_dir));
+    let mu_o = saturate(dot(n, view_dir));
+    if (mu_i <= 0.0001 || mu_o <= 0.0001) {
+        let wrapped = saturate((dot(n, light_dir) + 0.26) / 1.26);
+        return wrapped * 0.075 * roughness;
+    }
+
+    let r = clamp(roughness, 0.0, 1.0);
+    let rho = clamp(albedo_luma, 0.035, 0.985);
+    let constant1_fon = 0.5 - 2.0 / (3.0 * PI);
+    let constant2_fon = 2.0 / 3.0 - 28.0 / (15.0 * PI);
+    let af = 1.0 / (1.0 + constant1_fon * r);
+
+    // FON/EON single-scatter angular term. The linked EON paper expresses this
+    // in local coordinates; the scalar s term can be evaluated directly from
+    // world-space directions and the normal.
+    let s = dot(light_dir, view_dir) - mu_i * mu_o;
+    let sovert_f = select(s, s / max(mu_i, mu_o), s > 0.0);
+    let f_ss_over_rho = (af / PI) * max(0.0, 1.0 + r * sovert_f);
+
+    let efi = eon_fon_albedo_approx(mu_i, r);
+    let efo = eon_fon_albedo_approx(mu_o, r);
+    let avg_ef = af * (1.0 + constant2_fon * r);
+
+    // Energy compensation from the EON model. We divide by rho because this
+    // compose pass applies the block albedo after RC lighting; this keeps the
+    // angular compensation without double-tinting the material color.
+    let rho_ms = (rho * rho) * avg_ef / max(0.0001, 1.0 - rho * (1.0 - avg_ef));
+    let f_ms_over_rho = (rho_ms / max(rho, 0.0001))
+        * max(0.000001, 1.0 - efo)
+        * max(0.000001, 1.0 - efi)
+        / (PI * max(0.000001, 1.0 - avg_ef));
+
+    let response = PI * (f_ss_over_rho + f_ms_over_rho) * mu_i;
+    let rough_horizon_wrap = saturate((dot(n, light_dir) + 0.24) / 1.24) * 0.055 * r;
+    return clamp(max(response, rough_horizon_wrap), 0.0, 1.25);
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     let albedo = textureSample(scene_tex, linear_sampler, input.uv).rgb;
@@ -858,6 +917,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     let max_index = resolution - 1;
 
     let upward_surface = smoothstep(0.0, 0.85, normal.y);
+    let view_dir = safe_normalize3(camera.position.xyz - world_pos, -camera.forward.xyz);
+    let albedo_luma = clamp(dot(albedo, vec3f(0.2126, 0.7152, 0.0722)), 0.035, 0.985);
 
     // RC is a positive lighting field, but direct daylight should not be
     // injected as a hard per-probe floor. Use a smooth sky-visibility baseline
@@ -920,12 +981,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
                     // 3D RC than scalar probe lobes, while still using one RGB
                     // radiance value per probe for this incremental patch.
                     let directional_anisotropy = saturate(dir_len);
-                    let lambert_response = saturate(dot(normal, incoming_dir));
+                    let terrain_roughness = 0.82;
+                    let eon_response = eon_rough_diffuse_response(normal, view_dir, incoming_dir, terrain_roughness, albedo_luma);
                     let sky_hemi_response = sky_access * upward_surface;
+                    let receiver_response = max(eon_response, sky_hemi_response * 0.62);
                     let directional_response = clamp(
-                        mix(0.26, 1.08, max(lambert_response, sky_hemi_response * 0.72)) * mix(0.58, 1.0, directional_anisotropy),
-                        0.10,
-                        1.0,
+                        mix(0.20, 1.08, receiver_response) * mix(0.60, 1.0, directional_anisotropy),
+                        0.075,
+                        1.08,
                     );
 
                     let validity = mix(0.10, 1.0, probe_alpha);
