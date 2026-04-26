@@ -861,6 +861,19 @@ class TerrainRenderer:
                     "visibility": wgpu.ShaderStage.COMPUTE,
                     "buffer": {"type": "uniform"},
                 },
+                {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE, "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False}},
+                {"binding": 4, "visibility": wgpu.ShaderStage.COMPUTE, "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False}},
+                {"binding": 5, "visibility": wgpu.ShaderStage.COMPUTE, "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False}},
+                {"binding": 6, "visibility": wgpu.ShaderStage.COMPUTE, "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False}},
+                {"binding": 7, "visibility": wgpu.ShaderStage.COMPUTE, "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False}},
+                {"binding": 8, "visibility": wgpu.ShaderStage.COMPUTE, "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False}},
+                {"binding": 9, "visibility": wgpu.ShaderStage.COMPUTE, "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False}},
+                {"binding": 10, "visibility": wgpu.ShaderStage.COMPUTE, "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False}},
+                {
+                    "binding": 11,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "uniform"},
+                },
             ],
         )
         self.worldspace_rc_filter_bind_group_layout = self.device.create_bind_group_layout(
@@ -2453,6 +2466,15 @@ class TerrainRenderer:
                         {"binding": 0, "resource": self.worldspace_rc_scratch_views[cascade_index]},
                         {"binding": 1, "resource": self.worldspace_rc_visibility_scratch_views[cascade_index]},
                         {"binding": 2, "resource": {"buffer": update_param_buffer, "offset": 0, "size": WORLDSPACE_RC_UPDATE_PARAMS_BYTES}},
+                        {"binding": 3, "resource": self.worldspace_rc_views[0]},
+                        {"binding": 4, "resource": self.worldspace_rc_views[1]},
+                        {"binding": 5, "resource": self.worldspace_rc_views[2]},
+                        {"binding": 6, "resource": self.worldspace_rc_views[3]},
+                        {"binding": 7, "resource": self.worldspace_rc_visibility_views[0]},
+                        {"binding": 8, "resource": self.worldspace_rc_visibility_views[1]},
+                        {"binding": 9, "resource": self.worldspace_rc_visibility_views[2]},
+                        {"binding": 10, "resource": self.worldspace_rc_visibility_views[3]},
+                        {"binding": 11, "resource": {"buffer": self.worldspace_rc_volume_params_buffer, "offset": 0, "size": 256}},
                     ],
                 )
             )

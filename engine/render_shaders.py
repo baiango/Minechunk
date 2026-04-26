@@ -833,6 +833,15 @@ fn cascade_edge_blend(uvw: vec3f) -> f32 {
     return smoothstep(PROBE_CASCADE_BLEND_EDGE_START, PROBE_CASCADE_BLEND_EDGE_END, edge_dist);
 }
 
+fn normalize_direction_buckets(v: vec4f) -> vec4f {
+    let clamped = max(v, vec4f(0.0, 0.0, 0.0, 0.0));
+    let s = clamped.x + clamped.y + clamped.z + clamped.w;
+    if (s <= 0.0001) {
+        return vec4f(0.25, 0.25, 0.25, 0.25);
+    }
+    return clamped / s;
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     let albedo = textureSample(scene_tex, linear_sampler, input.uv).rgb;
@@ -891,9 +900,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
                     let probe = load_world_rc(i, coord);
                     let probe_vis = load_world_rc_vis(i, coord);
                     let probe_alpha = saturate(probe.a);
-                    let hit_fraction = saturate(probe_vis.z);
-                    let sky_access = saturate(probe_vis.w);
-                    if (probe_alpha <= 0.0001 && hit_fraction <= 0.0001) {
+                    if (probe_alpha <= 0.0001) {
                         continue;
                     }
 
@@ -906,23 +913,24 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
                     }
                     let probe_dir = to_probe / probe_dist;
                     let backface = saturate((dot(normal, probe_dir) + PROBE_BACKFACE_SOFTNESS) / (1.0 + PROBE_BACKFACE_SOFTNESS));
-                    let mean_distance = probe_vis.x;
-                    let mean_distance_sq = max(probe_vis.y, mean_distance * mean_distance);
-                    let variance = max(mean_distance_sq - mean_distance * mean_distance, PROBE_VISIBILITY_VARIANCE_BIAS);
-                    let biased_distance = max(0.0, probe_dist - PROBE_VISIBILITY_BIAS);
-                    var visibility = 1.0;
-                    if (biased_distance > mean_distance) {
-                        let delta = biased_distance - mean_distance;
-                        visibility = variance / (variance + PROBE_VISIBILITY_SHARPNESS * delta * delta);
-                    }
+                    let direction_buckets = normalize_direction_buckets(probe_vis);
+                    let sky_access = direction_buckets.y;
 
-                    let validity = mix(0.10, 1.0, smoothstep(PROBE_MIN_HIT_FRACTION, 1.0, hit_fraction));
+                    // Integrate the packed directional lobes against the receiver
+                    // normal. This is not full RGB-per-direction yet, but it stops
+                    // the probe from behaving as isotropic ambient glow and is the
+                    // first step toward real 3D RC directional intervals.
+                    let receiver_lobes = normalize_direction_buckets(vec4f(abs(normal.x), max(normal.y, 0.0), abs(normal.z), max(-normal.y, 0.0)));
+                    let directional_response = clamp(dot(direction_buckets, receiver_lobes) * 2.35, 0.08, 1.0);
+
+                    let validity = mix(0.10, 1.0, probe_alpha);
                     let open_probe_gate = smoothstep(0.06, 0.55, sky_access);
                     let open_surface_probe_gate = mix(1.0, open_probe_gate, upward_surface);
-                    let structural_weight = tri_weight * backface * visibility * visibility * validity * validity * probe_alpha * open_surface_probe_gate;
-                    let exposure_weight = tri_weight * max(0.16, backface) * visibility * validity * probe_alpha * open_surface_probe_gate;
+                    let geometric_weight = max(0.18, backface);
+                    let structural_weight = tri_weight * geometric_weight * validity * validity * probe_alpha * open_surface_probe_gate;
+                    let exposure_weight = tri_weight * max(0.20, geometric_weight) * validity * probe_alpha * open_surface_probe_gate;
 
-                    cascade_accum = cascade_accum + probe.rgb * structural_weight;
+                    cascade_accum = cascade_accum + probe.rgb * structural_weight * directional_response;
                     cascade_weight_sum = cascade_weight_sum + structural_weight;
                     cascade_sky_access_sum = cascade_sky_access_sum + sky_access * exposure_weight;
                     cascade_sky_access_weight = cascade_sky_access_weight + exposure_weight;
@@ -1038,9 +1046,23 @@ struct RcUpdateParams {
     controls: vec4f,
 }
 
+struct WorldRcParams {
+    volume_min: array<vec4f, 4>,
+    volume_inv_extent: array<vec4f, 4>,
+}
+
 @group(0) @binding(0) var dst_volume: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(1) var dst_visibility: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> rc: RcUpdateParams;
+@group(0) @binding(3) var rc0_src_tex: texture_3d<f32>;
+@group(0) @binding(4) var rc1_src_tex: texture_3d<f32>;
+@group(0) @binding(5) var rc2_src_tex: texture_3d<f32>;
+@group(0) @binding(6) var rc3_src_tex: texture_3d<f32>;
+@group(0) @binding(7) var rc0_src_vis_tex: texture_3d<f32>;
+@group(0) @binding(8) var rc1_src_vis_tex: texture_3d<f32>;
+@group(0) @binding(9) var rc2_src_vis_tex: texture_3d<f32>;
+@group(0) @binding(10) var rc3_src_vis_tex: texture_3d<f32>;
+@group(0) @binding(11) var<uniform> world_rc: WorldRcParams;
 
 const AIR: u32 = 0u;
 const BEDROCK: u32 = 1u;
@@ -1402,6 +1424,104 @@ fn direction_for_base_index(index: u32, base_count: u32) -> vec3f {
     return vec3f(cos(theta) * radius, y, sin(theta) * radius);
 }
 
+fn direction_bucket_weights(dir: vec3f) -> vec4f {
+    // First structural step toward real 3D RC: keep a directional lobe
+    // distribution per probe instead of treating the probe as one scalar glow.
+    // Packed buckets: abs(X side), +Y sky/up, abs(Z side), -Y floor/down.
+    // RGB radiance is still shared for now; this metadata lets compose integrate
+    // the probe against the receiving surface normal like directional radiance.
+    let ax = abs(dir.x);
+    let up = max(dir.y, 0.0);
+    let az = abs(dir.z);
+    let down = max(-dir.y, 0.0);
+    let lobes = vec4f(ax * ax + 0.015, up * up + 0.015, az * az + 0.015, down * down + 0.015);
+    return lobes / max(lobes.x + lobes.y + lobes.z + lobes.w, 0.0001);
+}
+
+fn normalize_direction_buckets(v: vec4f) -> vec4f {
+    let clamped = max(v, vec4f(0.0, 0.0, 0.0, 0.0));
+    let s = clamped.x + clamped.y + clamped.z + clamped.w;
+    if (s <= 0.0001) {
+        return vec4f(0.25, 0.25, 0.25, 0.25);
+    }
+    return clamped / s;
+}
+
+fn load_src_world_rc(index: u32, coord: vec3i) -> vec4f {
+    switch (index) {
+        case 0u: { return textureLoad(rc0_src_tex, coord, 0); }
+        case 1u: { return textureLoad(rc1_src_tex, coord, 0); }
+        case 2u: { return textureLoad(rc2_src_tex, coord, 0); }
+        default: { return textureLoad(rc3_src_tex, coord, 0); }
+    }
+}
+
+fn load_src_world_rc_vis(index: u32, coord: vec3i) -> vec4f {
+    switch (index) {
+        case 0u: { return textureLoad(rc0_src_vis_tex, coord, 0); }
+        case 1u: { return textureLoad(rc1_src_vis_tex, coord, 0); }
+        case 2u: { return textureLoad(rc2_src_vis_tex, coord, 0); }
+        default: { return textureLoad(rc3_src_vis_tex, coord, 0); }
+    }
+}
+
+fn sample_src_world_rc(index: u32, world_pos: vec3f, resolution: i32) -> vec4f {
+    let min_corner = world_rc.volume_min[index].xyz;
+    let inv_extent = world_rc.volume_inv_extent[index].xyz;
+    let uvw = (world_pos - min_corner) * inv_extent;
+    if (uvw.x < 0.0 || uvw.y < 0.0 || uvw.z < 0.0 || uvw.x > 1.0 || uvw.y > 1.0 || uvw.z > 1.0) {
+        return vec4f(0.0, 0.0, 0.0, 0.0);
+    }
+    let max_index = max(resolution - 1, 1);
+    let grid_f = uvw * f32(max_index);
+    let base_x = i32(clamp(floor(grid_f.x), 0.0, f32(max_index - 1)));
+    let base_y = i32(clamp(floor(grid_f.y), 0.0, f32(max_index - 1)));
+    let base_z = i32(clamp(floor(grid_f.z), 0.0, f32(max_index - 1)));
+    let frac = fract(grid_f);
+    var accum = vec4f(0.0);
+    for (var oz: u32 = 0u; oz < 2u; oz = oz + 1u) {
+        let wz = select(1.0 - frac.z, frac.z, oz == 1u);
+        for (var oy: u32 = 0u; oy < 2u; oy = oy + 1u) {
+            let wy = select(1.0 - frac.y, frac.y, oy == 1u);
+            for (var ox: u32 = 0u; ox < 2u; ox = ox + 1u) {
+                let wx = select(1.0 - frac.x, frac.x, ox == 1u);
+                let coord = vec3i(base_x + i32(ox), base_y + i32(oy), base_z + i32(oz));
+                accum = accum + load_src_world_rc(index, coord) * (wx * wy * wz);
+            }
+        }
+    }
+    return accum;
+}
+
+fn sample_src_world_rc_vis(index: u32, world_pos: vec3f, resolution: i32) -> vec4f {
+    let min_corner = world_rc.volume_min[index].xyz;
+    let inv_extent = world_rc.volume_inv_extent[index].xyz;
+    let uvw = (world_pos - min_corner) * inv_extent;
+    if (uvw.x < 0.0 || uvw.y < 0.0 || uvw.z < 0.0 || uvw.x > 1.0 || uvw.y > 1.0 || uvw.z > 1.0) {
+        return vec4f(0.0, 0.0, 0.0, 0.0);
+    }
+    let max_index = max(resolution - 1, 1);
+    let grid_f = uvw * f32(max_index);
+    let base_x = i32(clamp(floor(grid_f.x), 0.0, f32(max_index - 1)));
+    let base_y = i32(clamp(floor(grid_f.y), 0.0, f32(max_index - 1)));
+    let base_z = i32(clamp(floor(grid_f.z), 0.0, f32(max_index - 1)));
+    let frac = fract(grid_f);
+    var accum = vec4f(0.0);
+    for (var oz: u32 = 0u; oz < 2u; oz = oz + 1u) {
+        let wz = select(1.0 - frac.z, frac.z, oz == 1u);
+        for (var oy: u32 = 0u; oy < 2u; oy = oy + 1u) {
+            let wy = select(1.0 - frac.y, frac.y, oy == 1u);
+            for (var ox: u32 = 0u; ox < 2u; ox = ox + 1u) {
+                let wx = select(1.0 - frac.x, frac.x, ox == 1u);
+                let coord = vec3i(base_x + i32(ox), base_y + i32(oy), base_z + i32(oz));
+                accum = accum + load_src_world_rc_vis(index, coord) * (wx * wy * wz);
+            }
+        }
+    }
+    return normalize_direction_buckets(accum);
+}
+
+
 fn effective_ray_count(cascade_index: u32, origin_sky_visibility: f32) -> u32 {
     let base_count = trace_base_directions();
     var ray_target_count = base_count;
@@ -1468,6 +1588,7 @@ fn block_coord_from_world(world_pos: vec3f, block_size: f32) -> vec3i {
 @compute @workgroup_size(4, 4, 4)
 fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let resolution = max(1u, u32(rc.meta0.x + 0.5));
+    let resolution_i = i32(resolution);
     if (gid.x >= resolution || gid.y >= resolution || gid.z >= resolution) {
         return;
     }
@@ -1514,7 +1635,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
         }
         if (!found) {
             textureStore(dst_volume, coord, vec4f(0.0, 0.0, 0.0, 0.0));
-            textureStore(dst_visibility, coord, vec4f(max_distance, max_distance * max_distance, 0.0, 0.0));
+            textureStore(dst_visibility, coord, vec4f(0.25, 0.25, 0.25, 0.25));
             return;
         }
         let offset_blocks = vec3f(
@@ -1543,6 +1664,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let direct_sun_scale = select(1.10, 0.62, cheap_hit_shading);
 
     var accum = vec3f(0.0, 0.0, 0.0);
+    var direction_bucket_accum = vec4f(0.0, 0.0, 0.0, 0.0);
     var hit_count = 0.0;
     var sky_count = 0.0;
     var hit_sky_visibility_accum = 0.0;
@@ -1589,7 +1711,10 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let range_term = 0.30 + 0.70 * falloff;
                 let facing_term = 0.40 + 0.60 * facing;
                 let bounce_scale = (indirect_floor + occluded_bounce + ambient_sky + direct_sun) * range_term * facing_term;
-                accum = accum + color * bounce_scale;
+                let hit_radiance = color * bounce_scale;
+                accum = accum + hit_radiance;
+                let hit_energy = max(max(hit_radiance.r, hit_radiance.g), hit_radiance.b) * (0.35 + 0.65 * facing);
+                direction_bucket_accum = direction_bucket_accum + direction_bucket_weights(dir) * hit_energy;
                 hit_sky_visibility_accum = hit_sky_visibility_accum + sky_visibility * (0.35 + 0.65 * facing);
                 hit_count = hit_count + 1.0;
                 hit = true;
@@ -1600,14 +1725,38 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
         }
 
         if (!hit) {
-            let sky_axis = max(0.0, dir.y);
-            let sky_ray_weight = (0.04 + 0.96 * (sky_axis * sky_axis)) * pow(max(0.0, origin_sky_visibility), 1.40);
-            // Keep sky misses mostly as a visibility signal, but allow a broader,
-            // softer contribution so open terrain and cave mouths do not fall off
-            // into black while avoiding the harsh cave-mouth hotspots.
-            let sky_fill = mix(0.08, 0.13, saturate(origin_sky_visibility));
-            accum = accum + sky_rgb * sky_ray_weight * sky_fill;
-            sky_count = sky_count + sky_ray_weight;
+            let current_cascade = u32(rc.meta0.y + 0.5);
+            var merged_from_far = false;
+            if (current_cascade + 1u < 4u) {
+                let merge_world_pos = origin + dir * (max_distance * 1.05);
+                let far_probe = sample_src_world_rc(current_cascade + 1u, merge_world_pos, resolution_i);
+                let far_vis = sample_src_world_rc_vis(current_cascade + 1u, merge_world_pos, resolution_i);
+                let far_conf = saturate(far_probe.a);
+                if (far_conf > 0.035) {
+                    let ray_lobes = normalize_direction_buckets(direction_bucket_weights(dir));
+                    let far_response = clamp(dot(normalize_direction_buckets(far_vis), ray_lobes) * 2.65, 0.0, 1.0);
+                    let merge_scale = mix(0.72, 0.40, f32(current_cascade) / 3.0);
+                    let merged_radiance = far_probe.rgb * far_response * far_conf * merge_scale;
+                    accum = accum + merged_radiance;
+                    let merged_energy = max(max(merged_radiance.r, merged_radiance.g), merged_radiance.b);
+                    direction_bucket_accum = direction_bucket_accum + ray_lobes * merged_energy;
+                    sky_count = sky_count + far_vis.y * far_conf * 0.35;
+                    merged_from_far = true;
+                }
+            }
+            if (!merged_from_far) {
+                let sky_axis = max(0.0, dir.y);
+                let sky_ray_weight = (0.04 + 0.96 * (sky_axis * sky_axis)) * pow(max(0.0, origin_sky_visibility), 1.40);
+                // Keep sky misses mostly as a visibility signal, but allow a broader,
+                // softer contribution so open terrain and cave mouths do not fall off
+                // into black while avoiding the harsh cave-mouth hotspots.
+                let sky_fill = mix(0.08, 0.13, saturate(origin_sky_visibility));
+                let sky_radiance = sky_rgb * sky_ray_weight * sky_fill;
+                accum = accum + sky_radiance;
+                let sky_energy = max(max(sky_radiance.r, sky_radiance.g), sky_radiance.b);
+                direction_bucket_accum = direction_bucket_accum + direction_bucket_weights(dir) * sky_energy;
+                sky_count = sky_count + sky_ray_weight;
+            }
         }
 
         distance_accum = distance_accum + hit_distance;
@@ -1633,11 +1782,14 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     }
     observed_sky_access = max(observed_sky_access, sky_fraction);
     let probe_sky_access = saturate(0.78 * origin_sky_visibility + 0.22 * observed_sky_access);
-    let mean_distance = distance_accum * inv_ray_count;
-    let mean_distance_sq = distance_sq_accum * inv_ray_count;
+    var direction_buckets = normalize_direction_buckets(direction_bucket_accum);
+    // Preserve hard sky/access information in the up bucket so open terrain can
+    // derive smooth daylight while closed caves keep low upward radiance.
+    direction_buckets.y = max(direction_buckets.y, probe_sky_access * valid_fraction);
+    direction_buckets = normalize_direction_buckets(direction_buckets);
 
     textureStore(dst_volume, coord, vec4f(rgb, valid_fraction));
-    textureStore(dst_visibility, coord, vec4f(mean_distance, mean_distance_sq, valid_fraction, probe_sky_access));
+    textureStore(dst_visibility, coord, direction_buckets);
 }
 """
 
@@ -1661,6 +1813,15 @@ fn in_bounds(c: vec3i, resolution: i32) -> bool {
     return c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < resolution && c.y < resolution && c.z < resolution;
 }
 
+fn normalize_direction_buckets(v: vec4f) -> vec4f {
+    let clamped = max(v, vec4f(0.0, 0.0, 0.0, 0.0));
+    let s = clamped.x + clamped.y + clamped.z + clamped.w;
+    if (s <= 0.0001) {
+        return vec4f(0.25, 0.25, 0.25, 0.25);
+    }
+    return clamped / s;
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
     let resolution_u = max(1u, u32(rc.meta0.x + 0.5));
@@ -1682,8 +1843,8 @@ fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
 
     // C0 keeps a tight 6-neighbor filter. Far cascades use a 3x3x3 bilateral
     // filter so they behave like broad irradiance fields instead of visible
-    // probe-grid shadow squares. The sky-access bilateral term still blocks
-    // open-sky probes from bleeding into sealed caves.
+    // probe-grid shadow squares. The Y lobe acts as upward/sky directional
+    // access, so the bilateral term still blocks open probes from flooding caves.
     for (var dz: i32 = -1; dz <= 1; dz = dz + 1) {
         for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
             for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
@@ -1708,9 +1869,9 @@ fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
                     let neighbor_volume = textureLoad(src_volume, nc, 0);
                     let neighbor_visibility = textureLoad(src_visibility, nc, 0);
 
-                    let sky_delta = abs(clamp(neighbor_visibility.w, 0.0, 1.0) - clamp(raw_visibility.w, 0.0, 1.0));
+                    let sky_delta = abs(clamp(neighbor_visibility.y, 0.0, 1.0) - clamp(raw_visibility.y, 0.0, 1.0));
                     let sky_similarity = clamp(1.0 - smoothstep(mix(0.08, 0.12, far_filter), mix(0.55, 0.82, far_filter), sky_delta), 0.0, 1.0);
-                    let neighbor_validity = clamp(max(neighbor_volume.a, neighbor_visibility.z), 0.0, 1.0);
+                    let neighbor_validity = clamp(neighbor_volume.a, 0.0, 1.0);
                     let neighbor_weight = geometric_weight * sky_similarity * (0.25 + 0.75 * neighbor_validity);
 
                     filtered_volume = filtered_volume + neighbor_volume * neighbor_weight;
@@ -1725,22 +1886,21 @@ fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
     filtered_visibility = filtered_visibility / max(weight, 0.0001);
 
     let sky_filter_power = max(0.25, rc.light0.w);
-    let sky_filter_gate = pow(clamp(raw_visibility.w, 0.0, 1.0), sky_filter_power);
-    var out_volume = raw_volume * (1.0 - sky_filter_gate) + filtered_volume * sky_filter_gate;
+    let directional_filter_gate = 0.35 + 0.65 * pow(clamp(raw_visibility.y, 0.0, 1.0), sky_filter_power);
+    var out_volume = raw_volume * (1.0 - directional_filter_gate) + filtered_volume * directional_filter_gate;
     var out_visibility = filtered_visibility;
 
     // Do not add a colored radiance floor here. Probe filtering should preserve
     // measured radiance; the compose pass handles open-surface confidence without
     // tinting the stored RC field blue.
 
-    // Sky access is an occlusion classification, not radiance. Still, C0 cannot
-    // stay completely raw or individual open probes become visible light blobs.
-    // Use bilateral-filtered sky visibility for the daylight baseline while the
-    // sky-similarity term above prevents open probes from flooding sealed caves.
-    let sky_visibility_blend = mix(0.62, 0.86, far_filter);
-    out_visibility.w = mix(raw_visibility.w, clamp(filtered_visibility.w, 0.0, 1.0), sky_visibility_blend);
+    // The visibility texture now stores packed directional lobe weights. Filter
+    // them, then renormalize so compose can treat them as a per-probe directional
+    // distribution instead of old scalar visibility statistics.
+    let directional_blend = mix(0.62, 0.86, far_filter);
+    out_visibility = mix(raw_visibility, max(filtered_visibility, vec4f(0.0, 0.0, 0.0, 0.0)), directional_blend);
+    out_visibility = normalize_direction_buckets(out_visibility);
     out_volume = vec4f(max(out_volume.rgb, vec3f(0.0, 0.0, 0.0)), clamp(out_volume.a, 0.0, 1.0));
-    out_visibility = max(out_visibility, vec4f(0.0, 0.0, 0.0, 0.0));
 
     textureStore(dst_volume, coord, out_volume);
     textureStore(dst_visibility, coord, out_visibility);
