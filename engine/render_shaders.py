@@ -1921,6 +1921,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
         dir_buckets[init_slot] = vec3f(0.0, 0.0, 0.0);
         dir_opacity[init_slot] = 0.0;
     }
+    let expected_samples_per_direction = max(1.0, f32(max(1u, ray_count)) / f32(max(1, active_dir_count)));
     var direction_vector_accum = vec3f(0.0, 0.0, 0.0);
     var direction_energy_accum = 0.0;
     var hit_count = 0.0;
@@ -2002,10 +2003,12 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 if (far_conf > 0.035) {
                     let far_sky_open = saturate(far_vis.w);
                     let merge_scale = mix(0.72, 0.40, f32(current_cascade) / 3.0);
-                    let merged_radiance = far_probe.rgb * far_conf * merge_scale;
+                    let local_interval_opacity = saturate(dir_opacity[current_merge_slot] / expected_samples_per_direction);
+                    let interval_transmittance = 1.0 - local_interval_opacity;
+                    let merged_radiance = far_probe.rgb * far_conf * merge_scale * interval_transmittance;
                     accum = accum + merged_radiance;
                     dir_buckets[current_merge_slot] = dir_buckets[current_merge_slot] + merged_radiance;
-                    dir_opacity[current_merge_slot] = dir_opacity[current_merge_slot] + far_conf * 0.70;
+                    dir_opacity[current_merge_slot] = dir_opacity[current_merge_slot] + far_conf * interval_transmittance * 0.70;
                     let merged_energy = max(max(merged_radiance.r, merged_radiance.g), merged_radiance.b);
                     direction_vector_accum = direction_vector_accum + normalize(dir) * merged_energy;
                     direction_energy_accum = direction_energy_accum + merged_energy;
@@ -2066,7 +2069,6 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let temporal_descriptor = normalize_direction_descriptor(mix(prev_descriptor, direction_descriptor, descriptor_new_weight));
     let out_descriptor = vec4f(temporal_descriptor.xyz, max(direction_descriptor.w, temporal_descriptor.w));
 
-    let expected_samples_per_direction = max(1.0, f32(max(1u, ray_count)) / f32(max(1, active_dir_count)));
     for (var store_slot: i32 = 0; store_slot < RC_DIRECTION_COUNT; store_slot = store_slot + 1) {
         let active_scale = select(0.0, 1.0, store_slot < active_dir_count);
         let traced_rgb = dir_buckets[store_slot] * inv_ray_count * solid_radiance_scale * active_scale;
