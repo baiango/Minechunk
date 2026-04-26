@@ -129,7 +129,7 @@ class Camera:
         self.pitch = clamp(self.pitch, -1.45, 1.45)
 
 
-_DEFAULT_ENGINE_MODE = ENGINE_MODE_METAL
+_DEFAULT_ENGINE_MODE = ENGINE_MODE_WGPU
 _engine_mode_env = os.environ.get("MINECHUNK_ENGINE_MODE", "").strip().lower()
 if _engine_mode_env in (ENGINE_MODE_CPU, ENGINE_MODE_WGPU, ENGINE_MODE_METAL):
     engine_mode = _engine_mode_env

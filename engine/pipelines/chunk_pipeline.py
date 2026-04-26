@@ -7,7 +7,10 @@ import numpy as np
 
 from ..cache import mesh_allocator as mesh_cache
 from ..meshing import gpu_mesher as wgpu_mesher
-from ..meshing import metal_mesher
+try:
+    from ..meshing import metal_mesher
+except Exception:
+    metal_mesher = None  # type: ignore[assignment]
 from ..meshing_types import ChunkMesh
 from ..terrain.types import ChunkVoxelResult
 from ..visibility.coord_manager import refresh_visible_chunk_set, rebuild_visible_missing_tracking
@@ -25,7 +28,7 @@ def _renderer_module():
     return renderer_module
 
 def _terrain_mesher(renderer):
-    if meshing_stage.selected_mesher_kind(renderer) == "metal":
+    if meshing_stage.selected_mesher_kind(renderer) == "metal" and metal_mesher is not None:
         return metal_mesher
     return wgpu_mesher
 

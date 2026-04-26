@@ -21,13 +21,17 @@ from ..meshing.cpu_mesher import (
     cpu_make_chunk_mesh_batch_from_terrain_results,
     cpu_make_chunk_mesh_from_terrain_result,
 )
-from ..meshing import gpu_mesher, metal_mesher
+from ..meshing import gpu_mesher
+try:
+    from ..meshing import metal_mesher
+except Exception:
+    metal_mesher = None  # type: ignore[assignment]
 
 
 def selected_mesher_kind(renderer) -> str:
     if not getattr(renderer, "use_gpu_meshing", False):
         return "cpu"
-    return "metal" if getattr(renderer, "_using_metal_meshing", False) else "wgpu"
+    return "metal" if getattr(renderer, "_using_metal_meshing", False) and metal_mesher is not None else "wgpu"
 
 
 def selected_mesher_label(renderer) -> str:
@@ -40,7 +44,11 @@ def selected_mesher_label(renderer) -> str:
 
 
 def _select_mesher(renderer):
-    return metal_mesher if selected_mesher_kind(renderer) == "metal" else gpu_mesher
+    if selected_mesher_kind(renderer) == "metal":
+        if metal_mesher is None:
+            raise RuntimeError("Metal mesher was selected but the optional Metal backend is unavailable.")
+        return metal_mesher
+    return gpu_mesher
 
 
 def terrain_surface_device_kind(renderer) -> str:
@@ -136,7 +144,7 @@ def enqueue_surface_gpu_batches_for_meshing(renderer, surface_batches):
             released = False
             if callable(release):
                 try:
-                    release(surface_batch) if mesher is metal_mesher else release(renderer, surface_batch)
+                    release(surface_batch) if (metal_mesher is not None and mesher is metal_mesher) else release(renderer, surface_batch)
                     released = True
                 except TypeError:
                     try:

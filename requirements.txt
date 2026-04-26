@@ -3,6 +3,6 @@ rendercanvas>=2.2
 numpy>=1.24
 # Optional acceleration for terrain kernels:
 numba>=0.60
-# Optional macOS Metal terrain backend:
-# pyobjc-framework-Metal
+# Optional macOS Metal terrain/meshing backend. Install manually on macOS only:
+#   python3 -m pip install pyobjc-framework-Metal
 # line_profiler

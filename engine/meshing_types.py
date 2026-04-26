@@ -116,6 +116,7 @@ class AsyncVoxelMeshBatchResources:
     chunk_totals_buffer: wgpu.GPUBuffer
     chunk_offsets_buffer: wgpu.GPUBuffer
     params_buffer: wgpu.GPUBuffer
+    expand_params_buffer: wgpu.GPUBuffer
     readback_buffer: wgpu.GPUBuffer
     emit_vertex_buffer: wgpu.GPUBuffer
     coords_array: np.ndarray

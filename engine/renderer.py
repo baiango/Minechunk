@@ -18,6 +18,9 @@ from .render_shaders import (
     GI_GBUFFER_SHADER,
     GI_POSTPROCESS_SHADER,
     GPU_VISIBILITY_SHADER,
+    WORLDSPACE_RC_FILTER_SHADER,
+    WORLDSPACE_RC_TRACE_SHADER,
+    WORLDSPACE_RC_UPDATE_PARAMS_BYTES,
     HUD_SHADER,
     RENDER_SHADER,
     TILE_MERGE_SHADER,
@@ -35,7 +38,13 @@ from .render_utils import (
     right_vector,
 )
 from .meshing import gpu_mesher as wgpu_mesher
-from .meshing import metal_mesher as metal_mesher
+try:
+    from .meshing import metal_mesher as metal_mesher
+except Exception as exc:  # Metal is optional; WGPU/CPU modes must import without pyobjc.
+    metal_mesher = None  # type: ignore[assignment]
+    METAL_MESHER_IMPORT_ERROR = exc
+else:
+    METAL_MESHER_IMPORT_ERROR = None
 try:
     from wgpu.backends.wgpu_native import multi_draw_indirect as wgpu_native_multi_draw_indirect
 except Exception:
@@ -154,10 +163,10 @@ class TerrainRenderer:
                 "Run `python3 -m pip install -r requirements.txt`, or launch with --allow-metal-fallback."
             )
         self.mesh_backend_label = "CPU"
-        self._using_metal_meshing = bool(self.use_gpu_meshing and engine_mode == ENGINE_MODE_METAL)
+        self._using_metal_meshing = bool(self.use_gpu_meshing and engine_mode == ENGINE_MODE_METAL and metal_mesher is not None)
         if self.use_gpu_meshing:
             self.mesh_backend_label = "Metal" if self._using_metal_meshing else "Wgpu"
-        if self._using_metal_meshing:
+        if self._using_metal_meshing and metal_mesher is not None:
             metal_mesher.prewarm_metal_chunk_mesher(self)
         if self.use_gpu_terrain and self.world.terrain_backend_label() == "Metal":
             print(
@@ -200,16 +209,25 @@ class TerrainRenderer:
         self.worldspace_rc_visibility_textures = []
         self.worldspace_rc_visibility_views = []
         self.worldspace_rc_volume_params_buffer = None
+        self.worldspace_rc_update_param_buffers = []
+        self.worldspace_rc_scratch_textures = []
+        self.worldspace_rc_scratch_views = []
+        self.worldspace_rc_visibility_scratch_textures = []
+        self.worldspace_rc_visibility_scratch_views = []
+        self.worldspace_rc_trace_bind_groups = []
+        self.worldspace_rc_filter_bind_groups = []
+        self.worldspace_rc_filter_pingpong_bind_groups = []
         self._worldspace_rc_signature = None
         self._worldspace_rc_active_signatures = [None, None, None, None]
         self._worldspace_rc_active_mins = [(0.0, 0.0, 0.0) for _ in range(4)]
         self._worldspace_rc_active_inv_extents = [(0.0, 0.0, 0.0) for _ in range(4)]
-        self._worldspace_rc_cpu_radiance_volumes = [None, None, None, None]
-        self._worldspace_rc_cpu_visibility_volumes = [None, None, None, None]
         self._worldspace_rc_last_update_frame = [-1000000, -1000000, -1000000, -1000000]
         self._worldspace_rc_update_cursor = 0
         self._worldspace_rc_frame_index = 0
-        self._worldspace_rc_material_lru: OrderedDict[tuple[int, int, int], int] = OrderedDict()
+        self.worldspace_rc_trace_bind_group_layout = None
+        self.worldspace_rc_filter_bind_group_layout = None
+        self.worldspace_rc_trace_pipeline = None
+        self.worldspace_rc_filter_pipeline = None
         self.postprocess_depth_texture = None
         self.postprocess_depth_view = None
         self.postprocess_sampler = None
@@ -455,6 +473,13 @@ class TerrainRenderer:
             size=256,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
+        self.worldspace_rc_update_param_buffers = [
+            self.device.create_buffer(
+                size=WORLDSPACE_RC_UPDATE_PARAMS_BYTES,
+                usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+            )
+            for _ in range(4)
+        ]
         self.final_present_params_buffer = self.device.create_buffer(
             size=32,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
@@ -819,6 +844,54 @@ class TerrainRenderer:
                 },
             ],
         )
+        self.worldspace_rc_trace_bind_group_layout = self.device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "storage_texture": {"access": "write-only", "format": POSTPROCESS_GI_FORMAT, "view_dimension": "3d"},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "storage_texture": {"access": "write-only", "format": POSTPROCESS_GI_FORMAT, "view_dimension": "3d"},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "uniform"},
+                },
+            ],
+        )
+        self.worldspace_rc_filter_bind_group_layout = self.device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "texture": {"sample_type": "float", "view_dimension": "3d", "multisampled": False},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "storage_texture": {"access": "write-only", "format": POSTPROCESS_GI_FORMAT, "view_dimension": "3d"},
+                },
+                {
+                    "binding": 3,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "storage_texture": {"access": "write-only", "format": POSTPROCESS_GI_FORMAT, "view_dimension": "3d"},
+                },
+                {
+                    "binding": 4,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "uniform"},
+                },
+            ],
+        )
         self.final_present_bind_group_layout = self.device.create_bind_group_layout(
             entries=[
                 {
@@ -858,6 +931,18 @@ class TerrainRenderer:
             self.mesh_visibility_pipeline = None
             self.use_gpu_visibility_culling = False
             print(f"Warning: GPU visibility pipeline could not be created ({exc!s}); using CPU visibility.", file=sys.stderr)
+
+
+        worldspace_rc_trace_module = self.device.create_shader_module(code=WORLDSPACE_RC_TRACE_SHADER)
+        worldspace_rc_filter_module = self.device.create_shader_module(code=WORLDSPACE_RC_FILTER_SHADER)
+        self.worldspace_rc_trace_pipeline = self.device.create_compute_pipeline(
+            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.worldspace_rc_trace_bind_group_layout]),
+            compute={"module": worldspace_rc_trace_module, "entry_point": "trace_main"},
+        )
+        self.worldspace_rc_filter_pipeline = self.device.create_compute_pipeline(
+            layout=self.device.create_pipeline_layout(bind_group_layouts=[self.worldspace_rc_filter_bind_group_layout]),
+            compute={"module": worldspace_rc_filter_module, "entry_point": "filter_main"},
+        )
 
         if self._using_metal_meshing:
             self.voxel_mesh_count_pipeline = None
@@ -1086,10 +1171,11 @@ class TerrainRenderer:
         if self._shutdown_complete:
             return
         self._shutdown_complete = True
-        try:
-            metal_mesher.shutdown_renderer_async_state(self)
-        except Exception:
-            pass
+        if metal_mesher is not None:
+            try:
+                metal_mesher.shutdown_renderer_async_state(self)
+            except Exception:
+                pass
         try:
             self.world.destroy()
         except Exception:
@@ -1114,8 +1200,17 @@ class TerrainRenderer:
         self.gi_cascade_views = []
         self.gi_cascade_param_buffers = []
         self.gi_cascade_bind_groups = []
+        self.worldspace_rc_textures = []
+        self.worldspace_rc_views = []
         self.worldspace_rc_visibility_textures = []
         self.worldspace_rc_visibility_views = []
+        self.worldspace_rc_scratch_textures = []
+        self.worldspace_rc_scratch_views = []
+        self.worldspace_rc_visibility_scratch_textures = []
+        self.worldspace_rc_visibility_scratch_views = []
+        self.worldspace_rc_trace_bind_groups = []
+        self.worldspace_rc_filter_bind_groups = []
+        self.worldspace_rc_filter_pingpong_bind_groups = []
         self._worldspace_rc_signature = None
         self.postprocess_depth_texture = None
         self.postprocess_depth_view = None
@@ -1349,10 +1444,11 @@ class TerrainRenderer:
         while self._pending_gpu_mesh_batches:
             pending = self._pending_gpu_mesh_batches.popleft()
             if hasattr(pending, "slot") or hasattr(pending, "surface_release_callbacks"):
-                try:
-                    metal_mesher.destroy_async_voxel_mesh_batch_resources(pending)
-                except Exception:
-                    pass
+                if metal_mesher is not None:
+                    try:
+                        metal_mesher.destroy_async_voxel_mesh_batch_resources(pending)
+                    except Exception:
+                        pass
                 continue
             readback_buffer = getattr(pending, "readback_buffer", None)
             if readback_buffer is not None and getattr(readback_buffer, "map_state", "unmapped") != "unmapped":
@@ -1396,10 +1492,11 @@ class TerrainRenderer:
         self._clear_transient_render_buffers()
         self._visible_chunk_origin = None
         self._cached_visible_render_batches.clear()
-        try:
-            metal_mesher.shutdown_renderer_async_state(self)
-        except Exception:
-            pass
+        if metal_mesher is not None:
+            try:
+                metal_mesher.shutdown_renderer_async_state(self)
+            except Exception:
+                pass
         try:
             self.world.destroy()
         except Exception:
@@ -1418,10 +1515,10 @@ class TerrainRenderer:
                 "ENGINE_MODE_METAL was requested after reset, but the active terrain backend is "
                 f"{self.world.terrain_backend_label()!r}{detail}. Refusing CPU/WGPU fallback."
             )
-        self._using_metal_meshing = bool(self.use_gpu_meshing and engine_mode == ENGINE_MODE_METAL)
+        self._using_metal_meshing = bool(self.use_gpu_meshing and engine_mode == ENGINE_MODE_METAL and metal_mesher is not None)
         if self.use_gpu_meshing:
             self.mesh_backend_label = "Metal" if self._using_metal_meshing else "Wgpu"
-        if self._using_metal_meshing:
+        if self._using_metal_meshing and metal_mesher is not None:
             metal_mesher.prewarm_metal_chunk_mesher(self)
         if self.use_gpu_terrain and self.world.terrain_backend_label() == "Metal":
             print(
@@ -2159,6 +2256,13 @@ class TerrainRenderer:
             and len(self.gi_cascade_views) == cascade_count
             and len(self.gi_cascade_bind_groups) == cascade_count
             and len(self.worldspace_rc_views) == 4
+            and len(self.worldspace_rc_visibility_views) == 4
+            and len(self.worldspace_rc_scratch_views) == 4
+            and len(self.worldspace_rc_visibility_scratch_views) == 4
+            and len(self.worldspace_rc_update_param_buffers) == 4
+            and len(self.worldspace_rc_trace_bind_groups) == 4
+            and len(self.worldspace_rc_filter_bind_groups) == 4
+            and len(self.worldspace_rc_filter_pingpong_bind_groups) == 4
             and self.gi_compose_bind_group is not None
             and self.final_scene_bind_group is not None
             and self.final_gi_bind_group is not None
@@ -2219,29 +2323,51 @@ class TerrainRenderer:
         self.worldspace_rc_views = []
         self.worldspace_rc_visibility_textures = []
         self.worldspace_rc_visibility_views = []
-        for _ in range(4):
+        self.worldspace_rc_scratch_textures = []
+        self.worldspace_rc_scratch_views = []
+        self.worldspace_rc_visibility_scratch_textures = []
+        self.worldspace_rc_visibility_scratch_views = []
+        self.worldspace_rc_trace_bind_groups = []
+        self.worldspace_rc_filter_bind_groups = []
+        self.worldspace_rc_filter_pingpong_bind_groups = []
+        rc_texture_usage = wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.STORAGE_BINDING
+        for cascade_index in range(4):
             rc_texture = self.device.create_texture(
                 size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
                 dimension="3d",
                 format=POSTPROCESS_GI_FORMAT,
-                usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+                usage=rc_texture_usage,
             )
             vis_texture = self.device.create_texture(
                 size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
                 dimension="3d",
                 format=POSTPROCESS_GI_FORMAT,
-                usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST,
+                usage=rc_texture_usage,
+            )
+            scratch_texture = self.device.create_texture(
+                size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
+                dimension="3d",
+                format=POSTPROCESS_GI_FORMAT,
+                usage=rc_texture_usage,
+            )
+            scratch_vis_texture = self.device.create_texture(
+                size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
+                dimension="3d",
+                format=POSTPROCESS_GI_FORMAT,
+                usage=rc_texture_usage,
             )
             self.worldspace_rc_textures.append(rc_texture)
             self.worldspace_rc_views.append(rc_texture.create_view(dimension="3d"))
             self.worldspace_rc_visibility_textures.append(vis_texture)
             self.worldspace_rc_visibility_views.append(vis_texture.create_view(dimension="3d"))
+            self.worldspace_rc_scratch_textures.append(scratch_texture)
+            self.worldspace_rc_scratch_views.append(scratch_texture.create_view(dimension="3d"))
+            self.worldspace_rc_visibility_scratch_textures.append(scratch_vis_texture)
+            self.worldspace_rc_visibility_scratch_views.append(scratch_vis_texture.create_view(dimension="3d"))
         self._worldspace_rc_signature = None
         self._worldspace_rc_active_signatures = [None, None, None, None]
         self._worldspace_rc_active_mins = [(0.0, 0.0, 0.0) for _ in range(4)]
         self._worldspace_rc_active_inv_extents = [(0.0, 0.0, 0.0) for _ in range(4)]
-        self._worldspace_rc_cpu_radiance_volumes = [None, None, None, None]
-        self._worldspace_rc_cpu_visibility_volumes = [None, None, None, None]
         self._worldspace_rc_last_update_frame = [-1000000, -1000000, -1000000, -1000000]
         self._worldspace_rc_update_cursor = 0
         self.gi_cascade_textures = []
@@ -2318,6 +2444,42 @@ class TerrainRenderer:
         self.gi_bind_group = self.gi_cascade_bind_groups[0] if self.gi_cascade_bind_groups else None
         worldspace_rc_params = np.zeros((8, 4), dtype=np.float32)
         self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, worldspace_rc_params.tobytes())
+        for cascade_index in range(4):
+            update_param_buffer = self.worldspace_rc_update_param_buffers[cascade_index]
+            self.worldspace_rc_trace_bind_groups.append(
+                self.device.create_bind_group(
+                    layout=self.worldspace_rc_trace_bind_group_layout,
+                    entries=[
+                        {"binding": 0, "resource": self.worldspace_rc_scratch_views[cascade_index]},
+                        {"binding": 1, "resource": self.worldspace_rc_visibility_scratch_views[cascade_index]},
+                        {"binding": 2, "resource": {"buffer": update_param_buffer, "offset": 0, "size": WORLDSPACE_RC_UPDATE_PARAMS_BYTES}},
+                    ],
+                )
+            )
+            self.worldspace_rc_filter_bind_groups.append(
+                self.device.create_bind_group(
+                    layout=self.worldspace_rc_filter_bind_group_layout,
+                    entries=[
+                        {"binding": 0, "resource": self.worldspace_rc_scratch_views[cascade_index]},
+                        {"binding": 1, "resource": self.worldspace_rc_visibility_scratch_views[cascade_index]},
+                        {"binding": 2, "resource": self.worldspace_rc_views[cascade_index]},
+                        {"binding": 3, "resource": self.worldspace_rc_visibility_views[cascade_index]},
+                        {"binding": 4, "resource": {"buffer": update_param_buffer, "offset": 0, "size": WORLDSPACE_RC_UPDATE_PARAMS_BYTES}},
+                    ],
+                )
+            )
+            self.worldspace_rc_filter_pingpong_bind_groups.append(
+                self.device.create_bind_group(
+                    layout=self.worldspace_rc_filter_bind_group_layout,
+                    entries=[
+                        {"binding": 0, "resource": self.worldspace_rc_views[cascade_index]},
+                        {"binding": 1, "resource": self.worldspace_rc_visibility_views[cascade_index]},
+                        {"binding": 2, "resource": self.worldspace_rc_scratch_views[cascade_index]},
+                        {"binding": 3, "resource": self.worldspace_rc_visibility_scratch_views[cascade_index]},
+                        {"binding": 4, "resource": {"buffer": update_param_buffer, "offset": 0, "size": WORLDSPACE_RC_UPDATE_PARAMS_BYTES}},
+                    ],
+                )
+            )
         self.gi_compose_bind_group = self.device.create_bind_group(
             layout=self.gi_compose_bind_group_layout,
             entries=[
@@ -2388,606 +2550,70 @@ class TerrainRenderer:
                     current_binding_offset = binding_offset
                 draw(vertex_count, 1, first_vertex, 0)
 
-    @profile
-    def _worldspace_rc_material_rgb(self, material: int) -> tuple[float, float, float]:
-        if material == 1:
-            return 0.24, 0.22, 0.20
-        if material == 2:
-            return 0.42, 0.40, 0.38
-        if material == 3:
-            return 0.47, 0.31, 0.18
-        if material == 4:
-            return 0.31, 0.68, 0.24
-        if material == 5:
-            return 0.78, 0.71, 0.49
-        if material == 6:
-            return 0.95, 0.97, 0.98
-        return 0.60, 0.80, 0.98
-
-    @profile
-    def _worldspace_rc_trace_directions(self) -> tuple[tuple[float, float, float], ...]:
-        cached = getattr(self, "_worldspace_rc_trace_dirs", None)
-        target_count = max(6, int(WORLDSPACE_RC_TRACE_DIRECTIONS))
-        if cached is not None and len(cached) == target_count:
-            return cached
-        directions: list[tuple[float, float, float]] = []
-        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
-        for i in range(target_count):
-            y = 1.0 - (2.0 * (float(i) + 0.5) / float(target_count))
-            radius = math.sqrt(max(0.0, 1.0 - y * y))
-            theta = golden_angle * float(i)
-            directions.append((math.cos(theta) * radius, y, math.sin(theta) * radius))
-        self._worldspace_rc_trace_dirs = tuple(directions)
-        self._worldspace_rc_trace_dir_subset_cache = {}
-        return self._worldspace_rc_trace_dirs
-
-    def _worldspace_rc_effective_trace_directions(
+    def _make_worldspace_rc_update_params(
         self,
         cascade_index: int,
-        origin_sky_visibility: float,
-    ) -> tuple[tuple[float, float, float], ...]:
-        """Return a cached adaptive ray set for one RC cascade.
-
-        Far cascades are filtered and temporally blended, so they do not need
-        the same angular density as the near cascade. Keep cascade 0 at full
-        quality, mildly thin cascade 1, then aggressively thin the far two
-        cascades. Dark/underground probes get one more reduction because sky
-        rays contribute very little there.
-        """
-        directions = self._worldspace_rc_trace_directions()
-        base_count = len(directions)
-        cascade = max(0, int(cascade_index))
-        low_sky = bool(origin_sky_visibility <= 0.04)
-        cache_key = (base_count, cascade, low_sky)
-        subset_cache = getattr(self, "_worldspace_rc_trace_dir_subset_cache", None)
-        if subset_cache is None:
-            subset_cache = {}
-            self._worldspace_rc_trace_dir_subset_cache = subset_cache
-        cached_subset = subset_cache.get(cache_key)
-        if cached_subset is not None:
-            return cached_subset
-
-        if cascade <= 0:
-            target_count = base_count
-        elif cascade == 1:
-            target_count = max(12, (base_count * 3 + 3) // 4)
-        elif cascade == 2:
-            target_count = max(6, (base_count + 1) // 2)
-        else:
-            target_count = max(4, (base_count + 3) // 4)
-
-        if low_sky and cascade >= 1:
-            min_dark_count = 6 if cascade == 1 else 4
-            target_count = max(min_dark_count, (target_count * 2 + 2) // 3)
-        target_count = max(1, min(base_count, int(target_count)))
-
-        if target_count >= base_count:
-            subset = directions
-        else:
-            # Evenly pick directions across the Fibonacci sphere instead of
-            # slicing with a fixed stride, which biases toward early samples.
-            indices: list[int] = []
-            seen: set[int] = set()
-            for i in range(target_count):
-                idx = int((float(i) + 0.5) * float(base_count) / float(target_count))
-                idx = min(base_count - 1, max(0, idx))
-                if idx not in seen:
-                    indices.append(idx)
-                    seen.add(idx)
-            # Rare small-count duplicate guard. Fill holes deterministically.
-            if len(indices) < target_count:
-                for idx in range(base_count):
-                    if idx in seen:
-                        continue
-                    indices.append(idx)
-                    seen.add(idx)
-                    if len(indices) >= target_count:
-                        break
-            subset = tuple(directions[idx] for idx in indices[:target_count])
-
-        subset_cache[cache_key] = subset
-        return subset
-
-    @profile
-    def _worldspace_rc_solid_at(
-        self,
-        bx: int,
-        by: int,
-        bz: int,
-        material_cache: dict[tuple[int, int, int], int],
-    ) -> bool:
-        key = (int(bx), int(by), int(bz))
-        material = material_cache.get(key)
-        if material is None:
-            # The previous cross-frame OrderedDict LRU thrashed heavily during
-            # flying RC updates: the benchmark saw tens of millions of evictions
-            # and only a tiny hit rate. The per-update material_cache already
-            # catches locality inside one cascade refresh, so avoid the global LRU
-            # bookkeeping on this hot path.
-            material = int(self.world.block_at(key[0], key[1], key[2])) if key[1] >= 0 else 1
-            material_cache[key] = material
-        return material != int(AIR)
-
-    @profile
-    def _worldspace_rc_estimate_hit_normal(
-        self,
-        bx: int,
-        by: int,
-        bz: int,
-        ray_dx: float,
-        ray_dy: float,
-        ray_dz: float,
-        material_cache: dict[tuple[int, int, int], int],
-        normal_cache: dict[tuple[int, int, int], tuple[float, float, float]] | None = None,
-    ) -> tuple[float, float, float]:
-        cache_key = (int(bx), int(by), int(bz))
-        if normal_cache is not None:
-            cached = normal_cache.get(cache_key)
-            if cached is not None:
-                return cached
-        sx0 = 1.0 if self._worldspace_rc_solid_at(bx - 1, by, bz, material_cache) else 0.0
-        sx1 = 1.0 if self._worldspace_rc_solid_at(bx + 1, by, bz, material_cache) else 0.0
-        sy0 = 1.0 if self._worldspace_rc_solid_at(bx, by - 1, bz, material_cache) else 0.0
-        sy1 = 1.0 if self._worldspace_rc_solid_at(bx, by + 1, bz, material_cache) else 0.0
-        sz0 = 1.0 if self._worldspace_rc_solid_at(bx, by, bz - 1, material_cache) else 0.0
-        sz1 = 1.0 if self._worldspace_rc_solid_at(bx, by, bz + 1, material_cache) else 0.0
-        nx = sx0 - sx1
-        ny = sy0 - sy1
-        nz = sz0 - sz1
-        length = math.sqrt(nx * nx + ny * ny + nz * nz)
-        if length <= 0.0001:
-            nx = -float(ray_dx)
-            ny = -float(ray_dy)
-            nz = -float(ray_dz)
-            length = math.sqrt(nx * nx + ny * ny + nz * nz)
-            inv_length = 1.0 / max(length, 0.0001)
-            return nx * inv_length, ny * inv_length, nz * inv_length
-        inv_length = 1.0 / max(length, 0.0001)
-        normal = (nx * inv_length, ny * inv_length, nz * inv_length)
-        if normal_cache is not None:
-            normal_cache[cache_key] = normal
-        return normal
-
-    @profile
-    def _worldspace_rc_hit_sky_visibility(
-        self,
-        bx: int,
-        by: int,
-        bz: int,
-        material_cache: dict[tuple[int, int, int], int],
-        sky_visibility_cache: dict[tuple[int, int, int], float] | None = None,
-        surface_height_cache: dict[tuple[int, int], int] | None = None,
-    ) -> float:
-        cache_key = (int(bx), int(by), int(bz))
-        if sky_visibility_cache is not None:
-            cached = sky_visibility_cache.get(cache_key)
-            if cached is not None:
-                return cached
-
-        sample_count = max(1, int(WORLDSPACE_RC_SKY_VISIBILITY_STEPS))
-        step_blocks = max(1, int(WORLDSPACE_RC_SKY_VISIBILITY_STEP_BLOCKS))
-        aperture_radius = max(1, int(WORLDSPACE_RC_SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS))
-        aperture_power = max(0.25, float(WORLDSPACE_RC_SKY_VISIBILITY_APERTURE_POWER))
-        min_aperture = max(0.0, min(0.25, float(WORLDSPACE_RC_SKY_VISIBILITY_MIN_APERTURE)))
-        side_weight = max(0.0, min(1.0, float(WORLDSPACE_RC_SKY_VISIBILITY_SIDE_WEIGHT)))
-        world_height = int(getattr(self.world, "height", 0))
-
-        def surface_height_at_cached(cx: int, cz: int) -> int:
-            column_key = (int(cx), int(cz))
-            if surface_height_cache is not None:
-                cached_height = surface_height_cache.get(column_key)
-                if cached_height is not None:
-                    return int(cached_height)
-            try:
-                height = int(self.world.surface_height_at(column_key[0], column_key[1]))
-            except Exception:
-                height = world_height
-            if surface_height_cache is not None:
-                surface_height_cache[column_key] = height
-            return height
-
-        def column_access(sx: int, sz: int) -> float:
-            column_x = cache_key[0] + int(sx)
-            column_z = cache_key[2] + int(sz)
-            surface_height = surface_height_at_cached(column_x, column_z)
-
-            # Terrain blocks are guaranteed air at y >= surface_height. Once the
-            # upward probe reaches that point, the remaining samples are open
-            # without any block_at/material lookup.
-            if cache_key[1] >= surface_height - 1:
-                return 1.0
-
-            open_count = 0
-            for step in range(1, sample_count + 1):
-                sample_y = cache_key[1] + step * step_blocks
-                if sample_y >= surface_height:
-                    open_count += sample_count - step + 1
-                    break
-                if self._worldspace_rc_solid_at(column_x, sample_y, column_z, material_cache):
-                    break
-                open_count += 1
-            return float(open_count) / float(sample_count)
-
-        if cache_key[1] < 0:
-            visibility = 0.0
-        else:
-            center_access = column_access(0, 0)
-            if center_access <= 0.0:
-                visibility = 0.0
-            elif center_access >= 0.999 or side_weight <= 0.0001:
-                visibility = center_access
-            else:
-                # The default side weight is low, so use four cardinal side
-                # columns instead of eight. Diagonals are reserved for high side
-                # weights where the extra aperture detail is explicitly requested.
-                side_offsets = [
-                    (aperture_radius, 0),
-                    (-aperture_radius, 0),
-                    (0, aperture_radius),
-                    (0, -aperture_radius),
-                ]
-                if side_weight >= 0.5:
-                    side_offsets.extend(
-                        [
-                            (aperture_radius, aperture_radius),
-                            (aperture_radius, -aperture_radius),
-                            (-aperture_radius, aperture_radius),
-                            (-aperture_radius, -aperture_radius),
-                        ]
-                    )
-
-                side_access = 0.0
-                for sx, sz in side_offsets:
-                    side_access += column_access(sx, sz)
-                side_access /= float(len(side_offsets))
-                aperture = max(min_aperture, side_access ** aperture_power)
-                visibility = center_access * aperture
-
-        if sky_visibility_cache is not None:
-            sky_visibility_cache[cache_key] = visibility
-        return visibility
-
-    @profile
-    def _trace_worldspace_rc_probe(
-        self,
-        origin: tuple[float, float, float],
-        max_distance: float,
-        cascade_index: int,
-        material_cache: dict[tuple[int, int, int], int],
-        sky_visibility_cache: dict[tuple[int, int, int], float],
-        normal_cache: dict[tuple[int, int, int], tuple[float, float, float]],
-        probe_trace_cache: dict[tuple[int, int, int, int], tuple[tuple[float, float, float], float, float, float, float, float]],
-        surface_height_cache: dict[tuple[int, int], int],
-    ) -> tuple[tuple[float, float, float], float, float, float, float, float]:
-        sky_rgb = (
-            0.60 * float(RADIANCE_CASCADES_SKY_STRENGTH),
-            0.80 * float(RADIANCE_CASCADES_SKY_STRENGTH),
-            0.98 * float(RADIANCE_CASCADES_SKY_STRENGTH),
+        min_corner: tuple[float, float, float],
+        full_extent: float,
+        resolution: int,
+    ) -> np.ndarray:
+        max_distance = float(full_extent) * 0.5
+        seed = float(getattr(self.world, "seed", 0))
+        world_height = float(self.world.height)
+        light_dir = tuple(float(v) for v in LIGHT_DIRECTION)
+        grid_spacing_world = float(full_extent) / max(1.0, float(resolution - 1))
+        grid_spacing_blocks = grid_spacing_world / max(float(BLOCK_SIZE), 0.000001)
+        # Far-cascade probe cells are much larger than C0. A fixed 3-8 block
+        # push leaves many C1/C2/C3 probes buried inside terrain, so those
+        # invalid dark texels show up as sharp square dark patches on distant
+        # chunks. Scale the solid-probe push radius with cascade cell size while
+        # keeping a sane cap so sealed cave probes still classify by hard sky
+        # occlusion after they are moved to nearby air.
+        max_probe_push_blocks = min(96.0, max(float(WORLDSPACE_RC_INVALID_PROBE_DILATE_MAX_GRID_DISTANCE), grid_spacing_blocks * 1.25))
+        return np.array(
+            [
+                float(min_corner[0]),
+                float(min_corner[1]),
+                float(min_corner[2]),
+                float(full_extent),
+                float(resolution),
+                float(cascade_index),
+                float(max_distance),
+                float(BLOCK_SIZE),
+                seed,
+                world_height,
+                float(WORLDSPACE_RC_TRACE_MAX_STEPS),
+                float(WORLDSPACE_RC_TRACE_DIRECTIONS),
+                float(RADIANCE_CASCADES_SKY_STRENGTH),
+                float(WORLDSPACE_RC_DIRECT_SUN_STRENGTH),
+                float(WORLDSPACE_RC_INDIRECT_FLOOR),
+                float(WORLDSPACE_RC_SPATIAL_FILTER_SKY_POWER),
+                light_dir[0],
+                light_dir[1],
+                light_dir[2],
+                0.0,
+                float(max_probe_push_blocks),
+                float(WORLDSPACE_RC_INVALID_PROBE_DILATE_RADIANCE_SCALE),
+                0.0,
+                0.0,
+            ],
+            dtype=np.float32,
         )
-        sun_dx, sun_dy, sun_dz = normalize3(tuple(float(v) for v in LIGHT_DIRECTION))
-        direct_sun_strength = max(0.0, float(WORLDSPACE_RC_DIRECT_SUN_STRENGTH))
-        indirect_floor = max(0.0, float(WORLDSPACE_RC_INDIRECT_FLOOR))
-        accum = np.zeros(3, dtype=np.float32)
-        hit_count = 0.0
-        sky_count = 0.0
-        hit_sky_visibility_accum = 0.0
-        distance_accum = 0.0
-        distance_sq_accum = 0.0
-        ox, oy, oz = origin
-        origin_bx = int(math.floor(ox / BLOCK_SIZE))
-        origin_by = int(math.floor(oy / BLOCK_SIZE))
-        origin_bz = int(math.floor(oz / BLOCK_SIZE))
-        if self._worldspace_rc_solid_at(origin_bx, origin_by, origin_bz, material_cache):
-            blocked_distance = float(max_distance)
-            return (0.0, 0.0, 0.0), 0.0, blocked_distance, blocked_distance * blocked_distance, 0.0, 0.0
-        trace_cache_key = (origin_bx, origin_by, origin_bz, int(cascade_index))
-        cached_trace = probe_trace_cache.get(trace_cache_key)
-        if cached_trace is not None:
-            return cached_trace
-        origin_sky_visibility = self._worldspace_rc_hit_sky_visibility(origin_bx, origin_by, origin_bz, material_cache, sky_visibility_cache, surface_height_cache)
-        cheap_hit_shading = int(cascade_index) >= 1
-        far_hit_sky_visibility = max(0.0, min(1.0, float(origin_sky_visibility)))
-        direct_sun_scale = 0.62 if cheap_hit_shading else 1.10
-        effective_directions = self._worldspace_rc_effective_trace_directions(cascade_index, origin_sky_visibility)
-        cascade_int = max(0, min(3, int(cascade_index)))
-        base_trace_steps = max(4, int(WORLDSPACE_RC_TRACE_MAX_STEPS))
-        # The ray marcher is now the dominant RC cost. Keep the near cascade at
-        # full quality when the probe can see the sky, but use fewer/larger
-        # steps for far cascades and buried low-sky probes. Far cascades are
-        # filtered and temporally blended, so precise thin-hit marching there
-        # is much less visible than it is in cascade 0.
-        if origin_sky_visibility <= 0.04:
-            step_schedule = (
-                max(8, base_trace_steps - 6),
-                max(6, base_trace_steps - 8),
-                max(4, base_trace_steps - 10),
-                max(4, base_trace_steps - 11),
-            )
-        elif origin_sky_visibility <= 0.20:
-            step_schedule = (
-                max(10, base_trace_steps - 4),
-                max(7, base_trace_steps - 7),
-                max(5, base_trace_steps - 9),
-                max(4, base_trace_steps - 10),
-            )
-        else:
-            step_schedule = (
-                base_trace_steps,
-                max(8, base_trace_steps - 5),
-                max(5, base_trace_steps - 8),
-                max(4, base_trace_steps - 10),
-            )
-        effective_step_count = int(step_schedule[cascade_int])
-        block_size = float(BLOCK_SIZE)
-        inv_block_size = 1.0 / max(block_size, 1e-12)
-        air_material = int(AIR)
-        solid_below_world_material = 1
-        block_at = self.world.block_at
-        floor = math.floor
-        step_size = max(block_size, float(max_distance) / float(effective_step_count))
-
-        for dx, dy, dz in effective_directions:
-            dist = step_size * 0.5
-            hit = False
-            hit_distance = float(max_distance)
-            while dist <= max_distance:
-                wx = ox + dx * dist
-                wy = oy + dy * dist
-                wz = oz + dz * dist
-                bx = int(floor(wx * inv_block_size))
-                by = int(floor(wy * inv_block_size))
-                bz = int(floor(wz * inv_block_size))
-                if by < 0:
-                    material = solid_below_world_material
-                else:
-                    # The trace path has very poor material-cache locality: prior
-                    # profiles showed ~3% hit rate, so tuple creation + dict lookup
-                    # cost more than the saved block_at calls.  Probe the world
-                    # directly for air-heavy ray steps, and only publish solid hits
-                    # into material_cache for the later normal / sky helpers.
-                    material = int(block_at(bx, by, bz))
-                if material != air_material:
-                    if by >= 0:
-                        material_cache[(bx, by, bz)] = material
-                    color = self._worldspace_rc_material_rgb(material)
-                    if cheap_hit_shading:
-                        # Far cascades are spatially filtered/merged, so avoid the
-                        # expensive per-hit sky aperture probe and six-neighbor
-                        # normal estimate.  Reuse the probe's sky access and shade
-                        # against the ray-opposed normal, which preserves the broad
-                        # directional response without extra block lookups.
-                        facing = 1.0
-                        sky_visibility = far_hit_sky_visibility
-                        open_hemi = max(0.0, -dy) ** 1.5
-                        sun_term = max(0.0, -(dx * sun_dx + dy * sun_dy + dz * sun_dz))
-                    else:
-                        nx, ny, nz = self._worldspace_rc_estimate_hit_normal(bx, by, bz, dx, dy, dz, material_cache, normal_cache)
-                        facing = max(0.0, min(1.0, -(nx * dx + ny * dy + nz * dz)))
-                        sun_term = max(0.0, nx * sun_dx + ny * sun_dy + nz * sun_dz)
-                        sky_visibility = self._worldspace_rc_hit_sky_visibility(bx, by, bz, material_cache, sky_visibility_cache, surface_height_cache)
-                        open_hemi = max(0.0, ny) ** 1.5
-                    cave_gate = sky_visibility ** 3.0
-                    ambient_sky = cave_gate * (0.10 + 0.90 * open_hemi) * 0.38
-                    direct_sun = cave_gate * sun_term * direct_sun_strength * direct_sun_scale
-                    falloff = 1.0 - min(1.0, dist / max(max_distance, 1e-4))
-                    range_term = 0.16 + 0.84 * falloff
-                    facing_term = 0.20 + 0.80 * facing
-                    bounce_scale = (indirect_floor + ambient_sky + direct_sun) * range_term * facing_term
-                    accum[0] += color[0] * bounce_scale
-                    accum[1] += color[1] * bounce_scale
-                    accum[2] += color[2] * bounce_scale
-                    hit_sky_visibility_accum += sky_visibility * (0.35 + 0.65 * facing)
-                    hit_count += 1.0
-                    hit = True
-                    hit_distance = float(dist)
-                    break
-                dist += step_size
-            if not hit:
-                sky_axis = max(0.0, float(dy))
-                sky_ray_weight = (0.03 + 0.97 * (sky_axis ** 2.0)) * (max(0.0, origin_sky_visibility) ** 1.85)
-                accum[0] += sky_rgb[0] * sky_ray_weight
-                accum[1] += sky_rgb[1] * sky_ray_weight
-                accum[2] += sky_rgb[2] * sky_ray_weight
-                sky_count += sky_ray_weight
-            distance_accum += hit_distance
-            distance_sq_accum += hit_distance * hit_distance
-        ray_count = float(max(1, len(effective_directions)))
-        accum /= ray_count
-        hit_fraction = hit_count / ray_count
-        sky_fraction = min(1.0, sky_count / ray_count)
-        valid_fraction = min(1.0, max(0.0, hit_fraction + 0.75 * sky_fraction))
-        observed_sky_access = 0.0
-        if hit_count > 0.0:
-            observed_sky_access = hit_sky_visibility_accum / hit_count
-        observed_sky_access = max(observed_sky_access, sky_fraction)
-        probe_sky_access = min(1.0, max(0.0, 0.78 * origin_sky_visibility + 0.22 * observed_sky_access))
-        alpha = valid_fraction
-        mean_distance = distance_accum / ray_count
-        mean_distance_sq = distance_sq_accum / ray_count
-        result = ((float(accum[0]), float(accum[1]), float(accum[2])), float(alpha), float(mean_distance), float(mean_distance_sq), float(valid_fraction), float(probe_sky_access))
-        probe_trace_cache[trace_cache_key] = result
-        return result
 
     @profile
-    def _worldspace_rc_filter_volume(self, volume: np.ndarray) -> np.ndarray:
-        passes = max(0, int(WORLDSPACE_RC_SPATIAL_FILTER_PASSES))
-        if passes <= 0:
-            return volume.astype(np.float16, copy=False)
-        filtered = volume.astype(np.float32, copy=True)
-        for _ in range(passes):
-            src = filtered
-            dst = src * 0.40
-            weights = np.full(src.shape[:3] + (1,), 0.40, dtype=np.float32)
-            for axis in range(3):
-                src_front = [slice(None)] * 4
-                dst_front = [slice(None)] * 4
-                src_front[axis] = slice(0, -1)
-                dst_front[axis] = slice(1, None)
-                dst[tuple(dst_front)] += src[tuple(src_front)] * 0.10
-                weights[tuple(dst_front[:3] + [slice(None)])] += 0.10
-                src_back = [slice(None)] * 4
-                dst_back = [slice(None)] * 4
-                src_back[axis] = slice(1, None)
-                dst_back[axis] = slice(0, -1)
-                dst[tuple(dst_back)] += src[tuple(src_back)] * 0.10
-                weights[tuple(dst_back[:3] + [slice(None)])] += 0.10
-            filtered = dst / np.maximum(weights, 1e-6)
-        return filtered.astype(np.float16)
-
-    @profile
-    def _worldspace_rc_sparse_sample_coords(self, resolution: int, stride: int) -> tuple[int, ...]:
-        stride = max(1, int(stride))
-        coords = list(range(0, max(1, int(resolution)), stride))
-        last = max(0, int(resolution) - 1)
-        if not coords or coords[-1] != last:
-            coords.append(last)
-        return tuple(sorted(set(int(v) for v in coords)))
-
-    @profile
-    def _worldspace_rc_fill_sparse_probe_volume(
-        self,
-        volume: np.ndarray,
-        visibility_volume: np.ndarray,
-        solid_probe_mask: np.ndarray,
-        sample_coords: tuple[int, ...],
-    ) -> None:
-        resolution = int(volume.shape[0])
-        if resolution <= 1:
+    def _update_worldspace_radiance_cascades(self, encoder) -> None:
+        if (
+            len(self.worldspace_rc_textures) != 4
+            or len(self.worldspace_rc_visibility_textures) != 4
+            or len(self.worldspace_rc_trace_bind_groups) != 4
+            or len(self.worldspace_rc_filter_bind_groups) != 4
+            or len(self.worldspace_rc_filter_pingpong_bind_groups) != 4
+            or self.worldspace_rc_volume_params_buffer is None
+            or self.worldspace_rc_trace_pipeline is None
+            or self.worldspace_rc_filter_pipeline is None
+        ):
             return
 
-        sample_set = set(int(v) for v in sample_coords)
-        valid_samples: list[tuple[int, int, int]] = []
-        for sz in sample_coords:
-            for sy in sample_coords:
-                for sx in sample_coords:
-                    z = int(sz)
-                    y = int(sy)
-                    x = int(sx)
-                    if bool(solid_probe_mask[z, y, x]):
-                        continue
-                    if (
-                        float(volume[z, y, x, 3]) > 0.0001
-                        or float(visibility_volume[z, y, x, 2]) > 0.0001
-                        or float(visibility_volume[z, y, x, 3]) > 0.0001
-                    ):
-                        valid_samples.append((x, y, z))
-        if not valid_samples:
-            return
-
-        fill_invalid = bool(WORLDSPACE_RC_DILATE_INVALID_PROBES)
-        max_solid_dist = max(1, int(WORLDSPACE_RC_INVALID_PROBE_DILATE_MAX_GRID_DISTANCE))
-        max_solid_dist_sq = max_solid_dist * max_solid_dist
-        solid_radiance_scale = max(0.0, min(1.0, float(WORLDSPACE_RC_INVALID_PROBE_DILATE_RADIANCE_SCALE)))
-
-        # Previous code found the nearest valid sample by scanning every valid
-        # sample for every cell. That created hundreds of millions of distance
-        # checks in the 4096-chunk fly-forward profile. A small 3D multi-source
-        # BFS gives each cell a nearby source in O(resolution^3) time.
-        nearest_x = np.full((resolution, resolution, resolution), -1, dtype=np.int16)
-        nearest_y = np.full((resolution, resolution, resolution), -1, dtype=np.int16)
-        nearest_z = np.full((resolution, resolution, resolution), -1, dtype=np.int16)
-        nearest_dist = np.full((resolution, resolution, resolution), 32767, dtype=np.int16)
-
-        queue: deque[tuple[int, int, int]] = deque()
-        for x, y, z in valid_samples:
-            nearest_x[z, y, x] = np.int16(x)
-            nearest_y[z, y, x] = np.int16(y)
-            nearest_z[z, y, x] = np.int16(z)
-            nearest_dist[z, y, x] = np.int16(0)
-            queue.append((x, y, z))
-
-        neighbor_offsets = (
-            (1, 0, 0),
-            (-1, 0, 0),
-            (0, 1, 0),
-            (0, -1, 0),
-            (0, 0, 1),
-            (0, 0, -1),
-        )
-        while queue:
-            x, y, z = queue.popleft()
-            next_dist = int(nearest_dist[z, y, x]) + 1
-            for dx, dy, dz in neighbor_offsets:
-                nx = x + dx
-                ny = y + dy
-                nz = z + dz
-                if nx < 0 or nx >= resolution or ny < 0 or ny >= resolution or nz < 0 or nz >= resolution:
-                    continue
-                if next_dist >= int(nearest_dist[nz, ny, nx]):
-                    continue
-                nearest_dist[nz, ny, nx] = np.int16(next_dist)
-                nearest_x[nz, ny, nx] = nearest_x[z, y, x]
-                nearest_y[nz, ny, nx] = nearest_y[z, y, x]
-                nearest_z[nz, ny, nx] = nearest_z[z, y, x]
-                queue.append((nx, ny, nz))
-
-        for z in range(resolution):
-            z_sampled = z in sample_set
-            for y in range(resolution):
-                yz_sampled = z_sampled and y in sample_set
-                for x in range(resolution):
-                    sampled = yz_sampled and x in sample_set
-                    solid = bool(solid_probe_mask[z, y, x])
-                    valid = (
-                        (not solid)
-                        and (
-                            float(volume[z, y, x, 3]) > 0.0001
-                            or float(visibility_volume[z, y, x, 2]) > 0.0001
-                            or float(visibility_volume[z, y, x, 3]) > 0.0001
-                        )
-                    )
-
-                    # Keep already-valid air cells. This makes the post-filter and
-                    # post-temporal fill calls cheap instead of re-interpolating the
-                    # whole volume after it has already been populated.
-                    if valid:
-                        continue
-                    if solid and not fill_invalid:
-                        continue
-
-                    sx = int(nearest_x[z, y, x])
-                    sy = int(nearest_y[z, y, x])
-                    sz = int(nearest_z[z, y, x])
-                    if sx < 0 or sy < 0 or sz < 0:
-                        continue
-
-                    dist_sq = (sx - x) * (sx - x) + (sy - y) * (sy - y) + (sz - z) * (sz - z)
-                    if solid and dist_sq > max_solid_dist_sq:
-                        continue
-
-                    volume[z, y, x, :] = volume[sz, sy, sx, :]
-                    visibility_volume[z, y, x, :] = visibility_volume[sz, sy, sx, :]
-                    if solid:
-                        volume[z, y, x, 0:3] = (volume[z, y, x, 0:3].astype(np.float32) * solid_radiance_scale).astype(np.float16)
-                        volume[z, y, x, 3] = np.float16(float(volume[z, y, x, 3]) * solid_radiance_scale)
-                        visibility_volume[z, y, x, 2] = np.float16(float(visibility_volume[z, y, x, 2]) * solid_radiance_scale)
-
-    @profile
-    def _worldspace_rc_temporal_blend(self, cascade_index: int, new_volume: np.ndarray, new_visibility_volume: np.ndarray, min_corner: tuple[float, float, float], full_extent: float) -> tuple[np.ndarray, np.ndarray]:
-        prev_volume = self._worldspace_rc_cpu_radiance_volumes[cascade_index]
-        prev_visibility = self._worldspace_rc_cpu_visibility_volumes[cascade_index]
-        prev_min_corner = self._worldspace_rc_active_mins[cascade_index]
-        resolution = max(2, int(WORLDSPACE_RC_GRID_RESOLUTION))
-        cell_world = full_extent / float(max(1, resolution - 1))
-        if prev_volume is None or prev_visibility is None:
-            return new_volume, new_visibility_volume
-        shift = max(abs(float(min_corner[i]) - float(prev_min_corner[i])) for i in range(3))
-        if shift > cell_world * 2.5:
-            return new_volume, new_visibility_volume
-        blend_alpha = float(WORLDSPACE_RC_TEMPORAL_BLEND_ALPHA) / (1.0 + 0.15 * float(cascade_index))
-        blend_alpha = min(0.80, max(0.10, blend_alpha))
-        prev_volume_f = prev_volume.astype(np.float32)
-        prev_visibility_f = prev_visibility.astype(np.float32)
-        new_volume_f = new_volume.astype(np.float32)
-        new_visibility_f = new_visibility_volume.astype(np.float32)
-        blended_volume = prev_volume_f * (1.0 - blend_alpha) + new_volume_f * blend_alpha
-        blended_visibility = prev_visibility_f * (1.0 - blend_alpha) + new_visibility_f * blend_alpha
-        return blended_volume.astype(np.float16), blended_visibility.astype(np.float16)
-
-    @profile
-    def _update_worldspace_radiance_cascades(self) -> None:
-        if len(self.worldspace_rc_textures) != 4 or len(self.worldspace_rc_visibility_textures) != 4 or self.worldspace_rc_volume_params_buffer is None:
-            return
         self._worldspace_rc_frame_index += 1
         resolution = max(4, int(WORLDSPACE_RC_GRID_RESOLUTION))
         base_half_extent = max(float(BLOCK_SIZE) * 4.0, float(WORLDSPACE_RC_BASE_HALF_EXTENT_WORLD))
@@ -2995,13 +2621,14 @@ class TerrainRenderer:
         target_signatures: list[tuple[float, ...]] = []
         target_mins: list[tuple[float, float, float]] = []
         target_inv_extents: list[tuple[float, float, float]] = []
+
         for cascade_index in range(4):
             half_extent = base_half_extent * (float(WORLDSPACE_RC_INTERVAL_SCALE) ** float(cascade_index))
             full_extent = half_extent * 2.0
             snap = max(float(WORLDSPACE_RC_UPDATE_QUANTIZE_WORLD), full_extent / max(1.0, float(resolution - 1)))
-            center_x = math.floor(camera_pos[0] / snap) * snap
-            center_y = math.floor(camera_pos[1] / snap) * snap
-            center_z = math.floor(camera_pos[2] / snap) * snap
+            center_x = math.floor((camera_pos[0] / snap) + 0.5) * snap
+            center_y = math.floor((camera_pos[1] / snap) + 0.5) * snap
+            center_z = math.floor((camera_pos[2] / snap) + 0.5) * snap
             min_corner = (center_x - half_extent, center_y - half_extent, center_z - half_extent)
             inv_extent = (1.0 / full_extent, 1.0 / full_extent, 1.0 / full_extent)
             target_signatures.append((round(min_corner[0], 4), round(min_corner[1], 4), round(min_corner[2], 4), round(full_extent, 4)))
@@ -3009,103 +2636,72 @@ class TerrainRenderer:
             target_inv_extents.append(inv_extent)
 
         dirty_indices = [i for i in range(4) if target_signatures[i] != self._worldspace_rc_active_signatures[i]]
+        if not dirty_indices:
+            params = np.zeros((8, 4), dtype=np.float32)
+            for cascade_index in range(4):
+                params[cascade_index, 0:3] = self._worldspace_rc_active_mins[cascade_index]
+                params[4 + cascade_index, 0:3] = self._worldspace_rc_active_inv_extents[cascade_index]
+            self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, params.tobytes())
+            return
+
         if any(sig is None for sig in self._worldspace_rc_active_signatures):
             max_updates = max(1, int(WORLDSPACE_RC_INITIAL_MAX_CASCADES_PER_FRAME))
         else:
             max_updates = max(1, int(WORLDSPACE_RC_UPDATE_MAX_CASCADES_PER_FRAME))
 
-        updated_any = False
-        material_cache: dict[tuple[int, int, int], int] = {}
-        sky_visibility_cache: dict[tuple[int, int, int], float] = {}
-        surface_height_cache: dict[tuple[int, int], int] = {}
-        normal_cache: dict[tuple[int, int, int], tuple[float, float, float]] = {}
-        probe_trace_cache: dict[tuple[int, int, int, int], tuple[tuple[float, float, float], float, float, float, float, float]] = {}
         updates_done = 0
+        updated_any = False
+        workgroups = (
+            (resolution + 3) // 4,
+            (resolution + 3) // 4,
+            (resolution + 3) // 4,
+        )
         search_order = [((self._worldspace_rc_update_cursor + offset) % 4) for offset in range(4)]
         for cascade_index in search_order:
             if cascade_index not in dirty_indices:
                 continue
             base_frame_stride = max(1, int(WORLDSPACE_RC_UPDATE_FRAME_INTERVAL))
-            frame_stride = base_frame_stride << cascade_index
+            # Keep every cascade spatially current while moving. Staggering farther
+            # cascades makes open-sky terrain sample old/out-of-range volumes for
+            # several frames, which reads as global darkening during camera motion.
+            frame_stride = base_frame_stride
             if self._worldspace_rc_active_signatures[cascade_index] is not None:
                 frames_since = self._worldspace_rc_frame_index - int(self._worldspace_rc_last_update_frame[cascade_index])
                 if frames_since < frame_stride:
                     continue
+
             min_corner = target_mins[cascade_index]
             full_extent = 1.0 / target_inv_extents[cascade_index][0]
-            max_distance = full_extent * 0.5
-            volume = np.zeros((resolution, resolution, resolution, 4), dtype=np.float16)
-            visibility_volume = np.zeros((resolution, resolution, resolution, 4), dtype=np.float16)
-            solid_probe_mask = np.zeros((resolution, resolution, resolution), dtype=np.bool_)
-            stride_values = tuple(int(v) for v in WORLDSPACE_RC_CASCADE_PROBE_STRIDES) if bool(WORLDSPACE_RC_SPARSE_UPDATE_ENABLED) else (1, 1, 1, 1)
-            stride_index = min(cascade_index, max(0, len(stride_values) - 1))
-            probe_stride = max(1, int(stride_values[stride_index])) if stride_values else 1
-            sample_coords = self._worldspace_rc_sparse_sample_coords(resolution, probe_stride)
-            sample_coord_set = set(sample_coords)
-            for z in range(resolution):
-                fz = z / max(1, resolution - 1)
-                wz = min_corner[2] + full_extent * fz
-                for y in range(resolution):
-                    fy = y / max(1, resolution - 1)
-                    wy = min_corner[1] + full_extent * fy
-                    for x in range(resolution):
-                        fx = x / max(1, resolution - 1)
-                        wx = min_corner[0] + full_extent * fx
-                        probe_bx = int(math.floor(wx / BLOCK_SIZE))
-                        probe_by = int(math.floor(wy / BLOCK_SIZE))
-                        probe_bz = int(math.floor(wz / BLOCK_SIZE))
-                        probe_inside_solid = self._worldspace_rc_solid_at(probe_bx, probe_by, probe_bz, material_cache)
-                        solid_probe_mask[z, y, x] = probe_inside_solid
-                        if probe_inside_solid or x not in sample_coord_set or y not in sample_coord_set or z not in sample_coord_set:
-                            continue
-                        rgb, alpha, mean_distance, mean_distance_sq, hit_fraction, sky_access = self._trace_worldspace_rc_probe(
-                            (wx, wy, wz),
-                            max_distance,
-                            cascade_index,
-                            material_cache,
-                            sky_visibility_cache,
-                            normal_cache,
-                            probe_trace_cache,
-                            surface_height_cache,
-                        )
-                        volume[z, y, x, 0] = np.float16(rgb[0])
-                        volume[z, y, x, 1] = np.float16(rgb[1])
-                        volume[z, y, x, 2] = np.float16(rgb[2])
-                        volume[z, y, x, 3] = np.float16(alpha)
-                        visibility_volume[z, y, x, 0] = np.float16(mean_distance)
-                        visibility_volume[z, y, x, 1] = np.float16(mean_distance_sq)
-                        visibility_volume[z, y, x, 2] = np.float16(hit_fraction)
-                        visibility_volume[z, y, x, 3] = np.float16(sky_access)
-            self._worldspace_rc_fill_sparse_probe_volume(volume, visibility_volume, solid_probe_mask, sample_coords)
-            raw_volume = volume
-            raw_visibility_volume = visibility_volume
-            filtered_volume = self._worldspace_rc_filter_volume(volume)
-            filtered_visibility_volume = self._worldspace_rc_filter_volume(visibility_volume)
-            sky_filter_gate = np.power(
-                np.clip(raw_visibility_volume[..., 3:4].astype(np.float32), 0.0, 1.0),
-                max(0.25, float(WORLDSPACE_RC_SPATIAL_FILTER_SKY_POWER)),
-            ).astype(np.float32)
-            volume = (raw_volume.astype(np.float32) * (1.0 - sky_filter_gate) + filtered_volume.astype(np.float32) * sky_filter_gate).astype(np.float16)
-            visibility_volume = filtered_visibility_volume
-            visibility_volume[..., 3] = np.minimum(filtered_visibility_volume[..., 3], raw_visibility_volume[..., 3]).astype(np.float16)
-            # One sparse fill is enough now that it populates the full volume by
-            # multi-source BFS. Re-filling after the filter and temporal blend
-            # was another ~15-16s in the profiled 4096-chunk flight benchmark.
-            volume, visibility_volume = self._worldspace_rc_temporal_blend(cascade_index, volume, visibility_volume, min_corner, full_extent)
-            self.device.queue.write_texture(
-                {"texture": self.worldspace_rc_textures[cascade_index], "mip_level": 0, "origin": (0, 0, 0)},
-                volume.tobytes(),
-                {"offset": 0, "bytes_per_row": resolution * 8, "rows_per_image": resolution},
-                (resolution, resolution, resolution),
+            update_params = self._make_worldspace_rc_update_params(cascade_index, min_corner, full_extent, resolution)
+            self.device.queue.write_buffer(
+                self.worldspace_rc_update_param_buffers[cascade_index],
+                0,
+                update_params.tobytes(),
             )
-            self.device.queue.write_texture(
-                {"texture": self.worldspace_rc_visibility_textures[cascade_index], "mip_level": 0, "origin": (0, 0, 0)},
-                visibility_volume.tobytes(),
-                {"offset": 0, "bytes_per_row": resolution * 8, "rows_per_image": resolution},
-                (resolution, resolution, resolution),
-            )
-            self._worldspace_rc_cpu_radiance_volumes[cascade_index] = volume
-            self._worldspace_rc_cpu_visibility_volumes[cascade_index] = visibility_volume
+
+            trace_pass = encoder.begin_compute_pass()
+            trace_pass.set_pipeline(self.worldspace_rc_trace_pipeline)
+            trace_pass.set_bind_group(0, self.worldspace_rc_trace_bind_groups[cascade_index])
+            trace_pass.dispatch_workgroups(*workgroups)
+            trace_pass.end()
+
+            filter_passes = max(1, int(WORLDSPACE_RC_SPATIAL_FILTER_PASSES))
+            # Compose samples the final RC textures, not the scratch textures. If
+            # an even number of blur iterations would end in scratch, add one
+            # final ping-pong pass back into the sampled volume.
+            filter_dispatches = filter_passes if (filter_passes % 2) == 1 else filter_passes + 1
+            for filter_index in range(filter_dispatches):
+                filter_bind_group = (
+                    self.worldspace_rc_filter_bind_groups[cascade_index]
+                    if (filter_index % 2) == 0
+                    else self.worldspace_rc_filter_pingpong_bind_groups[cascade_index]
+                )
+                filter_pass = encoder.begin_compute_pass()
+                filter_pass.set_pipeline(self.worldspace_rc_filter_pipeline)
+                filter_pass.set_bind_group(0, filter_bind_group)
+                filter_pass.dispatch_workgroups(*workgroups)
+                filter_pass.end()
+
             self._worldspace_rc_active_signatures[cascade_index] = target_signatures[cascade_index]
             self._worldspace_rc_active_mins[cascade_index] = target_mins[cascade_index]
             self._worldspace_rc_active_inv_extents[cascade_index] = target_inv_extents[cascade_index]
@@ -3121,6 +2717,7 @@ class TerrainRenderer:
             params[cascade_index, 0:3] = self._worldspace_rc_active_mins[cascade_index]
             params[4 + cascade_index, 0:3] = self._worldspace_rc_active_inv_extents[cascade_index]
         self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, params.tobytes())
+
         if updated_any:
             signature_parts: list[float] = []
             for cascade_index in range(4):
@@ -3277,7 +2874,7 @@ class TerrainRenderer:
                 assert self.gi_color_view is not None
                 assert self.gi_compose_pipeline is not None
                 assert self.gi_compose_bind_group is not None
-                self._update_worldspace_radiance_cascades()
+                self._update_worldspace_radiance_cascades(encoder)
                 gi_compose_pass = encoder.begin_render_pass(
                     color_attachments=[
                         {
