@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import math
 import os
-import struct
 import time
 import sys
-import zlib
 from collections import OrderedDict, deque
 
 import numpy as np
@@ -28,6 +26,11 @@ from .render_shaders import (
     TILE_MERGE_SHADER,
     VOXEL_MESH_BATCH_SHADER,
     VOXEL_SURFACE_EXPAND_SHADER,
+)
+from .debug_capture import (
+    readback_to_rgba8,
+    safe_filename_component,
+    write_rgba8_png,
 )
 from .render_utils import (
     clamp,
@@ -2749,11 +2752,6 @@ class TerrainRenderer:
         except Exception as exc:
             print(f"Warning: failed to write RC diagnostics snapshot: {exc!r}", file=sys.stderr)
 
-    def _safe_rc_debug_filename_component(self, value: str) -> str:
-        text = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value).strip())
-        text = "_".join(part for part in text.split("_") if part)
-        return text or "mode"
-
     def _queue_worldspace_rc_debug_image_dump(self) -> None:
         """Queue one-shot PNG captures for every RC compose debug mode."""
         try:
@@ -2822,7 +2820,7 @@ class TerrainRenderer:
             if mode < 0 or mode >= len(mode_names):
                 continue
             mode_name = mode_names[mode]
-            mode_slug = self._safe_rc_debug_filename_component(mode_name)
+            mode_slug = safe_filename_component(mode_name)
             path = os.path.join(out_dir, f"rc_debug_{stamp}_frame_{frame:06d}_{mode:02d}_{mode_slug}.png")
             params_buffer = self.device.create_buffer(
                 size=32,
@@ -2900,52 +2898,6 @@ class TerrainRenderer:
         if encoded_count > 0:
             print(f"Info: encoded F7 RC debug PNG captures for {encoded_count} mode(s).", file=sys.stderr)
 
-    def _png_chunk(self, chunk_type: bytes, payload: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(payload))
-            + chunk_type
-            + payload
-            + struct.pack(">I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
-        )
-
-    def _write_rgba8_png(self, path: str, rgba: np.ndarray) -> None:
-        rgba = np.ascontiguousarray(rgba, dtype=np.uint8)
-        height, width, channels = rgba.shape
-        if channels != 4:
-            raise ValueError(f"expected RGBA8 image with 4 channels, got {channels}")
-        scanlines = bytearray()
-        for y in range(height):
-            scanlines.append(0)
-            scanlines.extend(rgba[y].tobytes())
-        payload = b"\x89PNG\r\n\x1a\n"
-        payload += self._png_chunk(
-            b"IHDR",
-            struct.pack(">IIBBBBB", int(width), int(height), 8, 6, 0, 0, 0),
-        )
-        payload += self._png_chunk(b"IDAT", zlib.compress(bytes(scanlines), level=4))
-        payload += self._png_chunk(b"IEND", b"")
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(payload)
-
-    def _readback_to_rgba8(self, mapped, *, width: int, height: int, texture_format: str, padded_bpr: int) -> np.ndarray:
-        if texture_format == "rgba16float":
-            row_pixels = padded_bpr // 8
-            values = np.frombuffer(mapped, dtype=np.float16, count=(padded_bpr * height) // 2)
-            image_f16 = values.reshape((height, row_pixels, 4))[:, :width, :]
-            image_f32 = np.nan_to_num(image_f16.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
-            rgb = np.clip(image_f32[:, :, 0:3], 0.0, 1.0)
-            alpha = np.clip(image_f32[:, :, 3:4], 0.0, 1.0)
-            out = np.empty((height, width, 4), dtype=np.uint8)
-            out[:, :, 0:3] = (rgb * 255.0 + 0.5).astype(np.uint8)
-            out[:, :, 3:4] = (alpha * 255.0 + 0.5).astype(np.uint8)
-            return out
-        if texture_format == "rgba8unorm":
-            raw = np.frombuffer(mapped, dtype=np.uint8, count=padded_bpr * height)
-            rows = raw.reshape((height, padded_bpr))[:, : width * 4]
-            return rows.reshape((height, width, 4)).copy()
-        raise ValueError(f"unsupported screenshot texture format: {texture_format!r}")
-
     def _drain_pending_rc_debug_readbacks(self) -> None:
         if not self._pending_rc_debug_readbacks:
             return
@@ -2962,7 +2914,7 @@ class TerrainRenderer:
                 buffer.map_sync(wgpu.MapMode.READ, 0, size)
                 try:
                     mapped = buffer.read_mapped(0, size, copy=False)
-                    rgba = self._readback_to_rgba8(
+                    rgba = readback_to_rgba8(
                         mapped,
                         width=int(item["width"]),
                         height=int(item["height"]),
@@ -2972,7 +2924,7 @@ class TerrainRenderer:
                 finally:
                     if getattr(buffer, "map_state", "unmapped") != "unmapped":
                         buffer.unmap()
-                self._write_rgba8_png(path, rgba)
+                write_rgba8_png(path, rgba)
                 saved_paths.append(path)
             except Exception as exc:
                 print(f"Warning: failed to save F7 RC debug PNG {path!r}: {exc!r}", file=sys.stderr)

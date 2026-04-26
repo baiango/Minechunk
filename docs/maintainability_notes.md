@@ -21,3 +21,13 @@ This patch starts the renderer split without changing render behavior.
 3. Move WGSL strings into individual `.wgsl` files or at least shader-specific Python modules.
 4. Split `build_tile_draw_batches()` into validation, batch collection, allocation, upload, and draw-record construction steps.
 5. Add CPU-only regression tests for terrain, meshing, allocator store/release, and visibility updates.
+
+## Patch 2: Debug capture helpers
+
+The F7 / world-space RC PNG capture path no longer stores PNG encoding and WGPU readback conversion helpers as private `TerrainRenderer` methods.  Those pure helpers now live in `engine/debug_capture.py`:
+
+- `safe_filename_component()` for stable debug output filenames.
+- `readback_to_rgba8()` for converting mapped WGPU readback buffers into RGBA8 arrays.
+- `write_rgba8_png()` for writing minimal PNG files without adding a Pillow dependency.
+
+This is intentionally behavior-preserving.  The renderer still owns GPU command encoding and resource lifetime, but the CPU-side image conversion can now be tested without creating a canvas, adapter, device, or renderer instance.
