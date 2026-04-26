@@ -1925,6 +1925,18 @@ class TerrainRenderer:
         )
         self.depth_view = self.depth_texture.create_view()
 
+
+    def raycast_from_camera(self, max_distance: float = 8.0):
+        """Return the first block in front of the camera using Amanatides-Woo DDA."""
+
+        direction = normalize3(forward_vector(self.camera.yaw, self.camera.pitch))
+        return self.world.raycast_blocks(
+            tuple(float(v) for v in self.camera.position),
+            direction,
+            float(max_distance),
+            start_distance=float(BLOCK_SIZE) * 1.0e-4,
+        )
+
     def _camera_basis(self) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
         forward = normalize3(forward_vector(self.camera.yaw, self.camera.pitch))
         world_up = (0.0, 1.0, 0.0)

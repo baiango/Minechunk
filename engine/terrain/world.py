@@ -33,6 +33,7 @@ from .kernels import (
     terrain_block_material_at,
 )
 from ..world_constants import BLOCK_SIZE, CHUNK_SIZE, CHUNK_WORLD_SIZE, WORLD_HEIGHT_BLOCKS, VERTICAL_CHUNK_STACK_ENABLED
+from ..visibility.amanatides_woo import VoxelRayHit, first_hit as amanatides_woo_first_hit, line_of_sight as amanatides_woo_line_of_sight
 
 
 def _allow_gpu_backend_fallback() -> bool:
@@ -236,6 +237,50 @@ class VoxelWorld:
             return int(STONE if int(blocks[local_y, sample_z, sample_x]) != 0 else AIR)
 
         return int(terrain_block_material_at(x, y, z, self.seed, self.height))
+
+
+    def raycast_blocks(
+        self,
+        origin: tuple[float, float, float],
+        direction: tuple[float, float, float],
+        max_distance: float,
+        *,
+        start_distance: float = 0.0,
+        max_steps: int | None = None,
+    ) -> VoxelRayHit | None:
+        """Raycast through world blocks using Amanatides-Woo 3D DDA.
+
+        The returned distance is in world metres along the ray.  This samples
+        ``block_at`` so CPU/GPU/Metal terrain modes stay aligned with collision.
+        """
+
+        return amanatides_woo_first_hit(
+            origin,
+            direction,
+            lambda bx, by, bz: int(self.block_at(bx, by, bz)) != int(AIR),
+            max_distance,
+            block_size=float(self.block_size),
+            start_distance=start_distance,
+            max_steps=max_steps,
+            material_at=lambda bx, by, bz: int(self.block_at(bx, by, bz)),
+        )
+
+    def has_clear_line_of_sight(
+        self,
+        origin: tuple[float, float, float],
+        target: tuple[float, float, float],
+        *,
+        max_steps: int | None = None,
+    ) -> bool:
+        """Return True when Amanatides-Woo finds no solid block between points."""
+
+        return amanatides_woo_line_of_sight(
+            origin,
+            target,
+            lambda bx, by, bz: int(self.block_at(bx, by, bz)) != int(AIR),
+            block_size=float(self.block_size),
+            max_steps=max_steps,
+        )
 
     def surface_profile_at(self, x: int, z: int) -> tuple[int, int]:
         return self._backend.surface_profile_at(x, z)

@@ -1355,6 +1355,8 @@ const RC_FAR_MERGE_MAX_LUMA: f32 = 0.90;
 const RC_FAR_MERGE_RINGING_VARIANCE_SCALE: f32 = 7.5;
 const RC_FAR_MERGE_MIN_STABILITY: f32 = 0.42;
 const RC_MERGE_CONTINUITY_FEATHER: f32 = __RC_MERGE_CONTINUITY_FEATHER__;
+const RC_DDA_MAX_VISITS: u32 = __RC_DDA_MAX_VISITS__u;
+const RC_DDA_INF: f32 = 1.0e20;
 
 fn saturate(v: f32) -> f32 {
     return clamp(v, 0.0, 1.0);
@@ -1849,41 +1851,146 @@ fn stable_tangent_a(ray_dir: vec3f) -> vec3f {
     return normalize(cross(up, ray_dir));
 }
 
+fn block_coord_from_world(world_pos: vec3f, block_size: f32) -> vec3i {
+    return vec3i(
+        i32(floor(world_pos.x / block_size)),
+        i32(floor(world_pos.y / block_size)),
+        i32(floor(world_pos.z / block_size)),
+    );
+}
+
+struct RcDdaHit {
+    hit: u32,
+    material: u32,
+    block: vec3i,
+    normal: vec3f,
+    distance: f32,
+    visits: u32,
+}
+
+fn dda_axis_step(v: f32) -> i32 {
+    if (v > 0.000001) {
+        return 1;
+    }
+    if (v < -0.000001) {
+        return -1;
+    }
+    return 0;
+}
+
+fn dda_axis_delta(v: f32, block_size: f32) -> f32 {
+    if (abs(v) <= 0.000001) {
+        return RC_DDA_INF;
+    }
+    return abs(block_size / v);
+}
+
+fn dda_axis_t_max(pos_axis: f32, dir_axis: f32, block_axis: i32, step_axis: i32, block_size: f32) -> f32 {
+    if (step_axis > 0) {
+        let boundary = f32(block_axis + 1) * block_size;
+        return max(0.0, (boundary - pos_axis) / dir_axis);
+    }
+    if (step_axis < 0) {
+        let boundary = f32(block_axis) * block_size;
+        return max(0.0, (boundary - pos_axis) / dir_axis);
+    }
+    return RC_DDA_INF;
+}
+
+fn dda_miss(distance: f32, visits: u32) -> RcDdaHit {
+    return RcDdaHit(0u, AIR, vec3i(0, 0, 0), vec3f(0.0, 0.0, 0.0), distance, visits);
+}
+
+fn trace_first_solid_dda(origin: vec3f, ray_dir: vec3f, start_dist: f32, end_dist: f32, block_size: f32, max_visits: u32) -> RcDdaHit {
+    // Amanatides-Woo 3D DDA over Minechunk's actual block grid.  This visits
+    // crossed blocks in order instead of probing at fixed distances, so thin
+    // voxel blockers near cascade boundaries are much harder to skip.
+    let ray_len = length(ray_dir);
+    if (ray_len <= 0.000001) {
+        return dda_miss(end_dist, 0u);
+    }
+    let dir_n = ray_dir / ray_len;
+    let safe_start = max(0.0, start_dist) + min(block_size * 0.0025, 0.001);
+    let safe_end = max(safe_start, end_dist);
+    let budget = max(1u, max_visits);
+
+    let start_pos = origin + dir_n * safe_start;
+    var block = block_coord_from_world(start_pos, block_size);
+    let step = vec3i(
+        dda_axis_step(dir_n.x),
+        dda_axis_step(dir_n.y),
+        dda_axis_step(dir_n.z),
+    );
+
+    var t_max_x = safe_start + dda_axis_t_max(start_pos.x, dir_n.x, block.x, step.x, block_size);
+    var t_max_y = safe_start + dda_axis_t_max(start_pos.y, dir_n.y, block.y, step.y, block_size);
+    var t_max_z = safe_start + dda_axis_t_max(start_pos.z, dir_n.z, block.z, step.z, block_size);
+    let t_delta_x = dda_axis_delta(dir_n.x, block_size);
+    let t_delta_y = dda_axis_delta(dir_n.y, block_size);
+    let t_delta_z = dda_axis_delta(dir_n.z, block_size);
+
+    var t_enter = safe_start;
+    var normal = vec3f(0.0, 0.0, 0.0);
+    var visits = 0u;
+
+    loop {
+        if (visits >= budget || t_enter > safe_end) {
+            break;
+        }
+
+        let material = material_at_block(block.x, block.y, block.z);
+        if (material != AIR) {
+            return RcDdaHit(1u, material, block, normal, t_enter, visits);
+        }
+
+        visits = visits + 1u;
+        let next_t = min(t_max_x, min(t_max_y, t_max_z));
+        if (next_t > safe_end) {
+            break;
+        }
+
+        // Classic one-axis Amanatides-Woo step.  Ties resolve X -> Y -> Z for
+        // determinism and to avoid repeatedly visiting the same corner cells.
+        if (t_max_x <= t_max_y && t_max_x <= t_max_z) {
+            block.x = block.x + step.x;
+            t_enter = t_max_x;
+            t_max_x = t_max_x + t_delta_x;
+            normal = vec3f(-f32(step.x), 0.0, 0.0);
+        } else if (t_max_y <= t_max_z) {
+            block.y = block.y + step.y;
+            t_enter = t_max_y;
+            t_max_y = t_max_y + t_delta_y;
+            normal = vec3f(0.0, -f32(step.y), 0.0);
+        } else {
+            block.z = block.z + step.z;
+            t_enter = t_max_z;
+            t_max_z = t_max_z + t_delta_z;
+            normal = vec3f(0.0, 0.0, -f32(step.z));
+        }
+    }
+
+    return dda_miss(safe_end, visits);
+}
+
+
 fn local_interval_visibility(origin: vec3f, ray_dir: vec3f, start_dist: f32, end_dist: f32, block_size: f32) -> f32 {
-    // Cheap local visibility for far-cascade interval merge. The primary trace
-    // can miss a thin blocker when interval steps are coarse; this denser guard
-    // prevents the farther cascade from leaking through local geometry.
-    let dir_n = normalize(ray_dir);
+    // Amanatides-Woo guard for far-cascade interval merge.  The old fixed-step
+    // probe could jump across one-block occluders, then merge bright/dark stale
+    // far probes through local terrain.  DDA visits every crossed block up to a
+    // capped budget, which is much safer around small sky holes and cave lips.
     let safe_start = max(0.0, start_dist);
     let safe_end = max(safe_start, end_dist);
     let span = safe_end - safe_start;
     if (span <= block_size * 0.25) {
         return 1.0;
     }
-
-    let step_len = max(block_size * 0.75, span / 12.0);
-    var dist = safe_start + step_len * 0.5;
-    var clear_samples = 0.0;
-    var total_samples = 0.0;
-
-    loop {
-        if (dist >= safe_end || total_samples >= 16.0) {
-            break;
-        }
-        let p = origin + dir_n * dist;
-        let b = block_coord_from_world(p, block_size);
-        total_samples = total_samples + 1.0;
-        if (!solid_at_block(b.x, b.y, b.z)) {
-            clear_samples = clear_samples + 1.0;
-        }
-        dist = dist + step_len;
+    let visits_needed = u32(ceil(span / max(block_size, 0.000001))) + 3u;
+    let visit_budget = min(RC_DDA_MAX_VISITS, max(1u, visits_needed));
+    let hit = trace_first_solid_dda(origin, ray_dir, safe_start, safe_end, block_size, visit_budget);
+    if (hit.hit != 0u) {
+        return 0.0;
     }
-
-    if (total_samples <= 0.0) {
-        return 1.0;
-    }
-    let clear_ratio = clear_samples / total_samples;
-    return smoothstep(0.72, 0.98, clear_ratio);
+    return 1.0;
 }
 
 fn sample_src_world_rc_angular_spatial(index: u32, world_pos: vec3f, resolution: i32, ray_dir: vec3f, active_count: i32, footprint_radius: f32) -> vec4f {
@@ -2089,13 +2196,7 @@ fn effective_step_count(cascade_index: u32, origin_sky_visibility: f32) -> u32 {
     return u32(max(1, steps));
 }
 
-fn block_coord_from_world(world_pos: vec3f, block_size: f32) -> vec3i {
-    return vec3i(
-        i32(floor(world_pos.x / block_size)),
-        i32(floor(world_pos.y / block_size)),
-        i32(floor(world_pos.z / block_size)),
-    );
-}
+
 
 @compute @workgroup_size(4, 4, 4)
 fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
@@ -2575,6 +2676,7 @@ WORLDSPACE_RC_TRACE_SHADER = (
     .replace("__RC_TEMPORAL_ALPHA__", f"{float(render_consts.WORLDSPACE_RC_TEMPORAL_BLEND_ALPHA):.8f}")
     .replace("__RC_BOUNCE_FEEDBACK_STRENGTH__", f"{float(getattr(render_consts, 'WORLDSPACE_RC_BOUNCE_FEEDBACK_STRENGTH', 0.18)):.8f}")
     .replace("__RC_MERGE_CONTINUITY_FEATHER__", f"{float(getattr(render_consts, 'WORLDSPACE_RC_MERGE_CONTINUITY_FEATHER', 0.22)):.8f}")
+    .replace("__RC_DDA_MAX_VISITS__", str(max(1, int(getattr(render_consts, 'WORLDSPACE_RC_DDA_MAX_VISITS', 64)))))
 )
 
 
