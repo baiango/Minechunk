@@ -15,13 +15,17 @@ LOW_LEVEL_MODULES = [
     ROOT / "engine" / "meshing_types.py",
     ROOT / "engine" / "pipelines" / "chunk_pipeline.py",
     ROOT / "engine" / "pipelines" / "profiling.py",
+    ROOT / "engine" / "rendering" / "direct_draw.py",
     ROOT / "engine" / "rendering" / "postprocess_targets.py",
+    ROOT / "engine" / "rendering" / "rc_debug_capture.py",
+    ROOT / "engine" / "rendering" / "worldspace_rc.py",
     ROOT / "engine" / "visibility" / "coord_manager.py",
+    ROOT / "engine" / "visibility" / "tile_layout.py",
 ]
 
 FORBIDDEN_RENDERER_IMPORTS = (
-    "from .. import renderer",
-    "from . import renderer",
+    "from .. import renderer\n",
+    "from . import renderer\n",
     "import engine.renderer",
     "from engine import renderer",
     "from .renderer import",

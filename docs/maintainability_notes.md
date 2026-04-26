@@ -51,3 +51,15 @@ This pass moves three more renderer-adjacent responsibilities out of `TerrainRen
 - `engine/auto_exit.py` now owns fixed-view auto-exit readiness checks and device-lost error classification.
 
 The goal is to reduce `TerrainRenderer` from a catch-all engine service into a coordinator. The extracted modules still operate on the renderer state object for compatibility, but the logic is now isolated enough to test and later replace with explicit state objects.
+
+## One-pass split 2: visibility layout and RC debug/update ownership
+
+This pass makes two previously-facade modules real and moves more renderer-owned logic out of `TerrainRenderer`:
+
+- `engine/visibility/tile_layout.py` now owns visible chunk window geometry, merged-tile key/mask computation, relative slot assignment, and tile-bit helpers.
+- `engine/visibility/coord_manager.py` now owns visible-coordinate refresh, incremental origin delta shifting, visible missing tracking, and cache-capacity warnings.
+- `engine/rendering/rc_debug_capture.py` now owns F7 RC diagnostic text snapshots, queued RC debug image captures, GPU readback draining, and debug-copy row alignment.
+- `engine/rendering/worldspace_rc.py` now owns RC interval bands, active direction counts, update parameter packing, volume parameter writes, and the world-space RC update/dispatch scheduler.
+
+The renderer still owns GPU device creation, pipeline creation, and final render submission, but the visibility and world-space RC subsystems are no longer private method islands inside the renderer class.  The new tests cover the tile-layout math and RC parameter helpers, and the import-boundary test now includes the new modules.
+- `engine/rendering/direct_draw.py` now owns direct/indirect visible-batch draw submission, including the optional native multi-draw fast path.

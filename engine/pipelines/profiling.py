@@ -13,6 +13,7 @@ from ..cache import mesh_allocator as mesh_cache
 from .. import render_contract as render_consts
 import wgpu
 from ..render_utils import pack_vertex, screen_to_ndc
+from ..rendering import worldspace_rc
 
 
 def _renderer_module():
@@ -683,7 +684,7 @@ def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
     rc_temporal_alpha = float(getattr(render_consts, "WORLDSPACE_RC_TEMPORAL_BLEND_ALPHA", 0.0))
     rc_interval_bands = list(getattr(renderer, "_worldspace_rc_last_interval_bands", []))
     if len(rc_interval_bands) < 4:
-        rc_interval_bands = [getattr(renderer, "_worldspace_rc_interval_band", lambda i: (0.0, 0.0))(i) for i in range(4)]
+        rc_interval_bands = [worldspace_rc.interval_band(i) for i in range(4)]
     rc_interval_text = " ".join(
         f"C{idx}:{float(band[0]):.1f}-{float(band[1]):.1f}"
         for idx, band in enumerate(rc_interval_bands[:4])

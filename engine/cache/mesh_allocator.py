@@ -12,6 +12,7 @@ import wgpu
 from .. import render_contract as render_consts
 from ..meshing_types import ChunkDrawBatch, ChunkMesh, ChunkRenderBatch, MeshBufferAllocation, MeshOutputSlab
 from ..meshing import gpu_mesher as wgpu_mesher
+from ..visibility import coord_manager
 
 
 MERGED_TILE_AGE_REFRESH_INTERVAL_SECONDS = 0.25
@@ -1044,7 +1045,7 @@ def merge_tile_meshes(
 
 def visible_tile_mesh_groups(renderer) -> dict[tuple[int, int, int], list[ChunkMesh]]:
     if not renderer._visible_chunk_coords:
-        renderer._refresh_visible_chunk_coords()
+        coord_manager.refresh_visible_chunk_coords(renderer)
     tile_active_meshes = getattr(renderer, "_visible_tile_active_meshes", None) or {}
     return {
         tile_key_value: list(meshes)
@@ -1055,7 +1056,7 @@ def visible_tile_mesh_groups(renderer) -> dict[tuple[int, int, int], list[ChunkM
 
 def visible_tile_chunk_groups(renderer) -> tuple[dict[tuple[int, int, int], list[tuple[int, int, int, ChunkMesh]]], int]:
     if not renderer._visible_chunk_coords:
-        renderer._refresh_visible_chunk_coords()
+        coord_manager.refresh_visible_chunk_coords(renderer)
     tile_active_meshes = getattr(renderer, "_visible_tile_active_meshes", None) or {}
     tile_groups: dict[tuple[int, int, int], list[tuple[int, int, int, ChunkMesh]]] = {}
     visible_count = 0
@@ -1462,7 +1463,7 @@ def build_tile_draw_batches(
             if now < cached_until:
                 return cached_batches, cached_merged, cached_visible, cached_vertices, cached_until
         if not renderer._visible_chunk_coords:
-            renderer._refresh_visible_chunk_coords()
+            coord_manager.refresh_visible_chunk_coords(renderer)
             visible_tile_dirty_keys = renderer._visible_tile_dirty_keys
         visible_tile_active_meshes = getattr(renderer, "_visible_tile_active_meshes", None) or {}
         current_tile_keys = getattr(renderer, "_visible_tile_key_set", None) or set(getattr(renderer, "_visible_tile_keys", None) or ())
@@ -2006,7 +2007,7 @@ def visible_render_batches_indirect(
 def visible_chunks(renderer) -> list[tuple[int, int, int, ChunkMesh]]:
     visible: list[tuple[int, int, int, ChunkMesh]] = []
     if not renderer._visible_chunk_coords:
-        renderer._refresh_visible_chunk_coords()
+        coord_manager.refresh_visible_chunk_coords(renderer)
     for chunk_x, chunk_y, chunk_z in renderer._visible_chunk_coords:
         key = (chunk_x, chunk_y, chunk_z)
         mesh = renderer.chunk_cache.get(key)
