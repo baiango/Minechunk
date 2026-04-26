@@ -198,6 +198,7 @@ class TerrainRenderer:
             "cascade confidence",
             "rc radiance",
             "rc light",
+            "volume coverage",
         )
         self._pending_rc_debug_capture_request: dict | None = None
         self._pending_rc_debug_readbacks: list[dict] = []
@@ -2652,10 +2653,8 @@ class TerrainRenderer:
     def _worldspace_rc_active_direction_count(self, cascade_index: int) -> int:
         direction_count = max(1, int(WORLDSPACE_RC_DIRECTION_COUNT))
         if int(cascade_index) <= 0:
-            return min(direction_count, 4)
-        if int(cascade_index) == 1:
             return min(direction_count, 8)
-        if int(cascade_index) == 2:
+        if int(cascade_index) == 1:
             return min(direction_count, 12)
         return direction_count
 
@@ -2698,6 +2697,8 @@ class TerrainRenderer:
             lines.append(f"  resolution={int(WORLDSPACE_RC_GRID_RESOLUTION)}")
             lines.append(f"  direction_count={int(WORLDSPACE_RC_DIRECTION_COUNT)}")
             lines.append(f"  active_direction_counts={[self._worldspace_rc_active_direction_count(i) for i in range(4)]}")
+            lines.append(f"  vertical_down_bias={float(WORLDSPACE_RC_VERTICAL_DOWN_BIAS):.4f}")
+            lines.append(f"  cascade_extent_scales={list(WORLDSPACE_RC_CASCADE_EXTENT_SCALES)}")
             lines.append(f"  filter_passes={int(WORLDSPACE_RC_SPATIAL_FILTER_PASSES)}")
             lines.append(f"  temporal_alpha={float(WORLDSPACE_RC_TEMPORAL_BLEND_ALPHA):.4f}")
             lines.append(f"  bounce_feedback={float(WORLDSPACE_RC_BOUNCE_FEEDBACK_STRENGTH):.4f}")
@@ -3084,11 +3085,17 @@ class TerrainRenderer:
             # keeps spatial coverage and distance interval math coherent: C0 is
             # the nearest band, C1 begins around C0's end, and so on.
             half_extent = max(base_half_extent * (float(WORLDSPACE_RC_INTERVAL_SCALE) ** float(cascade_index)), interval_end)
+            extent_scales = tuple(float(v) for v in WORLDSPACE_RC_CASCADE_EXTENT_SCALES)
+            extent_scale = extent_scales[min(cascade_index, len(extent_scales) - 1)] if extent_scales else 1.0
+            half_extent *= max(1.0, extent_scale)
             full_extent = half_extent * 2.0
             snap = max(float(WORLDSPACE_RC_UPDATE_QUANTIZE_WORLD), full_extent / max(1.0, float(resolution - 1)))
             center_x = math.floor((camera_pos[0] / snap) + 0.5) * snap
-            center_y = math.floor((camera_pos[1] / snap) + 0.5) * snap
+            snapped_camera_y = math.floor((camera_pos[1] / snap) + 0.5) * snap
             center_z = math.floor((camera_pos[2] / snap) + 0.5) * snap
+            vertical_down_bias = max(0.0, min(0.65, float(WORLDSPACE_RC_VERTICAL_DOWN_BIAS)))
+            cascade_bias = vertical_down_bias * (0.45 + 0.55 * (float(cascade_index) / 3.0))
+            center_y = snapped_camera_y - half_extent * cascade_bias
             min_corner = (center_x - half_extent, center_y - half_extent, center_z - half_extent)
             inv_extent = (1.0 / full_extent, 1.0 / full_extent, 1.0 / full_extent)
             target_signatures.append((round(min_corner[0], 4), round(min_corner[1], 4), round(min_corner[2], 4), round(full_extent, 4), round(interval_start, 4), round(interval_end, 4)))

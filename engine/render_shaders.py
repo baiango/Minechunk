@@ -761,6 +761,55 @@ fn saturate(v: f32) -> f32 {
     return clamp(v, 0.0, 1.0);
 }
 
+fn screen_gbuffer_sky_at_offset(uv: vec2f, offset_px: vec2f, inv_dims: vec2f, dims_u: vec2u) -> f32 {
+    let sample_uv = clamp(uv + offset_px * inv_dims, vec2f(0.0, 0.0), vec2f(0.9999, 0.9999));
+    let dims_i = vec2i(dims_u);
+    let xy = clamp(vec2i(sample_uv * vec2f(dims_u)), vec2i(0, 0), dims_i - vec2i(1, 1));
+    let g = textureLoad(gbuffer_tex, xy, 0);
+    let has_surface = g.w > 0.0 && length(g.xyz) > 0.001;
+    return select(1.0, 0.0, has_surface);
+}
+
+fn screen_space_sky_exposure(uv: vec2f) -> f32 {
+    let dims_u = textureDimensions(gbuffer_tex, 0u);
+    let inv_dims = 1.0 / max(vec2f(dims_u), vec2f(1.0, 1.0));
+    var weighted_sum = 0.0;
+    var weight_total = 0.0;
+    var support_count = 0.0;
+    var strong = 0.0;
+
+    // v12: the earlier version used a pure max() across many long-range taps.
+    // A tiny on-screen sky hole could therefore light a broad area and looked
+    // like ghosting, but it disappeared as soon as the hole moved off screen.
+    // Require multi-tap support instead of letting one small visible hole win.
+    let s0 = screen_gbuffer_sky_at_offset(uv, vec2f(0.0, -6.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s0 * 1.00; weight_total = weight_total + 1.00; support_count = support_count + select(0.0, 1.0, s0 > 0.001); strong = max(strong, s0 * 1.00);
+    let s1 = screen_gbuffer_sky_at_offset(uv, vec2f(0.0, -16.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s1 * 0.95; weight_total = weight_total + 0.95; support_count = support_count + select(0.0, 1.0, s1 > 0.001); strong = max(strong, s1 * 0.95);
+    let s2 = screen_gbuffer_sky_at_offset(uv, vec2f(-18.0, -18.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s2 * 0.82; weight_total = weight_total + 0.82; support_count = support_count + select(0.0, 1.0, s2 > 0.001); strong = max(strong, s2 * 0.82);
+    let s3 = screen_gbuffer_sky_at_offset(uv, vec2f(18.0, -18.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s3 * 0.82; weight_total = weight_total + 0.82; support_count = support_count + select(0.0, 1.0, s3 > 0.001); strong = max(strong, s3 * 0.82);
+    let s4 = screen_gbuffer_sky_at_offset(uv, vec2f(0.0, -36.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s4 * 0.72; weight_total = weight_total + 0.72; support_count = support_count + select(0.0, 1.0, s4 > 0.001); strong = max(strong, s4 * 0.72);
+    let s5 = screen_gbuffer_sky_at_offset(uv, vec2f(-42.0, -42.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s5 * 0.58; weight_total = weight_total + 0.58; support_count = support_count + select(0.0, 1.0, s5 > 0.001); strong = max(strong, s5 * 0.58);
+    let s6 = screen_gbuffer_sky_at_offset(uv, vec2f(42.0, -42.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s6 * 0.58; weight_total = weight_total + 0.58; support_count = support_count + select(0.0, 1.0, s6 > 0.001); strong = max(strong, s6 * 0.58);
+    let s7 = screen_gbuffer_sky_at_offset(uv, vec2f(0.0, -72.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s7 * 0.42; weight_total = weight_total + 0.42; support_count = support_count + select(0.0, 1.0, s7 > 0.001); strong = max(strong, s7 * 0.42);
+    let s8 = screen_gbuffer_sky_at_offset(uv, vec2f(0.0, -128.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s8 * 0.28; weight_total = weight_total + 0.28; support_count = support_count + select(0.0, 1.0, s8 > 0.001); strong = max(strong, s8 * 0.28);
+    let s9 = screen_gbuffer_sky_at_offset(uv, vec2f(-24.0, 0.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s9 * 0.18; weight_total = weight_total + 0.18; support_count = support_count + select(0.0, 1.0, s9 > 0.001); strong = max(strong, s9 * 0.18);
+    let s10 = screen_gbuffer_sky_at_offset(uv, vec2f(24.0, 0.0), inv_dims, dims_u);
+    weighted_sum = weighted_sum + s10 * 0.18; weight_total = weight_total + 0.18; support_count = support_count + select(0.0, 1.0, s10 > 0.001); strong = max(strong, s10 * 0.18);
+
+    let avg_exposure = weighted_sum / max(weight_total, 0.0001);
+    let support_gate = smoothstep(1.5, 3.5, support_count);
+    return saturate(max(avg_exposure * 1.10, strong * 0.55) * support_gate);
+}
+
 fn view_pos_from_uv_depth(uv: vec2f, depth: f32) -> vec3f {
     let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let focal = camera.proj.x;
@@ -848,12 +897,12 @@ fn normalize_direction_descriptor(v: vec4f) -> vec4f {
 }
 
 fn rc_active_direction_count(cascade_index: u32) -> i32 {
-    // Real RC trades spatial detail for angular detail. Keep a fixed 16-slot
-    // atlas capacity, but use fewer active intervals near the camera and more
-    // in farther cascades: C0=4, C1=8, C2=12, C3=16.
-    if (cascade_index == 0u) { return 4; }
-    if (cascade_index == 1u) { return 8; }
-    if (cascade_index == 2u) { return 12; }
+    // v9: C0=4 was too sparse for voxel hills and showed visible probe-scale
+    // splotches. Keep the 16-slot atlas, but give the near cascades enough
+    // angular buckets that open-sky/terrain samples do not collapse into four
+    // unstable lobes.
+    if (cascade_index == 0u) { return 8; }
+    if (cascade_index == 1u) { return 12; }
     return RC_DIRECTION_COUNT;
 }
 
@@ -965,8 +1014,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     var rc_indirect = vec3f(0.0, 0.0, 0.0);
     var sky_signal_accum = 0.0;
     var sky_signal_weight = 0.0;
+    var rc_confidence_max = 0.0;
     var debug_cascade_contrib = vec3f(0.0, 0.0, 0.0);
     var debug_cascade_confidence = vec3f(0.0, 0.0, 0.0);
+    var debug_volume_coverage = vec3f(0.0, 0.0, 0.0);
     for (var i: u32 = 0u; i < 4u; i = i + 1u) {
         if (i >= cascade_count) {
             break;
@@ -977,6 +1028,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
         if (uvw.x < 0.0 || uvw.y < 0.0 || uvw.z < 0.0 || uvw.x > 1.0 || uvw.y > 1.0 || uvw.z > 1.0) {
             continue;
         }
+        var coverage_color = vec3f(1.0, 0.22, 0.08);
+        if (i == 1u) {
+            coverage_color = vec3f(0.20, 1.0, 0.22);
+        } else if (i == 2u) {
+            coverage_color = vec3f(0.18, 0.36, 1.0);
+        } else if (i >= 3u) {
+            coverage_color = vec3f(1.0, 0.28, 1.0);
+        }
+        debug_volume_coverage = max(debug_volume_coverage, coverage_color * 0.60);
 
         let grid_f = uvw * f32(max_index);
         let base_x = i32(clamp(floor(grid_f.x), 0.0, f32(max_index - 1)));
@@ -1009,8 +1069,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
                     let probe_dir = to_probe / probe_dist;
                     let backface = saturate((dot(normal, probe_dir) + PROBE_BACKFACE_SOFTNESS) / (1.0 + PROBE_BACKFACE_SOFTNESS));
                     let geometric_weight = max(0.18, backface);
-                    let open_probe_gate = smoothstep(0.06, 0.55, sky_access);
-                    let open_surface_probe_gate = mix(1.0, open_probe_gate, upward_surface);
+                    let open_probe_gate = smoothstep(0.02, 0.32, sky_access);
+                    let open_surface_probe_gate = mix(1.0, mix(0.35, 1.0, open_probe_gate), upward_surface);
                     let terrain_roughness = 0.82;
 
                     var probe_alpha_max = 0.0;
@@ -1063,19 +1123,25 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
         let cascade_preference = mix(1.0, PROBE_CASCADE_BLEND_FAR_BIAS, f32(i) / max(1.0, f32(cascade_count - 1u)));
         let raw_confidence = clamp(cascade_alpha * boundary_blend * cascade_preference, 0.0, 1.0);
         let confidence = smoothstep(0.025, 0.92, raw_confidence);
+        rc_confidence_max = max(rc_confidence_max, confidence * cascade_preference);
 
         // Probe radiance is indirect/additive only. Dark cascades add zero; they
         // never reduce light by participating in a normalized average.
+        // v8: the earlier tuning intentionally crushed far cascades to avoid
+        // additive overbright, but it made C1/C2/C3 visibly much darker than C0.
+        // Rebalance the compose energy so farther cascades still look like the
+        // same lighting field, just blurrier/lower-detail rather than darker.
         var cascade_add_weight = 1.0;
         if (i == 1u) {
-            cascade_add_weight = 0.55;
+            cascade_add_weight = 0.92;
         } else if (i == 2u) {
-            cascade_add_weight = 0.30;
+            cascade_add_weight = 0.84;
         } else if (i >= 3u) {
-            cascade_add_weight = 0.18;
+            cascade_add_weight = 0.76;
         }
-        let edge_handoff_damper = select(1.0, mix(0.82, 1.0, transition_blend), i + 1u < cascade_count);
-        let cascade_contribution = cascade_rgb_raw * confidence * cascade_add_weight * edge_handoff_damper;
+        let far_energy_comp = mix(1.0, 1.18, f32(i) / max(1.0, f32(cascade_count - 1u)));
+        let edge_handoff_damper = select(1.0, mix(0.88, 1.0, transition_blend), i + 1u < cascade_count);
+        let cascade_contribution = cascade_rgb_raw * confidence * cascade_add_weight * far_energy_comp * edge_handoff_damper;
         rc_indirect = rc_indirect + cascade_contribution;
 
         var cascade_debug_color = vec3f(1.0, 0.22, 0.08);
@@ -1093,13 +1159,16 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
         // Sky visibility is a smooth daylight mask, not visible probe radiance.
         // Weight C1 most strongly so the open-sky baseline is broad instead of
         // shaped like individual C0 cells. Hard-occluded caves keep this at zero.
-        var sky_cascade_weight = 0.42;
+        // Keep C0 from driving the broad daylight field by itself. C0 is close
+        // to terrain and intentionally high-frequency; using C1/C2 as the main
+        // sky baseline removes near-probe blotches while preserving C0 detail.
+        var sky_cascade_weight = 0.34;
         if (i == 1u) {
             sky_cascade_weight = 1.0;
         } else if (i == 2u) {
-            sky_cascade_weight = 0.35;
+            sky_cascade_weight = 0.82;
         } else if (i >= 3u) {
-            sky_cascade_weight = 0.15;
+            sky_cascade_weight = 0.62;
         }
         let sky_signal = smoothstep(0.18, 0.72, cascade_sky_access);
         let sky_transition_weight = mix(0.72, 1.0, transition_blend);
@@ -1110,11 +1179,53 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     let smoothed_sky_signal = smoothstep(0.06, 0.84, sky_signal_accum / max(sky_signal_weight, 0.0001));
     let hemisphere = clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
     let rc_coverage = saturate(sky_signal_weight * 0.95);
+    let near_surface = 1.0 - smoothstep(8.0, 40.0, depth);
     let medium_surface = smoothstep(24.0, 160.0, depth);
     let distant_surface = smoothstep(96.0, 384.0, depth);
-    let terrain_daylight_floor = medium_surface * mix(0.06, 0.18, hemisphere) * (0.40 + 0.60 * (1.0 - smoothed_sky_signal));
+    let close_terrain_daylight_floor =
+        near_surface
+        * upward_surface
+        * smoothstep(0.04, 0.32, max(smoothed_sky_signal, rc_coverage * 0.65))
+        * mix(0.025, 0.085, hemisphere);
+    let terrain_daylight_floor = max(
+        close_terrain_daylight_floor,
+        medium_surface * mix(0.06, 0.18, hemisphere) * (0.40 + 0.60 * (1.0 - smoothed_sky_signal))
+    );
     let distant_open_fallback = (1.0 - rc_coverage) * distant_surface * mix(0.14, 0.70, hemisphere);
-    let open_sky = max(smoothed_sky_signal, max(terrain_daylight_floor, distant_open_fallback));
+    let local_visible_surface = 1.0 - smoothstep(40.0, 360.0, depth);
+    let screen_exterior_hint = screen_space_sky_exposure(input.uv);
+    let rc_hole = 1.0 - smoothstep(0.025, 0.30, rc_confidence_max);
+    let top_surface = smoothstep(0.42, 0.92, normal.y);
+    let height_locality = 1.0 - smoothstep(38.0, 128.0, abs(world_pos.y - camera.position.y));
+
+    let screen_exterior_floor =
+        screen_exterior_hint
+        * rc_hole
+        * mix(0.06, 0.22, max(near_surface, local_visible_surface))
+        * mix(0.55, 1.0, hemisphere);
+
+    // Non-angle-dependent recovery for the exact failure in the diagnostics:
+    // a visible upward terrain surface inside the RC volumes, but with zero
+    // probe confidence / sky signal. Keep this a modest exterior-style floor
+    // rather than a radiance term, so RC still owns actual bounce lighting.
+    let local_top_confidence_floor =
+        top_surface
+        * local_visible_surface
+        * rc_hole
+        * mix(0.12, 0.34, max(height_locality, near_surface))
+        * mix(0.65, 1.0, hemisphere);
+
+    let base_open_sky = max(
+        smoothed_sky_signal,
+        max(max(terrain_daylight_floor, distant_open_fallback), max(screen_exterior_floor, local_top_confidence_floor))
+    );
+    let confidence_recovery_floor =
+        top_surface
+        * max(near_surface, height_locality * 0.70)
+        * rc_hole
+        * smoothstep(0.005, 0.08, base_open_sky)
+        * mix(0.04, 0.14, hemisphere);
+    let open_sky = max(base_open_sky, confidence_recovery_floor);
     let sky_baseline = vec3f(0.38, 0.40, 0.38) * open_sky * mix(0.34, 1.0, hemisphere);
     let rc_indirect_soft = rc_indirect / (vec3f(1.0, 1.0, 1.0) + rc_indirect);
     let rc_light = max(sky_baseline + rc_indirect_soft * 0.36, vec3f(0.0, 0.0, 0.0));
@@ -1124,7 +1235,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
         return vec4f(clamp(dbg * 2.4, vec3f(0.0), vec3f(1.0)), 1.0);
     }
     if (rc_debug_mode == 2) {
-        return vec4f(vec3f(open_sky), 1.0);
+        let rc_open_debug = max(smoothed_sky_signal, max(terrain_daylight_floor, distant_open_fallback));
+        return vec4f(vec3f(rc_open_debug), 1.0);
     }
     if (rc_debug_mode == 3) {
         return vec4f(normal * 0.5 + vec3f(0.5), 1.0);
@@ -1137,6 +1249,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     }
     if (rc_debug_mode == 6) {
         return vec4f(clamp(rc_light, vec3f(0.0), vec3f(1.0)), 1.0);
+    }
+    if (rc_debug_mode == 7) {
+        return vec4f(clamp(debug_volume_coverage, vec3f(0.0), vec3f(1.0)), 1.0);
     }
 
     let lit = clamp(albedo * rc_light * strength, vec3f(0.0, 0.0, 0.0), vec3f(1.0, 1.0, 1.0));
@@ -1561,32 +1676,12 @@ fn sky_visibility_at_block(bx: i32, by: i32, bz: i32) -> f32 {
     if (by < 0) {
         return 0.0;
     }
-    let center_access = column_sky_access(bx, by, bz, 0, 0);
-    if (center_access <= 0.0) {
-        return 0.0;
-    }
-    if (center_access >= 0.999 || SKY_VISIBILITY_SIDE_WEIGHT <= 0.0001) {
-        return center_access;
-    }
 
-    let r = SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS;
-    var side_access =
-        column_sky_access(bx, by, bz, r, 0) +
-        column_sky_access(bx, by, bz, -r, 0) +
-        column_sky_access(bx, by, bz, 0, r) +
-        column_sky_access(bx, by, bz, 0, -r);
-    var side_count = 4.0;
-    if (SKY_VISIBILITY_SIDE_WEIGHT >= 0.5) {
-        side_access = side_access +
-            column_sky_access(bx, by, bz, r, r) +
-            column_sky_access(bx, by, bz, r, -r) +
-            column_sky_access(bx, by, bz, -r, r) +
-            column_sky_access(bx, by, bz, -r, -r);
-        side_count = 8.0;
-    }
-    side_access = side_access / side_count;
-    let aperture = max(SKY_VISIBILITY_MIN_APERTURE, pow(max(side_access, 0.0), SKY_VISIBILITY_APERTURE_POWER));
-    return center_access * aperture;
+    // v7: keep the world-space RC sky classifier cheap again. The earlier
+    // side/cone checks were called from many trace samples and tanked frame time,
+    // while the diagnostics showed the remaining black hill problem was better
+    // handled in compose as a visible-surface recovery path.
+    return column_sky_access(bx, by, bz, 0, 0);
 }
 
 fn direction_for_base_index(index: u32, base_count: u32) -> vec3f {
@@ -1603,9 +1698,8 @@ fn normalize_direction_descriptor(v: vec4f) -> vec4f {
 }
 
 fn rc_active_direction_count(cascade_index: u32) -> i32 {
-    if (cascade_index == 0u) { return 4; }
-    if (cascade_index == 1u) { return 8; }
-    if (cascade_index == 2u) { return 12; }
+    if (cascade_index == 0u) { return 8; }
+    if (cascade_index == 1u) { return 12; }
     return RC_DIRECTION_COUNT;
 }
 
@@ -2249,13 +2343,20 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let temporal_history_weight = saturate(rc.light_dir.w);
     let hit_fraction = hit_count * inv_ray_count;
     let sky_fraction = min(1.0, sky_count * inv_ray_count);
-    let valid_fraction = saturate(hit_fraction + 0.75 * sky_fraction) * solid_radiance_scale;
     var observed_sky_access = 0.0;
     if (hit_count > 0.0) {
         observed_sky_access = hit_sky_visibility_accum / hit_count;
     }
     observed_sky_access = max(observed_sky_access, sky_fraction);
-    let probe_sky_access = saturate(0.78 * origin_sky_visibility + 0.22 * observed_sky_access);
+    let probe_sky_access = saturate(max(
+        0.58 * origin_sky_visibility + 0.42 * observed_sky_access,
+        sky_fraction * 0.45
+    ));
+    let open_probe_validity_floor = smoothstep(0.18, 0.62, probe_sky_access) * 0.16;
+    let valid_fraction = max(
+        saturate(hit_fraction + 0.75 * sky_fraction) * solid_radiance_scale,
+        open_probe_validity_floor * solid_radiance_scale
+    );
     let direction_len = length(direction_vector_accum);
     let dominant_dir = select(vec3f(0.0, 1.0, 0.0), direction_vector_accum / max(direction_len, 0.0001), direction_len > 0.0001);
     let directional_anisotropy = saturate(direction_len / max(direction_energy_accum, 0.0001));
@@ -2269,8 +2370,18 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
 
     for (var store_slot: i32 = 0; store_slot < RC_DIRECTION_COUNT; store_slot = store_slot + 1) {
         let active_scale = select(0.0, 1.0, store_slot < active_dir_count);
-        let traced_rgb = dir_buckets[store_slot] * inv_ray_count * solid_radiance_scale * active_scale;
         let directional_interval_opacity = saturate(dir_opacity[store_slot] / expected_samples_per_direction);
+        // v10: this atlas stores one radiance value per direction slot. The old
+        // code divided every slot by the total ray count, which made each bucket
+        // roughly 1/active_dir_count as bright as it should be. That starved true
+        // indirect bounce, especially in caves where there is no sky baseline to
+        // hide the weak RC radiance. Normalize by the expected rays that map to
+        // this slot instead, then let alpha/confidence control validity.
+        let directional_norm = 1.0 / max(expected_samples_per_direction, 1.0);
+        let traced_rgb = rc_clamp_luma(
+            dir_buckets[store_slot] * directional_norm * solid_radiance_scale * active_scale,
+            RC_INTERVAL_MAX_LUMA,
+        );
         let traced_alpha = valid_fraction * directional_interval_opacity * active_scale;
         let previous = sample_src_world_rc_dir(cascade_index, origin, resolution_i, store_slot);
         let previous_alpha = saturate(previous.a) * active_scale;
@@ -2301,9 +2412,8 @@ struct RcUpdateParams {
 const RC_DIRECTION_COUNT: i32 = 16;
 
 fn rc_active_direction_count(cascade_index: u32) -> i32 {
-    if (cascade_index == 0u) { return 4; }
-    if (cascade_index == 1u) { return 8; }
-    if (cascade_index == 2u) { return 12; }
+    if (cascade_index == 0u) { return 8; }
+    if (cascade_index == 1u) { return 12; }
     return RC_DIRECTION_COUNT;
 }
 
@@ -2345,7 +2455,8 @@ fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
     let coord = vec3i(i32(gid.x), i32(gid.y), i32(gid.z));
     let cascade_index = u32(rc.meta0.y + 0.5);
     let active_dir_count = rc_active_direction_count(cascade_index);
-    let far_filter = clamp(f32(cascade_index) * 0.45, 0.0, 1.0);
+    let c0_desplotch_filter = select(0.0, 0.55, cascade_index == 0u);
+    let far_filter = max(c0_desplotch_filter, clamp(f32(cascade_index) * 0.45, 0.0, 1.0));
 
     let raw_visibility = textureLoad(src_visibility, coord, 0);
     let center_weight = mix(0.34, 0.28, far_filter);
