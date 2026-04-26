@@ -6,6 +6,7 @@ import time
 import numpy as np
 import wgpu
 
+from .. import render_contract as render_consts
 from ..cache import mesh_allocator as mesh_cache
 from ..meshing_types import ChunkMesh
 from ..terrain.types import ChunkVoxelResult
@@ -25,9 +26,8 @@ __all__ = [
 ]
 
 def _renderer_module():
-    from .. import renderer as renderer_module
-
-    return renderer_module
+    """Return stable render constants without importing the renderer runtime."""
+    return render_consts
 
 @profile
 def _shared_empty_chunk_vertex_buffer(renderer) -> wgpu.GPUBuffer:

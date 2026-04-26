@@ -9,7 +9,7 @@ import time
 import numpy as np
 import wgpu
 
-from .. import render_constants as render_consts
+from .. import render_contract as render_consts
 from ..meshing_types import ChunkDrawBatch, ChunkMesh, ChunkRenderBatch, MeshBufferAllocation, MeshOutputSlab
 from ..meshing import gpu_mesher as wgpu_mesher
 
@@ -24,9 +24,13 @@ except NameError:  # pragma: no cover - only used outside kernprof
 
 
 def _renderer_module():
-    from .. import renderer as renderer_module
+    """Return the small render contract used by cache/allocator helpers.
 
-    return renderer_module
+    Importing ``engine.renderer`` from here creates a reverse dependency on the
+    god-object runtime module.  The allocator only needs stable constants, so keep
+    it pointed at ``render_contract`` instead.
+    """
+    return render_consts
 
 
 def chunk_cache_memory_bytes(renderer) -> int:

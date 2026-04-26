@@ -10,15 +10,14 @@ from ctypes.util import find_library
 from pathlib import Path
 
 from ..cache import mesh_allocator as mesh_cache
-from .. import render_constants as render_consts
+from .. import render_contract as render_consts
 import wgpu
 from ..render_utils import pack_vertex, screen_to_ndc
 
 
 def _renderer_module():
-    from .. import renderer as renderer_module
-
-    return renderer_module
+    """Return stable render constants without importing the renderer runtime."""
+    return render_consts
 
 
 HUD_FONT_FALLBACK: dict[str, tuple[str, ...]] = {

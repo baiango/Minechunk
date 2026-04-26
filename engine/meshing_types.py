@@ -6,6 +6,8 @@ import math
 import numpy as np
 import wgpu
 
+from . import render_contract as render_consts
+
 
 @dataclass
 class ChunkMesh:
@@ -23,18 +25,10 @@ class ChunkMesh:
     first_vertex: int = 0
 
     def __post_init__(self) -> None:
-        try:
-            from . import renderer as renderer_module
-
-            chunk_world_size = float(renderer_module.CHUNK_WORLD_SIZE)
-            block_size = float(renderer_module.BLOCK_SIZE)
-            chunk_size = int(renderer_module.CHUNK_SIZE)
-            vertex_stride = int(renderer_module.VERTEX_STRIDE)
-        except Exception:
-            chunk_size = 64
-            chunk_world_size = 6.4
-            block_size = 0.1
-            vertex_stride = 48
+        chunk_world_size = float(render_consts.CHUNK_WORLD_SIZE)
+        block_size = float(render_consts.BLOCK_SIZE)
+        chunk_size = int(render_consts.CHUNK_SIZE)
+        vertex_stride = int(render_consts.VERTEX_STRIDE)
         half_chunk = chunk_world_size * 0.5
         min_y = float(self.chunk_y * chunk_size) * block_size
         max_y = float(self.max_height) * block_size

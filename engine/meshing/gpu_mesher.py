@@ -8,6 +8,7 @@ from collections import deque
 import numpy as np
 import wgpu
 
+from .. import render_contract as render_consts
 from ..cache import mesh_allocator as mesh_cache
 from .. import meshing_types as mt
 from ..terrain.types import ChunkSurfaceGpuBatch, ChunkVoxelResult
@@ -20,9 +21,8 @@ except NameError:  # pragma: no cover - only used outside kernprof
 
 
 def _renderer_module():
-    from .. import renderer
-
-    return renderer
+    """Return stable render constants without importing the renderer runtime."""
+    return render_consts
 
 
 def _chunk_half() -> float:

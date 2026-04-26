@@ -46,8 +46,6 @@ def rebuild_visible_missing_tracking(renderer) -> None:
 @profile
 def refresh_visible_chunk_set(renderer) -> float:
     visibility_start = time.perf_counter()
-    from ..pipelines.chunk_pipeline import _renderer_module
-    renderer_module = _renderer_module()
     current_origin = renderer._current_chunk_origin()
     if renderer._visible_chunk_origin != current_origin or not renderer._visible_chunk_coords:
         renderer._refresh_visible_chunk_coords()

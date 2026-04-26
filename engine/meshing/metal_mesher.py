@@ -13,6 +13,7 @@ import numpy as np
 import Metal
 import wgpu
 
+from .. import render_contract as render_consts
 from ..cache import mesh_allocator as mesh_cache
 from ..meshing import cpu_mesher
 from ..meshing_types import ChunkMesh
@@ -30,8 +31,8 @@ _ASYNC_STATE_INIT_LOCK = threading.Lock()
 
 
 def _renderer_module():
-    from .. import renderer
-    return renderer
+    """Return stable render constants without importing the renderer runtime."""
+    return render_consts
 
 
 def _normalize_chunk_coord(coord) -> tuple[int, int, int]:

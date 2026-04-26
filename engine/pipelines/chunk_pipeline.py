@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 from ..cache import mesh_allocator as mesh_cache
+from .. import render_contract as render_contract
 from ..meshing import gpu_mesher as wgpu_mesher
 try:
     from ..meshing import metal_mesher
@@ -23,9 +24,8 @@ except NameError:  # pragma: no cover - only used outside kernprof
         return func
 
 def _renderer_module():
-    from .. import renderer as renderer_module
-
-    return renderer_module
+    """Return renderer configuration constants without importing engine.renderer."""
+    return render_contract
 
 def _terrain_mesher(renderer):
     if meshing_stage.selected_mesher_kind(renderer) == "metal" and metal_mesher is not None:
