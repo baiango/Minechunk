@@ -1187,6 +1187,7 @@ const SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS: i32 = __SKY_VISIBILITY_APERTURE_RAD
 const SKY_VISIBILITY_APERTURE_POWER: f32 = __SKY_VISIBILITY_APERTURE_POWER__;
 const SKY_VISIBILITY_MIN_APERTURE: f32 = __SKY_VISIBILITY_MIN_APERTURE__;
 const RC_DIRECTION_COUNT: i32 = 16;
+const RC_TEMPORAL_ALPHA: f32 = __RC_TEMPORAL_ALPHA__;
 
 fn saturate(v: f32) -> f32 {
     return clamp(v, 0.0, 1.0);
@@ -2050,15 +2051,29 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let directional_anisotropy = saturate(direction_len / max(direction_energy_accum, 0.0001));
     let direction_descriptor = vec4f(dominant_dir * directional_anisotropy, probe_sky_access * valid_fraction);
 
+    let prev_descriptor = sample_src_world_rc_vis(cascade_index, origin, resolution_i);
+    let descriptor_has_history = prev_descriptor.w > 0.001 || length(prev_descriptor.xyz) > 0.001;
+    let descriptor_new_weight = select(1.0, clamp(RC_TEMPORAL_ALPHA * 1.20, 0.0, 1.0), descriptor_has_history && valid_fraction > 0.001);
+    let temporal_descriptor = normalize_direction_descriptor(mix(prev_descriptor, direction_descriptor, descriptor_new_weight));
+    let out_descriptor = vec4f(temporal_descriptor.xyz, max(direction_descriptor.w, temporal_descriptor.w));
+
     for (var store_slot: i32 = 0; store_slot < RC_DIRECTION_COUNT; store_slot = store_slot + 1) {
         let active_scale = select(0.0, 1.0, store_slot < active_dir_count);
+        let traced_rgb = dir_buckets[store_slot] * inv_ray_count * solid_radiance_scale * active_scale;
+        let traced_alpha = valid_fraction * active_scale;
+        let previous = sample_src_world_rc_dir(cascade_index, origin, resolution_i, store_slot);
+        let previous_alpha = saturate(previous.a) * active_scale;
+        let has_history = previous_alpha > 0.001 && traced_alpha > 0.001;
+        let new_weight = select(1.0, RC_TEMPORAL_ALPHA, has_history);
+        let temporal_rgb = mix(previous.rgb, traced_rgb, new_weight);
+        let temporal_alpha = max(traced_alpha, mix(previous_alpha, traced_alpha, new_weight));
         textureStore(
             dst_volume,
             vec3i(coord.x + store_slot * resolution_i, coord.y, coord.z),
-            vec4f(dir_buckets[store_slot] * inv_ray_count * solid_radiance_scale * active_scale, valid_fraction * active_scale),
+            vec4f(max(temporal_rgb, vec3f(0.0, 0.0, 0.0)), temporal_alpha),
         );
     }
-    textureStore(dst_visibility, coord, direction_descriptor);
+    textureStore(dst_visibility, coord, out_descriptor);
 }
 """
 
@@ -2224,6 +2239,7 @@ WORLDSPACE_RC_TRACE_SHADER = (
     .replace("__SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS__", str(max(1, int(render_consts.WORLDSPACE_RC_SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS))))
     .replace("__SKY_VISIBILITY_APERTURE_POWER__", f"{float(render_consts.WORLDSPACE_RC_SKY_VISIBILITY_APERTURE_POWER):.8f}")
     .replace("__SKY_VISIBILITY_MIN_APERTURE__", f"{float(render_consts.WORLDSPACE_RC_SKY_VISIBILITY_MIN_APERTURE):.8f}")
+    .replace("__RC_TEMPORAL_ALPHA__", f"{float(render_consts.WORLDSPACE_RC_TEMPORAL_BLEND_ALPHA):.8f}")
 )
 
 
