@@ -4,7 +4,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 LOW_LEVEL_MODULES = [
+    ROOT / "engine" / "auto_exit.py",
     ROOT / "engine" / "cache" / "mesh_allocator.py",
+    ROOT / "engine" / "collision" / "walk_solver.py",
     ROOT / "engine" / "debug_capture.py",
     ROOT / "engine" / "render_contract.py",
     ROOT / "engine" / "meshing" / "cpu_mesher.py",
@@ -13,6 +15,7 @@ LOW_LEVEL_MODULES = [
     ROOT / "engine" / "meshing_types.py",
     ROOT / "engine" / "pipelines" / "chunk_pipeline.py",
     ROOT / "engine" / "pipelines" / "profiling.py",
+    ROOT / "engine" / "rendering" / "postprocess_targets.py",
     ROOT / "engine" / "visibility" / "coord_manager.py",
 ]
 

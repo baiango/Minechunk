@@ -12,7 +12,7 @@ from .pipelines import chunk_pipeline as chunk_gen
 from .pipelines import profiling as hud_profile
 from .cache import mesh_allocator as mesh_cache
 from .renderer_config import *
-from . import render_contract
+from . import auto_exit, render_contract
 from .render_shaders import (
     FINAL_BLIT_SHADER,
     GI_CASCADE_SHADER,
@@ -28,6 +28,8 @@ from .render_shaders import (
     VOXEL_MESH_BATCH_SHADER,
     VOXEL_SURFACE_EXPAND_SHADER,
 )
+from .collision import walk_solver
+from .rendering import postprocess_targets
 from .debug_capture import (
     readback_to_rgba8,
     safe_filename_component,
@@ -76,7 +78,6 @@ from .world_constants import (
 )
 from .terrain.world import VoxelWorld
 from .terrain.types import ChunkSurfaceGpuBatch
-from .terrain.kernels import AIR
 
 try:
     profile  # type: ignore[name-defined]
@@ -1297,7 +1298,7 @@ class TerrainRenderer:
             self.radiance_cascades_enabled = not self.radiance_cascades_enabled
         if is_new_press and key == "f6":
             self.rc_debug_mode = (int(self.rc_debug_mode) + 1) % len(self.rc_debug_mode_names)
-            self._write_gi_params()
+            postprocess_targets.write_gi_params(self)
             print(f"Info: RC debug mode = {self.rc_debug_mode} ({self.rc_debug_mode_names[self.rc_debug_mode]})")
         if is_new_press and key == "f7":
             self._dump_worldspace_rc_diagnostics()
@@ -1339,15 +1340,6 @@ class TerrainRenderer:
             if name in self.keys_down:
                 return True
         return False
-
-    def _write_final_present_params(self, width: int, height: int) -> None:
-        params = np.array([
-            1.0 / max(1.0, float(width)),
-            1.0 / max(1.0, float(height)),
-            0.0,
-            0.0,
-        ], dtype=np.float32)
-        self.device.queue.write_buffer(self.final_present_params_buffer, 0, params.tobytes())
 
     def _toggle_profiling(self) -> None:
         if self.profiling_enabled:
@@ -1560,197 +1552,6 @@ class TerrainRenderer:
         else:
             self._mesh_buffer_refs[key] = refs - 1
 
-    def _player_extents(self) -> tuple[float, float, float]:
-        return (
-            float(PLAYER_COLLIDER_HALF_WIDTH_METERS),
-            float(PLAYER_EYE_OFFSET_METERS),
-            float(max(0.0, PLAYER_COLLIDER_HEIGHT_METERS - PLAYER_EYE_OFFSET_METERS)),
-        )
-
-    def _player_aabb(self, position: list[float]) -> tuple[float, float, float, float, float, float]:
-        half_width, eye_down, eye_up = self._player_extents()
-        return (
-            float(position[0]) - half_width,
-            float(position[1]) - eye_down,
-            float(position[2]) - half_width,
-            float(position[0]) + half_width,
-            float(position[1]) + eye_up,
-            float(position[2]) + half_width,
-        )
-
-    def _is_block_solid(self, bx: int, by: int, bz: int) -> bool:
-        if by < 0:
-            return True
-        key = (int(bx), int(by), int(bz))
-        cached = self._solid_block_cache.get(key)
-        if cached is not None:
-            return bool(cached)
-        is_solid = int(self.world.block_at(key[0], key[1], key[2])) != int(AIR)
-        self._solid_block_cache[key] = bool(is_solid)
-        return bool(is_solid)
-
-    def _resolve_small_downward_snap(self, position: list[float], delta: float) -> bool:
-        if delta >= 0.0 or delta < -BLOCK_SIZE * 1.01:
-            return False
-        eps = 1e-6
-        half_width, eye_down, _ = self._player_extents()
-        min_x = float(position[0]) - half_width
-        max_x = float(position[0]) + half_width
-        min_z = float(position[2]) - half_width
-        max_z = float(position[2]) + half_width
-        target_min_y = float(position[1]) + float(delta) - eye_down
-        probe_by = int(math.floor(target_min_y / BLOCK_SIZE))
-        min_bx = int(math.floor(min_x / BLOCK_SIZE))
-        max_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
-        min_bz = int(math.floor(min_z / BLOCK_SIZE))
-        max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
-        for bz in range(min_bz, max_bz + 1):
-            for bx in range(min_bx, max_bx + 1):
-                if self._is_block_solid(bx, probe_by, bz):
-                    position[1] = (float(probe_by) + 1.0) * BLOCK_SIZE + eye_down + eps
-                    return True
-        return False
-
-    def _resolve_collision_axis(self, position: list[float], axis: int, delta: float) -> bool:
-        if abs(delta) <= 1e-9:
-            return False
-
-        eps = 1e-6
-        old_position = [float(position[0]), float(position[1]), float(position[2])]
-        old_min_x, old_min_y, old_min_z, old_max_x, old_max_y, old_max_z = self._player_aabb(old_position)
-        position[axis] += float(delta)
-        min_x, min_y, min_z, max_x, max_y, max_z = self._player_aabb(position)
-        half_width, eye_down, eye_up = self._player_extents()
-
-        if axis == 0:
-            min_by = int(math.floor(min_y / BLOCK_SIZE))
-            max_by = int(math.floor((max_y - eps) / BLOCK_SIZE))
-            min_bz = int(math.floor(min_z / BLOCK_SIZE))
-            max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
-            if delta > 0.0:
-                start_bx = int(math.floor((old_max_x - eps) / BLOCK_SIZE)) + 1
-                end_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
-                for bx in range(start_bx, end_bx + 1):
-                    for by in range(min_by, max_by + 1):
-                        for bz in range(min_bz, max_bz + 1):
-                            if self._is_block_solid(bx, by, bz):
-                                position[0] = float(bx) * BLOCK_SIZE - half_width - eps
-                                return True
-            else:
-                start_bx = int(math.floor(old_min_x / BLOCK_SIZE)) - 1
-                end_bx = int(math.floor(min_x / BLOCK_SIZE))
-                for bx in range(start_bx, end_bx - 1, -1):
-                    for by in range(min_by, max_by + 1):
-                        for bz in range(min_bz, max_bz + 1):
-                            if self._is_block_solid(bx, by, bz):
-                                position[0] = (float(bx) + 1.0) * BLOCK_SIZE + half_width + eps
-                                return True
-            return False
-
-        if axis == 1:
-            if delta < 0.0:
-                snap_probe = [float(old_position[0]), float(old_position[1]), float(old_position[2])]
-                if self._resolve_small_downward_snap(snap_probe, delta):
-                    position[1] = snap_probe[1]
-                    return True
-            min_bx = int(math.floor(min_x / BLOCK_SIZE))
-            max_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
-            min_bz = int(math.floor(min_z / BLOCK_SIZE))
-            max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
-            if delta > 0.0:
-                start_by = int(math.floor((old_max_y - eps) / BLOCK_SIZE)) + 1
-                end_by = int(math.floor((max_y - eps) / BLOCK_SIZE))
-                for by in range(start_by, end_by + 1):
-                    for bz in range(min_bz, max_bz + 1):
-                        for bx in range(min_bx, max_bx + 1):
-                            if self._is_block_solid(bx, by, bz):
-                                position[1] = float(by) * BLOCK_SIZE - eye_up - eps
-                                return True
-            else:
-                start_by = int(math.floor(old_min_y / BLOCK_SIZE)) - 1
-                end_by = int(math.floor(min_y / BLOCK_SIZE))
-                for by in range(start_by, end_by - 1, -1):
-                    for bz in range(min_bz, max_bz + 1):
-                        for bx in range(min_bx, max_bx + 1):
-                            if self._is_block_solid(bx, by, bz):
-                                position[1] = (float(by) + 1.0) * BLOCK_SIZE + eye_down + eps
-                                return True
-            return False
-
-        min_bx = int(math.floor(min_x / BLOCK_SIZE))
-        max_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
-        min_by = int(math.floor(min_y / BLOCK_SIZE))
-        max_by = int(math.floor((max_y - eps) / BLOCK_SIZE))
-        if delta > 0.0:
-            start_bz = int(math.floor((old_max_z - eps) / BLOCK_SIZE)) + 1
-            end_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
-            for bz in range(start_bz, end_bz + 1):
-                for by in range(min_by, max_by + 1):
-                    for bx in range(min_bx, max_bx + 1):
-                        if self._is_block_solid(bx, by, bz):
-                            position[2] = float(bz) * BLOCK_SIZE - half_width - eps
-                            return True
-        else:
-            start_bz = int(math.floor(old_min_z / BLOCK_SIZE)) - 1
-            end_bz = int(math.floor(min_z / BLOCK_SIZE))
-            for bz in range(start_bz, end_bz - 1, -1):
-                for by in range(min_by, max_by + 1):
-                    for bx in range(min_bx, max_bx + 1):
-                        if self._is_block_solid(bx, by, bz):
-                            position[2] = (float(bz) + 1.0) * BLOCK_SIZE + half_width + eps
-                            return True
-        return False
-
-    @profile
-    def _position_is_clear(self, position: list[float]) -> bool:
-        min_x, min_y, min_z, max_x, max_y, max_z = self._player_aabb(position)
-        eps = 1e-6
-        min_bx = int(math.floor(min_x / BLOCK_SIZE))
-        max_bx = int(math.floor((max_x - eps) / BLOCK_SIZE))
-        min_by = int(math.floor(min_y / BLOCK_SIZE))
-        max_by = int(math.floor((max_y - eps) / BLOCK_SIZE))
-        min_bz = int(math.floor(min_z / BLOCK_SIZE))
-        max_bz = int(math.floor((max_z - eps) / BLOCK_SIZE))
-        for by in range(min_by, max_by + 1):
-            for bz in range(min_bz, max_bz + 1):
-                for bx in range(min_bx, max_bx + 1):
-                    if self._is_block_solid(bx, by, bz):
-                        return False
-        return True
-
-    @profile
-    def _move_horizontal_with_step(self, position: list[float], axis: int, delta: float) -> bool:
-        if abs(delta) <= 1e-9:
-            return False
-        trial = [float(position[0]), float(position[1]), float(position[2])]
-        collided = self._resolve_collision_axis(trial, axis, delta)
-        if not collided:
-            position[:] = trial
-            return False
-        if not self.walk_mode or not self._camera_on_ground:
-            position[:] = trial
-            return True
-        stepped = [float(position[0]), float(position[1]), float(position[2])]
-        self._resolve_collision_axis(stepped, 1, float(PLAYER_STEP_HEIGHT_METERS))
-        if stepped[1] <= position[1] + 1e-5 or not self._position_is_clear(stepped):
-            position[:] = trial
-            return True
-        step_trial = [float(stepped[0]), float(stepped[1]), float(stepped[2])]
-        if self._resolve_collision_axis(step_trial, axis, delta):
-            position[:] = trial
-            return True
-        self._resolve_collision_axis(step_trial, 1, -float(PLAYER_GROUND_SNAP_METERS))
-        position[:] = step_trial
-        return False
-
-    def _snap_to_ground(self, position: list[float]) -> bool:
-        probe = [float(position[0]), float(position[1]), float(position[2])]
-        collided = self._resolve_collision_axis(probe, 1, -float(PLAYER_GROUND_SNAP_METERS))
-        if collided:
-            position[:] = probe
-            return True
-        return False
-
     @profile
     def _update_camera_fly(self, dt: float) -> None:
         sprinting = self._key_active("shift", "shiftleft", "shiftright")
@@ -1786,86 +1587,8 @@ class TerrainRenderer:
             self.camera.position[2] += move[2] * scale
 
     @profile
-    def _update_camera_walk(self, dt: float) -> None:
-        self._solid_block_cache.clear()
-        sprinting = self._key_active("shift", "shiftleft", "shiftright")
-        speed = WALK_SPRINT_SPEED if sprinting else self.camera.move_speed
-        self._current_move_speed = float(speed)
-
-        move_x = 0.0
-        move_z = 0.0
-        forward = flat_forward_vector(self.camera.yaw)
-        right = right_vector(self.camera.yaw)
-        if self._key_active("w", "arrowup"):
-            move_x += forward[0]
-            move_z += forward[2]
-        if self._key_active("s", "arrowdown"):
-            move_x -= forward[0]
-            move_z -= forward[2]
-        if self._key_active("d", "arrowright"):
-            move_x += right[0]
-            move_z += right[2]
-        if self._key_active("a", "arrowleft"):
-            move_x -= right[0]
-            move_z -= right[2]
-
-        move_len = math.sqrt(move_x * move_x + move_z * move_z)
-        if move_len > 0.0:
-            move_x /= move_len
-            move_z /= move_len
-        desired_dx = move_x * speed * dt
-        desired_dz = move_z * speed * dt
-
-        if self._camera_on_ground and self._jump_queued:
-            self._walk_velocity[1] = float(PLAYER_JUMP_SPEED_METERS)
-            self._camera_on_ground = False
-        self._jump_queued = False
-
-        if self._camera_on_ground and desired_dx == 0.0 and desired_dz == 0.0 and self._walk_velocity[1] <= 0.0:
-            position = [float(self.camera.position[0]), float(self.camera.position[1]), float(self.camera.position[2])]
-            if self._resolve_small_downward_snap(position, -float(PLAYER_GROUND_SNAP_METERS)):
-                self._walk_velocity[1] = 0.0
-                self.camera.position[:] = position
-                return
-
-        self._walk_velocity[1] -= float(PLAYER_GRAVITY_METERS) * dt
-
-        position = [float(self.camera.position[0]), float(self.camera.position[1]), float(self.camera.position[2])]
-        if desired_dx != 0.0:
-            self._move_horizontal_with_step(position, 0, desired_dx)
-        if desired_dz != 0.0:
-            self._move_horizontal_with_step(position, 2, desired_dz)
-
-        vertical_delta = self._walk_velocity[1] * dt
-        if vertical_delta <= 0.0:
-            snap_delta = min(vertical_delta, -float(PLAYER_GROUND_SNAP_METERS))
-            collided_y = self._resolve_small_downward_snap(position, snap_delta)
-            if not collided_y:
-                collided_y = self._resolve_collision_axis(position, 1, snap_delta)
-            if collided_y:
-                self._camera_on_ground = True
-                self._walk_velocity[1] = 0.0
-            else:
-                self._camera_on_ground = False
-        else:
-            collided_y = self._resolve_collision_axis(position, 1, vertical_delta)
-            if collided_y:
-                self._walk_velocity[1] = 0.0
-            else:
-                self._camera_on_ground = False
-
-        self.camera.position[:] = position
-
-    @profile
     def _update_camera(self, dt: float) -> None:
-        if self.walk_mode:
-            self._update_camera_walk(dt)
-        else:
-            self._update_camera_fly(dt)
-            self._walk_velocity[:] = [0.0, 0.0, 0.0]
-            self._camera_on_ground = False
-            self._jump_queued = False
-        self.camera.position[1] = clamp(self.camera.position[1], CAMERA_MIN_HEIGHT_METERS, self.world.height * BLOCK_SIZE + CAMERA_HEADROOM_METERS)
+        walk_solver.update_camera(self, dt)
 
     def _ensure_depth_buffer(self) -> None:
         width, height = self.canvas.get_physical_size()
@@ -2264,301 +1987,6 @@ class TerrainRenderer:
             file=sys.stderr,
         )
 
-    def _make_gi_params(self, rc_debug_mode: int | None = None) -> np.ndarray:
-        # merge_control.x is used by the world-space RC compose shader as a
-        # lightweight debug visualization mode. The legacy screen-space cascade
-        # pass is not submitted in the current WGPU RC path.
-        debug_mode = int(self.rc_debug_mode if rc_debug_mode is None else rc_debug_mode)
-        return np.array([
-            float(RADIANCE_CASCADES_STRENGTH),
-            float(RADIANCE_CASCADES_BIAS),
-            float(RADIANCE_CASCADES_SKY_STRENGTH),
-            float(RADIANCE_CASCADES_HIT_THICKNESS),
-            float(debug_mode),
-            float(RADIANCE_CASCADES_MERGE_STRENGTH),
-            float(RADIANCE_CASCADES_CASCADE_COUNT),
-            float(WORLDSPACE_RC_GRID_RESOLUTION),
-        ], dtype=np.float32)
-
-    def _write_gi_params(self) -> None:
-        if self.gi_params_buffer is None:
-            return
-        self.device.queue.write_buffer(self.gi_params_buffer, 0, self._make_gi_params().tobytes())
-
-    def _ensure_postprocess_targets(self) -> None:
-        width, height = self.canvas.get_physical_size()
-        target_size = (max(1, int(width)), max(1, int(height)))
-        cascade_count = max(1, int(RADIANCE_CASCADES_CASCADE_COUNT))
-        if (
-            target_size == self._postprocess_size
-            and self.scene_color_view is not None
-            and self.scene_gbuffer_view is not None
-            and self.gi_color_view is not None
-            and len(self.gi_cascade_views) == cascade_count
-            and len(self.gi_cascade_bind_groups) == cascade_count
-            and len(self.worldspace_rc_views) == 4
-            and len(self.worldspace_rc_visibility_views) == 4
-            and len(self.worldspace_rc_scratch_views) == 4
-            and len(self.worldspace_rc_visibility_scratch_views) == 4
-            and len(self.worldspace_rc_update_param_buffers) == 4
-            and len(self.worldspace_rc_trace_bind_groups) == 4
-            and len(self.worldspace_rc_filter_bind_groups) == 4
-            and len(self.worldspace_rc_filter_pingpong_bind_groups) == 4
-            and self.gi_compose_bind_group is not None
-            and self.final_scene_bind_group is not None
-            and self.final_gi_bind_group is not None
-            and self.postprocess_depth_view is not None
-            and (self.postprocess_msaa_sample_count <= 1 or self.scene_color_msaa_view is not None)
-            and (self.postprocess_msaa_sample_count <= 1 or self.scene_gbuffer_msaa_view is not None)
-        ):
-            return
-        self._postprocess_size = target_size
-        gi_compose_scale = min(1.0, max(0.25, float(RADIANCE_CASCADES_COMPOSE_SCALE)))
-        gi_target_size = (
-            max(1, int(math.ceil(float(target_size[0]) * gi_compose_scale))),
-            max(1, int(math.ceil(float(target_size[1]) * gi_compose_scale))),
-        )
-        texture_usage = wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.TEXTURE_BINDING
-        self.scene_color_texture = self.device.create_texture(
-            size=(target_size[0], target_size[1], 1),
-            format=POSTPROCESS_SCENE_FORMAT,
-            usage=texture_usage,
-        )
-        self.scene_color_view = self.scene_color_texture.create_view()
-        if self.postprocess_msaa_sample_count > 1:
-            self.scene_color_msaa_texture = self.device.create_texture(
-                size=(target_size[0], target_size[1], 1),
-                format=POSTPROCESS_SCENE_FORMAT,
-                usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
-                sample_count=self.postprocess_msaa_sample_count,
-            )
-            self.scene_color_msaa_view = self.scene_color_msaa_texture.create_view()
-        else:
-            self.scene_color_msaa_texture = None
-            self.scene_color_msaa_view = self.scene_color_view
-        self.scene_gbuffer_texture = self.device.create_texture(
-            size=(target_size[0], target_size[1], 1),
-            format=POSTPROCESS_GBUFFER_FORMAT,
-            usage=texture_usage,
-        )
-        self.scene_gbuffer_view = self.scene_gbuffer_texture.create_view()
-        if self.postprocess_msaa_sample_count > 1:
-            self.scene_gbuffer_msaa_texture = self.device.create_texture(
-                size=(target_size[0], target_size[1], 1),
-                format=POSTPROCESS_GBUFFER_FORMAT,
-                usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
-                sample_count=self.postprocess_msaa_sample_count,
-            )
-            self.scene_gbuffer_msaa_view = self.scene_gbuffer_msaa_texture.create_view()
-        else:
-            self.scene_gbuffer_msaa_texture = None
-            self.scene_gbuffer_msaa_view = self.scene_gbuffer_view
-        self.gi_color_texture = self.device.create_texture(
-            size=(gi_target_size[0], gi_target_size[1], 1),
-            format=POSTPROCESS_GI_FORMAT,
-            usage=texture_usage,
-        )
-        self.gi_color_view = self.gi_color_texture.create_view()
-        self._gi_color_size = (gi_target_size[0], gi_target_size[1])
-        worldspace_resolution = max(4, int(WORLDSPACE_RC_GRID_RESOLUTION))
-        worldspace_direction_count = max(1, int(WORLDSPACE_RC_DIRECTION_COUNT))
-        worldspace_radiance_width = worldspace_resolution * worldspace_direction_count
-        self.worldspace_rc_textures = []
-        self.worldspace_rc_views = []
-        self.worldspace_rc_visibility_textures = []
-        self.worldspace_rc_visibility_views = []
-        self.worldspace_rc_scratch_textures = []
-        self.worldspace_rc_scratch_views = []
-        self.worldspace_rc_visibility_scratch_textures = []
-        self.worldspace_rc_visibility_scratch_views = []
-        self.worldspace_rc_trace_bind_groups = []
-        self.worldspace_rc_filter_bind_groups = []
-        self.worldspace_rc_filter_pingpong_bind_groups = []
-        rc_texture_usage = wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.STORAGE_BINDING
-        for cascade_index in range(4):
-            rc_texture = self.device.create_texture(
-                size=(worldspace_radiance_width, worldspace_resolution, worldspace_resolution),
-                dimension="3d",
-                format=POSTPROCESS_GI_FORMAT,
-                usage=rc_texture_usage,
-            )
-            vis_texture = self.device.create_texture(
-                size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
-                dimension="3d",
-                format=POSTPROCESS_GI_FORMAT,
-                usage=rc_texture_usage,
-            )
-            scratch_texture = self.device.create_texture(
-                size=(worldspace_radiance_width, worldspace_resolution, worldspace_resolution),
-                dimension="3d",
-                format=POSTPROCESS_GI_FORMAT,
-                usage=rc_texture_usage,
-            )
-            scratch_vis_texture = self.device.create_texture(
-                size=(worldspace_resolution, worldspace_resolution, worldspace_resolution),
-                dimension="3d",
-                format=POSTPROCESS_GI_FORMAT,
-                usage=rc_texture_usage,
-            )
-            self.worldspace_rc_textures.append(rc_texture)
-            self.worldspace_rc_views.append(rc_texture.create_view(dimension="3d"))
-            self.worldspace_rc_visibility_textures.append(vis_texture)
-            self.worldspace_rc_visibility_views.append(vis_texture.create_view(dimension="3d"))
-            self.worldspace_rc_scratch_textures.append(scratch_texture)
-            self.worldspace_rc_scratch_views.append(scratch_texture.create_view(dimension="3d"))
-            self.worldspace_rc_visibility_scratch_textures.append(scratch_vis_texture)
-            self.worldspace_rc_visibility_scratch_views.append(scratch_vis_texture.create_view(dimension="3d"))
-        self._worldspace_rc_signature = None
-        self._worldspace_rc_active_signatures = [None, None, None, None]
-        self._worldspace_rc_active_mins = [(0.0, 0.0, 0.0) for _ in range(4)]
-        self._worldspace_rc_active_inv_extents = [(0.0, 0.0, 0.0) for _ in range(4)]
-        self._worldspace_rc_last_update_frame = [-1000000, -1000000, -1000000, -1000000]
-        self._worldspace_rc_update_cursor = 0
-        self.gi_cascade_textures = []
-        self.gi_cascade_views = []
-        self.gi_cascade_param_buffers = []
-        self.gi_cascade_bind_groups = []
-        for cascade_index in range(cascade_count):
-            cascade_size = (
-                max(1, target_size[0] >> cascade_index),
-                max(1, target_size[1] >> cascade_index),
-                1,
-            )
-            cascade_texture = self.device.create_texture(
-                size=cascade_size,
-                format=POSTPROCESS_GI_FORMAT,
-                usage=texture_usage,
-            )
-            self.gi_cascade_textures.append(cascade_texture)
-            self.gi_cascade_views.append(cascade_texture.create_view())
-        self.postprocess_depth_texture = self.device.create_texture(
-            size=(target_size[0], target_size[1], 1),
-            format=DEPTH_FORMAT,
-            usage=wgpu.TextureUsage.RENDER_ATTACHMENT,
-            sample_count=self.postprocess_msaa_sample_count,
-        )
-        self.postprocess_depth_view = self.postprocess_depth_texture.create_view()
-
-        self._write_final_present_params(target_size[0], target_size[1])
-
-        self._write_gi_params()
-
-        for cascade_index in range(cascade_count):
-            cascade_params = np.array([
-                float(cascade_index),
-                1.0 if cascade_index + 1 < cascade_count else 0.0,
-                float(cascade_count),
-                0.0,
-                float(RADIANCE_CASCADES_BASE_INTERVAL),
-                float(RADIANCE_CASCADES_INTERVAL_SCALE),
-                float(RADIANCE_CASCADES_STEPS_PER_CASCADE),
-                0.0,
-            ], dtype=np.float32)
-            cascade_param_buffer = self.device.create_buffer(
-                size=32,
-                usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
-            )
-            self.device.queue.write_buffer(cascade_param_buffer, 0, cascade_params.tobytes())
-            self.gi_cascade_param_buffers.append(cascade_param_buffer)
-            prev_view = self.gi_cascade_views[cascade_index + 1] if cascade_index + 1 < cascade_count else self.scene_color_view
-            self.gi_cascade_bind_groups.append(
-                self.device.create_bind_group(
-                    layout=self.gi_bind_group_layout,
-                    entries=[
-                        {"binding": 0, "resource": self.scene_color_view},
-                        {"binding": 1, "resource": self.scene_gbuffer_view},
-                        {"binding": 2, "resource": prev_view},
-                        {"binding": 3, "resource": self.postprocess_sampler},
-                        {"binding": 4, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
-                        {"binding": 5, "resource": {"buffer": self.gi_params_buffer, "offset": 0, "size": 32}},
-                        {"binding": 6, "resource": {"buffer": cascade_param_buffer, "offset": 0, "size": 32}},
-                    ],
-                )
-            )
-        self.gi_bind_group = self.gi_cascade_bind_groups[0] if self.gi_cascade_bind_groups else None
-        worldspace_rc_params = np.zeros((8, 4), dtype=np.float32)
-        self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, worldspace_rc_params.tobytes())
-        for cascade_index in range(4):
-            update_param_buffer = self.worldspace_rc_update_param_buffers[cascade_index]
-            self.worldspace_rc_trace_bind_groups.append(
-                self.device.create_bind_group(
-                    layout=self.worldspace_rc_trace_bind_group_layout,
-                    entries=[
-                        {"binding": 0, "resource": self.worldspace_rc_scratch_views[cascade_index]},
-                        {"binding": 1, "resource": self.worldspace_rc_visibility_scratch_views[cascade_index]},
-                        {"binding": 2, "resource": {"buffer": update_param_buffer, "offset": 0, "size": WORLDSPACE_RC_UPDATE_PARAMS_BYTES}},
-                        {"binding": 3, "resource": self.worldspace_rc_views[0]},
-                        {"binding": 4, "resource": self.worldspace_rc_views[1]},
-                        {"binding": 5, "resource": self.worldspace_rc_views[2]},
-                        {"binding": 6, "resource": self.worldspace_rc_views[3]},
-                        {"binding": 7, "resource": self.worldspace_rc_visibility_views[0]},
-                        {"binding": 8, "resource": self.worldspace_rc_visibility_views[1]},
-                        {"binding": 9, "resource": self.worldspace_rc_visibility_views[2]},
-                        {"binding": 10, "resource": self.worldspace_rc_visibility_views[3]},
-                        {"binding": 11, "resource": {"buffer": self.worldspace_rc_volume_params_buffer, "offset": 0, "size": 256}},
-                    ],
-                )
-            )
-            self.worldspace_rc_filter_bind_groups.append(
-                self.device.create_bind_group(
-                    layout=self.worldspace_rc_filter_bind_group_layout,
-                    entries=[
-                        {"binding": 0, "resource": self.worldspace_rc_scratch_views[cascade_index]},
-                        {"binding": 1, "resource": self.worldspace_rc_visibility_scratch_views[cascade_index]},
-                        {"binding": 2, "resource": self.worldspace_rc_views[cascade_index]},
-                        {"binding": 3, "resource": self.worldspace_rc_visibility_views[cascade_index]},
-                        {"binding": 4, "resource": {"buffer": update_param_buffer, "offset": 0, "size": WORLDSPACE_RC_UPDATE_PARAMS_BYTES}},
-                    ],
-                )
-            )
-            self.worldspace_rc_filter_pingpong_bind_groups.append(
-                self.device.create_bind_group(
-                    layout=self.worldspace_rc_filter_bind_group_layout,
-                    entries=[
-                        {"binding": 0, "resource": self.worldspace_rc_views[cascade_index]},
-                        {"binding": 1, "resource": self.worldspace_rc_visibility_views[cascade_index]},
-                        {"binding": 2, "resource": self.worldspace_rc_scratch_views[cascade_index]},
-                        {"binding": 3, "resource": self.worldspace_rc_visibility_scratch_views[cascade_index]},
-                        {"binding": 4, "resource": {"buffer": update_param_buffer, "offset": 0, "size": WORLDSPACE_RC_UPDATE_PARAMS_BYTES}},
-                    ],
-                )
-            )
-        self.gi_compose_bind_group = self.device.create_bind_group(
-            layout=self.gi_compose_bind_group_layout,
-            entries=[
-                {"binding": 0, "resource": self.scene_color_view},
-                {"binding": 1, "resource": self.scene_gbuffer_view},
-                {"binding": 2, "resource": self.worldspace_rc_views[0]},
-                {"binding": 3, "resource": self.worldspace_rc_views[1]},
-                {"binding": 4, "resource": self.worldspace_rc_views[2]},
-                {"binding": 5, "resource": self.worldspace_rc_views[3]},
-                {"binding": 6, "resource": self.worldspace_rc_visibility_views[0]},
-                {"binding": 7, "resource": self.worldspace_rc_visibility_views[1]},
-                {"binding": 8, "resource": self.worldspace_rc_visibility_views[2]},
-                {"binding": 9, "resource": self.worldspace_rc_visibility_views[3]},
-                {"binding": 10, "resource": self.postprocess_sampler},
-                {"binding": 11, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
-                {"binding": 12, "resource": {"buffer": self.gi_params_buffer, "offset": 0, "size": 32}},
-                {"binding": 13, "resource": {"buffer": self.worldspace_rc_volume_params_buffer, "offset": 0, "size": 256}},
-            ],
-        )
-        self.final_scene_bind_group = self.device.create_bind_group(
-            layout=self.final_present_bind_group_layout,
-            entries=[
-                {"binding": 0, "resource": self.scene_color_view},
-                {"binding": 1, "resource": self.postprocess_sampler},
-                {"binding": 2, "resource": {"buffer": self.final_present_params_buffer, "offset": 0, "size": 32}},
-            ],
-        )
-        self.final_gi_bind_group = self.device.create_bind_group(
-            layout=self.final_present_bind_group_layout,
-            entries=[
-                {"binding": 0, "resource": self.gi_color_view},
-                {"binding": 1, "resource": self.postprocess_sampler},
-                {"binding": 2, "resource": {"buffer": self.final_present_params_buffer, "offset": 0, "size": 32}},
-            ],
-        )
-
     @profile
     def _draw_visible_batches_to_pass(self, render_pass, visible_batches, use_gpu_visibility: bool, use_indirect: bool) -> None:
         current_vertex_buffer = None
@@ -2777,7 +2205,7 @@ class TerrainRenderer:
                 size=32,
                 usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
             )
-            self.device.queue.write_buffer(params_buffer, 0, self._make_gi_params(mode).tobytes())
+            self.device.queue.write_buffer(params_buffer, 0, postprocess_targets.make_gi_params(self, mode).tobytes())
             capture_texture = self.device.create_texture(
                 size=(width, height, 1),
                 format=POSTPROCESS_GI_FORMAT,
@@ -3273,7 +2701,7 @@ class TerrainRenderer:
 
         use_postprocess = bool(self.final_present_enabled)
         if use_postprocess:
-            self._ensure_postprocess_targets()
+            postprocess_targets.ensure_postprocess_targets(self)
             assert self.scene_color_view is not None
             assert self.scene_render_pipeline is not None
 
@@ -3396,78 +2824,6 @@ class TerrainRenderer:
     def submit_render_meshes(self, meshes):
         return self.encode_render_meshes(meshes)
 
-    def _is_device_lost_error(self, exc: Exception) -> bool:
-        text = str(exc)
-        if "Parent device is lost" in text or "device is lost" in text.lower():
-            return True
-        return exc.__class__.__name__ == "GPUValidationError" and "lost" in text.lower()
-
-    def _pending_chunk_work_count(self) -> int:
-        return (
-            len(self._pending_chunk_coords)
-            + len(self._pending_voxel_mesh_results)
-            + len(self._pending_surface_gpu_batches)
-            + int(self._pending_surface_gpu_batches_chunk_total)
-            + len(self._pending_gpu_mesh_batches)
-        )
-
-    def _view_ready_for_auto_exit(self) -> bool:
-        if self._device_lost:
-            return False
-        target_coords = self._visible_chunk_coord_set if self._visible_chunk_coord_set else set(self._visible_chunk_coords)
-        if not target_coords:
-            return False
-        if self._visible_missing_coords:
-            return False
-        if self._pending_chunk_work_count() > 0:
-            return False
-        chunk_cache = self.chunk_cache
-        visible_nonempty_chunks = 0
-        for coord in target_coords:
-            mesh = chunk_cache.get(coord)
-            if mesh is None:
-                return False
-            if int(getattr(mesh, "vertex_count", 0)) > 0:
-                visible_nonempty_chunks += 1
-        if visible_nonempty_chunks <= 0:
-            return False
-        if int(self._last_frame_draw_calls) <= 0:
-            return False
-        if int(self._last_frame_visible_vertices) <= 0:
-            return False
-        return True
-
-    def _request_auto_exit(self) -> None:
-        if self._auto_exit_requested:
-            return
-        self._auto_exit_requested = True
-        target_count = len(self._visible_chunk_coord_set) if self._visible_chunk_coord_set else len(self._visible_chunk_coords)
-        print(
-            f"Info: fixed-size render complete; loaded {target_count} target chunks. Closing window.",
-            file=sys.stderr,
-        )
-        try:
-            self.canvas.close()
-        except Exception:
-            pass
-        stop_loop = getattr(loop, "stop", None)
-        if callable(stop_loop):
-            try:
-                stop_loop()
-            except Exception:
-                pass
-        raise SystemExit(0)
-
-    def _service_auto_exit(self) -> None:
-        if not self.exit_when_view_ready or self._auto_exit_requested:
-            return
-        if self._view_ready_for_auto_exit():
-            self._auto_exit_frame_count += 1
-        else:
-            self._auto_exit_frame_count = 0
-        if self._auto_exit_frame_count >= 2:
-            self._request_auto_exit()
-
     @profile
     def draw_frame(self) -> None:
         frame_start = time.perf_counter()
@@ -3532,7 +2888,7 @@ class TerrainRenderer:
 
             hud_profile.refresh_frame_breakdown_summary(self, frame_start)
         except Exception as exc:
-            if self._is_device_lost_error(exc):
+            if auto_exit.is_device_lost_error(exc):
                 self._device_lost = True
                 print(f"Fatal: render device lost; stopping draw loop ({exc!s})", file=sys.stderr)
                 if profile_started_at is not None:
@@ -3550,6 +2906,6 @@ class TerrainRenderer:
                 hud_profile.profile_end_frame(self, profile_started_at, 0.0)
             raise
         hud_profile.profile_end_frame(self, profile_started_at, wall_frame_ms / 1000.0)
-        self._service_auto_exit()
+        auto_exit.service_auto_exit(self)
         if not self._auto_exit_requested:
             self.canvas.request_draw(self.draw_frame)

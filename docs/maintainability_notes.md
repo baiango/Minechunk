@@ -41,3 +41,13 @@ limit probing without calling private `TerrainRenderer` methods. This removes
 another small piece of renderer-as-service coupling before splitting the large
 resource systems.
 
+
+## One-pass split: collision, postprocess targets, and auto-exit
+
+This pass moves three more renderer-adjacent responsibilities out of `TerrainRenderer` without changing the draw algorithm:
+
+- `engine/collision/walk_solver.py` now owns player AABB math, block-solid collision queries, ground snapping, walking movement, and the walking camera update. The renderer keeps fly-mode movement and delegates walk-mode/camera clamping to the solver.
+- `engine/rendering/postprocess_targets.py` now owns GI parameter packing and the lifetime/rebuild logic for postprocess, GI cascade, and world-space RC textures/bind groups.
+- `engine/auto_exit.py` now owns fixed-view auto-exit readiness checks and device-lost error classification.
+
+The goal is to reduce `TerrainRenderer` from a catch-all engine service into a coordinator. The extracted modules still operate on the renderer state object for compatibility, but the logic is now isolated enough to test and later replace with explicit state objects.
