@@ -2580,6 +2580,7 @@ class TerrainRenderer:
         min_corner: tuple[float, float, float],
         full_extent: float,
         resolution: int,
+        temporal_history_weight: float,
     ) -> np.ndarray:
         max_distance = float(full_extent) * 0.5
         interval_scale = max(1.000001, float(WORLDSPACE_RC_INTERVAL_SCALE))
@@ -2618,7 +2619,7 @@ class TerrainRenderer:
                 light_dir[0],
                 light_dir[1],
                 light_dir[2],
-                0.0,
+                float(temporal_history_weight),
                 float(max_probe_push_blocks),
                 float(WORLDSPACE_RC_INVALID_PROBE_DILATE_RADIANCE_SCALE),
                 float(interval_start),
@@ -2663,7 +2664,15 @@ class TerrainRenderer:
             target_inv_extents.append(inv_extent)
 
         dirty_indices = [i for i in range(4) if target_signatures[i] != self._worldspace_rc_active_signatures[i]]
-        if not dirty_indices:
+        stable_refresh_indices: list[int] = []
+        if not dirty_indices and all(sig is not None for sig in self._worldspace_rc_active_signatures):
+            # v32 temporal accumulation only helps when the previous field uses
+            # the same world-space volume. If the camera has not crossed a snap
+            # boundary, refresh one stable cascade per frame so it can converge
+            # without blending stale history from old volume positions.
+            stable_refresh_indices = [self._worldspace_rc_update_cursor]
+
+        if not dirty_indices and not stable_refresh_indices:
             params = np.zeros((8, 4), dtype=np.float32)
             for cascade_index in range(4):
                 params[cascade_index, 0:3] = self._worldspace_rc_active_mins[cascade_index]
@@ -2671,10 +2680,12 @@ class TerrainRenderer:
             self.device.queue.write_buffer(self.worldspace_rc_volume_params_buffer, 0, params.tobytes())
             return
 
-        if any(sig is None for sig in self._worldspace_rc_active_signatures):
+        if dirty_indices and any(sig is None for sig in self._worldspace_rc_active_signatures):
             max_updates = max(1, int(WORLDSPACE_RC_INITIAL_MAX_CASCADES_PER_FRAME))
-        else:
+        elif dirty_indices:
             max_updates = max(1, int(WORLDSPACE_RC_UPDATE_MAX_CASCADES_PER_FRAME))
+        else:
+            max_updates = 1
 
         updates_done = 0
         updated_any = False
@@ -2683,9 +2694,10 @@ class TerrainRenderer:
             (resolution + 3) // 4,
             (resolution + 3) // 4,
         )
+        update_candidates = dirty_indices if dirty_indices else stable_refresh_indices
         search_order = [((self._worldspace_rc_update_cursor + offset) % 4) for offset in range(4)]
         for cascade_index in search_order:
-            if cascade_index not in dirty_indices:
+            if cascade_index not in update_candidates:
                 continue
             base_frame_stride = max(1, int(WORLDSPACE_RC_UPDATE_FRAME_INTERVAL))
             # Keep every cascade spatially current while moving. Staggering farther
@@ -2699,7 +2711,14 @@ class TerrainRenderer:
 
             min_corner = target_mins[cascade_index]
             full_extent = 1.0 / target_inv_extents[cascade_index][0]
-            update_params = self._make_worldspace_rc_update_params(cascade_index, min_corner, full_extent, resolution)
+            temporal_history_weight = 0.0 if cascade_index in dirty_indices else 1.0
+            update_params = self._make_worldspace_rc_update_params(
+                cascade_index,
+                min_corner,
+                full_extent,
+                resolution,
+                temporal_history_weight,
+            )
             self.device.queue.write_buffer(
                 self.worldspace_rc_update_param_buffers[cascade_index],
                 0,

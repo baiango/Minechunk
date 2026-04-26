@@ -2037,6 +2037,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let pushed_sky_gate = smoothstep(0.18, 0.72, origin_sky_visibility);
     let pushed_radiance_scale = mix(clamp(rc.controls.y, 0.0, 1.0), 1.0, pushed_sky_gate);
     let solid_radiance_scale = select(1.0, pushed_radiance_scale, origin_was_solid);
+    let temporal_history_weight = saturate(rc.light_dir.w);
     let hit_fraction = hit_count * inv_ray_count;
     let sky_fraction = min(1.0, sky_count * inv_ray_count);
     let valid_fraction = saturate(hit_fraction + 0.75 * sky_fraction) * solid_radiance_scale;
@@ -2052,7 +2053,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let direction_descriptor = vec4f(dominant_dir * directional_anisotropy, probe_sky_access * valid_fraction);
 
     let prev_descriptor = sample_src_world_rc_vis(cascade_index, origin, resolution_i);
-    let descriptor_has_history = prev_descriptor.w > 0.001 || length(prev_descriptor.xyz) > 0.001;
+    let descriptor_has_history = temporal_history_weight > 0.5 && (prev_descriptor.w > 0.001 || length(prev_descriptor.xyz) > 0.001);
     let descriptor_new_weight = select(1.0, clamp(RC_TEMPORAL_ALPHA * 1.20, 0.0, 1.0), descriptor_has_history && valid_fraction > 0.001);
     let temporal_descriptor = normalize_direction_descriptor(mix(prev_descriptor, direction_descriptor, descriptor_new_weight));
     let out_descriptor = vec4f(temporal_descriptor.xyz, max(direction_descriptor.w, temporal_descriptor.w));
@@ -2063,7 +2064,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
         let traced_alpha = valid_fraction * active_scale;
         let previous = sample_src_world_rc_dir(cascade_index, origin, resolution_i, store_slot);
         let previous_alpha = saturate(previous.a) * active_scale;
-        let has_history = previous_alpha > 0.001 && traced_alpha > 0.001;
+        let has_history = temporal_history_weight > 0.5 && previous_alpha > 0.001 && traced_alpha > 0.001;
         let new_weight = select(1.0, RC_TEMPORAL_ALPHA, has_history);
         let temporal_rgb = mix(previous.rgb, traced_rgb, new_weight);
         let temporal_alpha = max(traced_alpha, mix(previous_alpha, traced_alpha, new_weight));
