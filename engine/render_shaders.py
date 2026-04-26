@@ -1643,6 +1643,42 @@ fn sample_src_world_rc_dir(index: u32, world_pos: vec3f, resolution: i32, slot: 
     return accum;
 }
 
+fn sample_src_world_rc_angular(index: u32, world_pos: vec3f, resolution: i32, ray_dir: vec3f, active_count: i32) -> vec4f {
+    // Forked angular reprojection: a current-cascade miss does not map to one
+    // brittle far angular texel. Gather all active far intervals with a sharp
+    // positive dot kernel, producing a smoother directional interval merge that
+    // is closer to canonical RC radiance carry/forking behavior.
+    let count = clamp(active_count, 1, RC_DIRECTION_COUNT);
+    let dir_n = normalize(ray_dir);
+    var rgb_accum = vec3f(0.0, 0.0, 0.0);
+    var weight_accum = 0.0;
+    var alpha_accum = 0.0;
+    for (var slot: i32 = 0; slot < RC_DIRECTION_COUNT; slot = slot + 1) {
+        if (slot >= count) {
+            continue;
+        }
+        let basis = rc_direction_basis(slot, count);
+        let align = max(0.0, dot(dir_n, basis));
+        let angular_weight = pow(align, 7.0);
+        if (angular_weight <= 0.000001) {
+            continue;
+        }
+        let probe = sample_src_world_rc_dir(index, world_pos, resolution, slot);
+        let a = saturate(probe.a);
+        if (a <= 0.0001) {
+            continue;
+        }
+        let w = angular_weight * a;
+        rgb_accum = rgb_accum + probe.rgb * w;
+        weight_accum = weight_accum + w;
+        alpha_accum = alpha_accum + angular_weight * a;
+    }
+    if (weight_accum <= 0.0001) {
+        return vec4f(0.0, 0.0, 0.0, 0.0);
+    }
+    return vec4f(rgb_accum / weight_accum, saturate(alpha_accum / max(weight_accum, 0.0001)));
+}
+
 fn sample_src_world_rc_vis(index: u32, world_pos: vec3f, resolution: i32) -> vec4f {
     let min_corner = world_rc.volume_min[index].xyz;
     let inv_extent = world_rc.volume_inv_extent[index].xyz;
@@ -1891,8 +1927,8 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
             if (current_cascade + 1u < 4u) {
                 let merge_world_pos = origin + dir * (max_distance * 1.05);
                 let far_active_dir_count = rc_active_direction_count(current_cascade + 1u);
-                let merge_slot = rc_direction_slot(dir, far_active_dir_count);
-                let far_probe = sample_src_world_rc_dir(current_cascade + 1u, merge_world_pos, resolution_i, merge_slot);
+                let current_merge_slot = rc_direction_slot(dir, active_dir_count);
+                let far_probe = sample_src_world_rc_angular(current_cascade + 1u, merge_world_pos, resolution_i, dir, far_active_dir_count);
                 let far_vis = sample_src_world_rc_vis(current_cascade + 1u, merge_world_pos, resolution_i);
                 let far_conf = saturate(far_probe.a);
                 if (far_conf > 0.035) {
@@ -1900,7 +1936,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                     let merge_scale = mix(0.72, 0.40, f32(current_cascade) / 3.0);
                     let merged_radiance = far_probe.rgb * far_conf * merge_scale;
                     accum = accum + merged_radiance;
-                    dir_buckets[merge_slot] = dir_buckets[merge_slot] + merged_radiance;
+                    dir_buckets[current_merge_slot] = dir_buckets[current_merge_slot] + merged_radiance;
                     let merged_energy = max(max(merged_radiance.r, merged_radiance.g), merged_radiance.b);
                     direction_vector_accum = direction_vector_accum + normalize(dir) * merged_energy;
                     direction_energy_accum = direction_energy_accum + merged_energy;
