@@ -31,3 +31,13 @@ The F7 / world-space RC PNG capture path no longer stores PNG encoding and WGPU 
 - `write_rgba8_png()` for writing minimal PNG files without adding a Pillow dependency.
 
 This is intentionally behavior-preserving.  The renderer still owns GPU command encoding and resource lifetime, but the CPU-side image conversion can now be tested without creating a canvas, adapter, device, or renderer instance.
+
+## Patch 3: shared renderer contract utilities
+
+The renderer no longer owns generic adapter/limit/alignment helper logic.
+`engine.render_contract` now exposes `align_up`, `device_limit`, and
+`describe_adapter`, so cache/meshing code can share allocator math and WGPU
+limit probing without calling private `TerrainRenderer` methods. This removes
+another small piece of renderer-as-service coupling before splitting the large
+resource systems.
+

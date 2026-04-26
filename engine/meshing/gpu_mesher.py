@@ -1124,7 +1124,7 @@ def finalize_pending_gpu_mesh_batches(renderer, budget: int | None = None) -> in
         batch_relative_offsets: list[int] = []
         cursor_bytes = 0
         for _pending, _chunk_totals, _chunk_offsets, total_vertex_bytes in pending_infos:
-            cursor_bytes = renderer._align_up(cursor_bytes, batch_alignment)
+            cursor_bytes = render_consts.align_up(cursor_bytes, batch_alignment)
             batch_relative_offsets.append(cursor_bytes)
             cursor_bytes += int(total_vertex_bytes)
         total_ready_vertex_bytes = _mesh_output_request_bytes(renderer, cursor_bytes)

@@ -303,7 +303,7 @@ def allocate_from_mesh_output_slab_bump(
     _ensure_slab_free_range_indexes(slab)
     needed_bytes = max(1, int(request_bytes))
     current_offset = int(slab.append_offset)
-    aligned_offset = renderer._align_up(current_offset, renderer._mesh_output_binding_alignment)
+    aligned_offset = render_consts.align_up(current_offset, renderer._mesh_output_binding_alignment)
     alloc_end = aligned_offset + needed_bytes
     if alloc_end > int(slab.size_bytes):
         return None
@@ -332,7 +332,7 @@ def find_mesh_output_slab_free_range_choice(
     max_checks = min(len(size_entries), start + 8)
     for size_index in range(start, max_checks):
         range_size, range_offset = size_entries[size_index]
-        aligned_offset = renderer._align_up(int(range_offset), alignment)
+        aligned_offset = render_consts.align_up(int(range_offset), alignment)
         padding = aligned_offset - int(range_offset)
         usable_size = int(range_size) - padding
         if usable_size < needed_bytes:
@@ -348,7 +348,7 @@ def find_mesh_output_slab_free_range_choice(
 
     for size_index in range(max_checks, len(size_entries)):
         range_size, range_offset = size_entries[size_index]
-        aligned_offset = renderer._align_up(int(range_offset), alignment)
+        aligned_offset = render_consts.align_up(int(range_offset), alignment)
         padding = aligned_offset - int(range_offset)
         usable_size = int(range_size) - padding
         if usable_size < needed_bytes:
@@ -412,7 +412,7 @@ def allocate_from_mesh_output_slab(
 @profile
 def allocate_mesh_output_range(renderer, request_bytes: int) -> MeshBufferAllocation:
     needed_bytes = max(1, int(request_bytes))
-    needed_bytes = renderer._align_up(needed_bytes, renderer._mesh_output_binding_alignment)
+    needed_bytes = render_consts.align_up(needed_bytes, renderer._mesh_output_binding_alignment)
     size_class_bytes = mesh_output_request_size_class(renderer, needed_bytes)
 
     class_slabs = _mesh_output_slabs_for_size_class(renderer, size_class_bytes)

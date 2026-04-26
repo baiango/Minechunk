@@ -41,3 +41,67 @@ def __dir__() -> list[str]:
     names.update(dir(_constants))
     names.update(dir(_config))
     return sorted(names)
+
+def align_up(value: int, alignment: int) -> int:
+    """Return ``value`` rounded up to the next ``alignment`` boundary."""
+    alignment = int(alignment)
+    if alignment <= 1:
+        return int(value)
+    return ((int(value) + alignment - 1) // alignment) * alignment
+
+
+def device_limit(device, name: str, default: int) -> int:
+    """Read a WGPU device limit without binding callers to renderer internals."""
+    limits = getattr(device, "limits", None)
+    if limits is None:
+        return int(default)
+    getter = limits.get if hasattr(limits, "get") else None
+    if getter is not None:
+        value = getter(name, default)
+    else:
+        value = getattr(limits, name, default)
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def describe_adapter(adapter) -> str:
+    """Build a stable human-readable adapter/backend label."""
+    info = getattr(adapter, "info", None)
+    summary = getattr(adapter, "summary", "")
+
+    backend = ""
+    adapter_type = ""
+    description = ""
+
+    if info is not None:
+        getter = info.get if hasattr(info, "get") else None
+        if getter is not None:
+            backend = getter("backend_type", "") or getter("backend", "")
+            adapter_type = getter("adapter_type", "") or getter("device_type", "")
+            description = getter("description", "") or getter("device", "")
+        else:
+            backend = getattr(info, "backend_type", "") or getattr(info, "backend", "")
+            adapter_type = getattr(info, "adapter_type", "") or getattr(info, "device_type", "")
+            description = getattr(info, "description", "") or getattr(info, "device", "")
+
+    if isinstance(summary, str) and summary.strip():
+        if not backend and not adapter_type and not description:
+            return summary.strip()
+
+    parts = [part for part in (backend, adapter_type, description) if part]
+    if parts:
+        return " / ".join(parts)
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    return "unknown"
+
+
+def truthy_env_flag(name: str, default: str = "") -> bool:
+    """Parse common true-ish environment variable values."""
+    import os
+
+    value = os.environ.get(name, default).strip().lower()
+    return value in ("1", "true", "yes", "on")
+

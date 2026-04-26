@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LOW_LEVEL_MODULES = [
     ROOT / "engine" / "cache" / "mesh_allocator.py",
     ROOT / "engine" / "debug_capture.py",
+    ROOT / "engine" / "render_contract.py",
     ROOT / "engine" / "meshing" / "cpu_mesher.py",
     ROOT / "engine" / "meshing" / "gpu_mesher.py",
     ROOT / "engine" / "meshing" / "metal_mesher.py",

@@ -12,6 +12,7 @@ from .pipelines import chunk_pipeline as chunk_gen
 from .pipelines import profiling as hud_profile
 from .cache import mesh_allocator as mesh_cache
 from .renderer_config import *
+from . import render_contract
 from .render_shaders import (
     FINAL_BLIT_SHADER,
     GI_CASCADE_SHADER,
@@ -90,8 +91,7 @@ def _engine_mode_uses_gpu_path() -> bool:
 
 
 def _allow_metal_fallback() -> bool:
-    value = os.environ.get("MINECHUNK_ALLOW_METAL_FALLBACK", "").strip().lower()
-    return value in ("1", "true", "yes", "on")
+    return render_contract.truthy_env_flag("MINECHUNK_ALLOW_METAL_FALLBACK")
 
 
 class TerrainRenderer:
@@ -143,7 +143,7 @@ class TerrainRenderer:
             self.device = request_device()
         self.context = self.canvas.get_wgpu_context()
         self.color_format = self.context.get_preferred_format(self.adapter)
-        self.render_api_label = self._describe_render_api()
+        self.render_api_label = render_contract.describe_adapter(self.adapter)
         self.render_backend_label = "Wgpu"
         self.context.configure(
             device=self.device,
@@ -355,7 +355,7 @@ class TerrainRenderer:
         self._next_mesh_allocation_id = 1
         self._mesh_output_binding_alignment = math.lcm(
             VERTEX_STRIDE,
-            max(1, int(self._device_limit("min_storage_buffer_offset_alignment", 256))),
+            max(1, int(render_contract.device_limit(self.device, "min_storage_buffer_offset_alignment", 256))),
         )
         self._mesh_output_min_slab_bytes = max(
             MESH_OUTPUT_SLAB_MIN_BYTES,
@@ -713,7 +713,7 @@ class TerrainRenderer:
         )
         self.tile_merge_bind_group_layout = None
         self.tile_merge_pipeline = None
-        if self._device_limit("max_storage_buffers_per_shader_stage", 0) >= MERGED_TILE_MAX_CHUNKS + 2:
+        if render_contract.device_limit(self.device, "max_storage_buffers_per_shader_stage", 0) >= MERGED_TILE_MAX_CHUNKS + 2:
             self.tile_merge_bind_group_layout = self.device.create_bind_group_layout(
                 entries=[
                     {
@@ -1415,36 +1415,6 @@ class TerrainRenderer:
             samples.clear()
             self.frame_breakdown_sample_sums[name] = 0.0
 
-    def _describe_render_api(self) -> str:
-        info = getattr(self.adapter, "info", None)
-        summary = getattr(self.adapter, "summary", "")
-
-        backend = ""
-        adapter_type = ""
-        description = ""
-
-        if info is not None:
-            getter = info.get if hasattr(info, "get") else None
-            if getter is not None:
-                backend = getter("backend_type", "") or getter("backend", "")
-                adapter_type = getter("adapter_type", "") or getter("device_type", "")
-                description = getter("description", "") or getter("device", "")
-            else:
-                backend = getattr(info, "backend_type", "") or getattr(info, "backend", "")
-                adapter_type = getattr(info, "adapter_type", "") or getattr(info, "device_type", "")
-                description = getattr(info, "description", "") or getattr(info, "device", "")
-
-        if isinstance(summary, str) and summary.strip():
-            if not backend and not adapter_type and not description:
-                return summary.strip()
-
-        parts = [part for part in (backend, adapter_type, description) if part]
-        if parts:
-            return " / ".join(parts)
-        if isinstance(summary, str) and summary.strip():
-            return summary.strip()
-        return "unknown"
-
     def _log_backend_diagnostics(self) -> None:
         terrain_backend = getattr(self.world, "_backend", None)
         terrain_device = getattr(terrain_backend, "device", None)
@@ -1461,25 +1431,6 @@ class TerrainRenderer:
             f"mesh_backend={mesh_backend_label}",
             file=sys.stderr,
         )
-
-    def _device_limit(self, name: str, default: int) -> int:
-        limits = getattr(self.device, "limits", None)
-        if limits is None:
-            return int(default)
-        getter = limits.get if hasattr(limits, "get") else None
-        if getter is not None:
-            value = getter(name, default)
-        else:
-            value = getattr(limits, name, default)
-        try:
-            return int(value)
-        except Exception:
-            return int(default)
-
-    def _align_up(self, value: int, alignment: int) -> int:
-        if alignment <= 1:
-            return int(value)
-        return ((int(value) + alignment - 1) // alignment) * alignment
 
     @profile
     def regenerate_world(self) -> None:
