@@ -1654,6 +1654,7 @@ fn sample_src_world_rc_angular(index: u32, world_pos: vec3f, resolution: i32, ra
     var rgb_accum = vec3f(0.0, 0.0, 0.0);
     var weight_accum = 0.0;
     var alpha_accum = 0.0;
+    var angular_weight_accum = 0.0;
     for (var slot: i32 = 0; slot < RC_DIRECTION_COUNT; slot = slot + 1) {
         if (slot >= count) {
             continue;
@@ -1664,6 +1665,7 @@ fn sample_src_world_rc_angular(index: u32, world_pos: vec3f, resolution: i32, ra
         if (angular_weight <= 0.000001) {
             continue;
         }
+        angular_weight_accum = angular_weight_accum + angular_weight;
         let probe = sample_src_world_rc_dir(index, world_pos, resolution, slot);
         let a = saturate(probe.a);
         if (a <= 0.0001) {
@@ -1677,7 +1679,7 @@ fn sample_src_world_rc_angular(index: u32, world_pos: vec3f, resolution: i32, ra
     if (weight_accum <= 0.0001) {
         return vec4f(0.0, 0.0, 0.0, 0.0);
     }
-    return vec4f(rgb_accum / weight_accum, saturate(alpha_accum / max(weight_accum, 0.0001)));
+    return vec4f(rgb_accum / weight_accum, saturate(alpha_accum / max(angular_weight_accum, 0.0001)));
 }
 
 fn stable_tangent_a(ray_dir: vec3f) -> vec3f {
@@ -1914,8 +1916,10 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
 
     var accum = vec3f(0.0, 0.0, 0.0);
     var dir_buckets: array<vec3f, 16>;
+    var dir_opacity: array<f32, 16>;
     for (var init_slot: i32 = 0; init_slot < RC_DIRECTION_COUNT; init_slot = init_slot + 1) {
         dir_buckets[init_slot] = vec3f(0.0, 0.0, 0.0);
+        dir_opacity[init_slot] = 0.0;
     }
     var direction_vector_accum = vec3f(0.0, 0.0, 0.0);
     var direction_energy_accum = 0.0;
@@ -1971,6 +1975,8 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let hit_energy = max(max(hit_radiance.r, hit_radiance.g), hit_radiance.b) * (0.35 + 0.65 * facing);
                 let hit_slot = rc_direction_slot(dir, active_dir_count);
                 dir_buckets[hit_slot] = dir_buckets[hit_slot] + hit_radiance;
+                let hit_interval_opacity = saturate((0.35 + 0.65 * facing) * (0.35 + 0.65 * (1.0 - interval_t)));
+                dir_opacity[hit_slot] = dir_opacity[hit_slot] + hit_interval_opacity;
                 direction_vector_accum = direction_vector_accum + normalize(dir) * hit_energy;
                 direction_energy_accum = direction_energy_accum + hit_energy;
                 hit_sky_visibility_accum = hit_sky_visibility_accum + sky_visibility * (0.35 + 0.65 * facing);
@@ -1999,6 +2005,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                     let merged_radiance = far_probe.rgb * far_conf * merge_scale;
                     accum = accum + merged_radiance;
                     dir_buckets[current_merge_slot] = dir_buckets[current_merge_slot] + merged_radiance;
+                    dir_opacity[current_merge_slot] = dir_opacity[current_merge_slot] + far_conf * 0.70;
                     let merged_energy = max(max(merged_radiance.r, merged_radiance.g), merged_radiance.b);
                     direction_vector_accum = direction_vector_accum + normalize(dir) * merged_energy;
                     direction_energy_accum = direction_energy_accum + merged_energy;
@@ -2017,6 +2024,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 accum = accum + sky_radiance;
                 let sky_slot = rc_direction_slot(dir, active_dir_count);
                 dir_buckets[sky_slot] = dir_buckets[sky_slot] + sky_radiance;
+                dir_opacity[sky_slot] = dir_opacity[sky_slot] + sky_ray_weight * 0.65;
                 let sky_energy = max(max(sky_radiance.r, sky_radiance.g), sky_radiance.b);
                 direction_vector_accum = direction_vector_accum + normalize(dir) * sky_energy;
                 direction_energy_accum = direction_energy_accum + sky_energy;
@@ -2058,10 +2066,12 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let temporal_descriptor = normalize_direction_descriptor(mix(prev_descriptor, direction_descriptor, descriptor_new_weight));
     let out_descriptor = vec4f(temporal_descriptor.xyz, max(direction_descriptor.w, temporal_descriptor.w));
 
+    let expected_samples_per_direction = max(1.0, f32(max(1u, ray_count)) / f32(max(1, active_dir_count)));
     for (var store_slot: i32 = 0; store_slot < RC_DIRECTION_COUNT; store_slot = store_slot + 1) {
         let active_scale = select(0.0, 1.0, store_slot < active_dir_count);
         let traced_rgb = dir_buckets[store_slot] * inv_ray_count * solid_radiance_scale * active_scale;
-        let traced_alpha = valid_fraction * active_scale;
+        let directional_interval_opacity = saturate(dir_opacity[store_slot] / expected_samples_per_direction);
+        let traced_alpha = valid_fraction * directional_interval_opacity * active_scale;
         let previous = sample_src_world_rc_dir(cascade_index, origin, resolution_i, store_slot);
         let previous_alpha = saturate(previous.a) * active_scale;
         let has_history = temporal_history_weight > 0.5 && previous_alpha > 0.001 && traced_alpha > 0.001;
