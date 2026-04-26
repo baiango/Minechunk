@@ -1679,6 +1679,59 @@ fn sample_src_world_rc_angular(index: u32, world_pos: vec3f, resolution: i32, ra
     return vec4f(rgb_accum / weight_accum, saturate(alpha_accum / max(weight_accum, 0.0001)));
 }
 
+fn stable_tangent_a(ray_dir: vec3f) -> vec3f {
+    let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(ray_dir.y) > 0.82);
+    return normalize(cross(up, ray_dir));
+}
+
+fn sample_src_world_rc_angular_spatial(index: u32, world_pos: vec3f, resolution: i32, ray_dir: vec3f, active_count: i32, footprint_radius: f32) -> vec4f {
+    // Spatially forked interval merge: gather the next cascade over a tiny
+    // ray-stable footprint around the interval endpoint, then perform the same
+    // angular fork. This reduces one-probe far-cascade grid/block artifacts while
+    // keeping the canonical RC idea: local miss -> filtered farther interval.
+    let dir_n = normalize(ray_dir);
+    let ta = stable_tangent_a(dir_n);
+    let tb = normalize(cross(dir_n, ta));
+    let r = max(0.0, footprint_radius);
+
+    var rgb_accum = vec3f(0.0, 0.0, 0.0);
+    var alpha_accum = 0.0;
+    var weight_accum = 0.0;
+
+    for (var tap: i32 = 0; tap < 5; tap = tap + 1) {
+        var tap_offset = vec3f(0.0, 0.0, 0.0);
+        var tap_weight = 0.42;
+        if (tap == 1) {
+            tap_offset = ta * r;
+            tap_weight = 0.145;
+        } else if (tap == 2) {
+            tap_offset = -ta * r;
+            tap_weight = 0.145;
+        } else if (tap == 3) {
+            tap_offset = tb * r;
+            tap_weight = 0.145;
+        } else if (tap == 4) {
+            tap_offset = -tb * r;
+            tap_weight = 0.145;
+        }
+
+        let probe = sample_src_world_rc_angular(index, world_pos + tap_offset, resolution, dir_n, active_count);
+        let a = saturate(probe.a);
+        if (a <= 0.0001) {
+            continue;
+        }
+        let w = tap_weight * a;
+        rgb_accum = rgb_accum + probe.rgb * w;
+        alpha_accum = alpha_accum + a * tap_weight;
+        weight_accum = weight_accum + w;
+    }
+
+    if (weight_accum <= 0.0001) {
+        return vec4f(0.0, 0.0, 0.0, 0.0);
+    }
+    return vec4f(rgb_accum / weight_accum, saturate(alpha_accum / max(0.0001, 0.42 + 0.145 * 4.0)));
+}
+
 fn sample_src_world_rc_vis(index: u32, world_pos: vec3f, resolution: i32) -> vec4f {
     let min_corner = world_rc.volume_min[index].xyz;
     let inv_extent = world_rc.volume_inv_extent[index].xyz;
@@ -1935,7 +1988,8 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let merge_world_pos = origin + dir * (interval_end + step_size * 0.5);
                 let far_active_dir_count = rc_active_direction_count(current_cascade + 1u);
                 let current_merge_slot = rc_direction_slot(dir, active_dir_count);
-                let far_probe = sample_src_world_rc_angular(current_cascade + 1u, merge_world_pos, resolution_i, dir, far_active_dir_count);
+                let far_footprint_radius = max(block_size * 1.5, interval_length * mix(0.030, 0.055, f32(current_cascade) / 3.0));
+                let far_probe = sample_src_world_rc_angular_spatial(current_cascade + 1u, merge_world_pos, resolution_i, dir, far_active_dir_count, far_footprint_radius);
                 let far_vis = sample_src_world_rc_vis(current_cascade + 1u, merge_world_pos, resolution_i);
                 let far_conf = saturate(far_probe.a);
                 if (far_conf > 0.035) {
