@@ -740,7 +740,8 @@ const SKY_GROUND: vec3f = vec3f(__SKY_GROUND_R__, __SKY_GROUND_G__, __SKY_GROUND
 const SKY_SUN_GLOW: vec3f = vec3f(__SKY_SUN_R__, __SKY_SUN_G__, __SKY_SUN_B__);
 const SKY_SUN_DIR: vec3f = vec3f(__SKY_SUN_DIR_X__, __SKY_SUN_DIR_Y__, __SKY_SUN_DIR_Z__);
 const PI: f32 = 3.14159265358979323846;
-const RC_DIRECTION_COUNT: i32 = 8;
+const RC_BASIS_GOLDEN_ANGLE: f32 = 2.39996322972865332;
+const RC_DIRECTION_COUNT: i32 = 16;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
@@ -841,15 +842,25 @@ fn normalize_direction_descriptor(v: vec4f) -> vec4f {
     return vec4f(dir * saturate(len_v), saturate(v.w));
 }
 
-fn rc_direction_basis(slot: i32) -> vec3f {
-    // Eight octant angular intervals. Each probe stores RGB radiance per
-    // direction bucket in an X-atlas, moving the world-space RC field closer to
-    // real 3D directional radiance storage than the earlier 4-way tetrahedral
-    // prototype.
-    let x = select(-1.0, 1.0, (slot & 1) != 0);
-    let y = select(-1.0, 1.0, (slot & 2) != 0);
-    let z = select(-1.0, 1.0, (slot & 4) != 0);
-    return normalize(vec3f(x, y, z));
+fn rc_active_direction_count(cascade_index: u32) -> i32 {
+    // Real RC trades spatial detail for angular detail. Keep a fixed 16-slot
+    // atlas capacity, but use fewer active intervals near the camera and more
+    // in farther cascades: C0=4, C1=8, C2=12, C3=16.
+    if (cascade_index == 0u) { return 4; }
+    if (cascade_index == 1u) { return 8; }
+    if (cascade_index == 2u) { return 12; }
+    return RC_DIRECTION_COUNT;
+}
+
+fn rc_direction_basis(slot: i32, active_count: i32) -> vec3f {
+    let count = clamp(active_count, 1, RC_DIRECTION_COUNT);
+    let clamped_slot = clamp(slot, 0, count - 1);
+    let n = f32(count);
+    let i = f32(clamped_slot) + 0.5;
+    let y = 1.0 - 2.0 * i / n;
+    let r = sqrt(max(0.0, 1.0 - y * y));
+    let theta = RC_BASIS_GOLDEN_ANGLE * i;
+    return normalize(vec3f(cos(theta) * r, y, sin(theta) * r));
 }
 
 fn load_world_rc_dir(index: u32, slot: i32, coord: vec3i, resolution: i32) -> vec4f {
@@ -997,13 +1008,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
                     var probe_alpha_max = 0.0;
                     var probe_directional_sum = vec3f(0.0, 0.0, 0.0);
                     var probe_directional_weight = 0.0;
-                    for (var dir_slot: i32 = 0; dir_slot < RC_DIRECTION_COUNT; dir_slot = dir_slot + 1) {
+                    let active_dir_count = rc_active_direction_count(i);
+                    for (var dir_slot: i32 = 0; dir_slot < active_dir_count; dir_slot = dir_slot + 1) {
                         let dir_probe = load_world_rc_dir(i, dir_slot, coord, resolution);
                         let dir_alpha = saturate(dir_probe.a);
                         if (dir_alpha <= 0.0001) {
                             continue;
                         }
-                        let incoming_dir = rc_direction_basis(dir_slot);
+                        let incoming_dir = rc_direction_basis(dir_slot, active_dir_count);
                         let eon_response = eon_rough_diffuse_response(normal, view_dir, incoming_dir, terrain_roughness, albedo_luma);
                         let sky_hemi_response = sky_access * upward_surface * saturate(incoming_dir.y);
                         let receiver_response = max(eon_response, sky_hemi_response * 0.55);
@@ -1174,7 +1186,7 @@ const SKY_VISIBILITY_SIDE_WEIGHT: f32 = __SKY_VISIBILITY_SIDE_WEIGHT__;
 const SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS: i32 = __SKY_VISIBILITY_APERTURE_RADIUS_BLOCKS__;
 const SKY_VISIBILITY_APERTURE_POWER: f32 = __SKY_VISIBILITY_APERTURE_POWER__;
 const SKY_VISIBILITY_MIN_APERTURE: f32 = __SKY_VISIBILITY_MIN_APERTURE__;
-const RC_DIRECTION_COUNT: i32 = 8;
+const RC_DIRECTION_COUNT: i32 = 16;
 
 fn saturate(v: f32) -> f32 {
     return clamp(v, 0.0, 1.0);
@@ -1521,18 +1533,30 @@ fn normalize_direction_descriptor(v: vec4f) -> vec4f {
     return vec4f(dir * saturate(len_v), saturate(v.w));
 }
 
-fn rc_direction_basis(slot: i32) -> vec3f {
-    let x = select(-1.0, 1.0, (slot & 1) != 0);
-    let y = select(-1.0, 1.0, (slot & 2) != 0);
-    let z = select(-1.0, 1.0, (slot & 4) != 0);
-    return normalize(vec3f(x, y, z));
+fn rc_active_direction_count(cascade_index: u32) -> i32 {
+    if (cascade_index == 0u) { return 4; }
+    if (cascade_index == 1u) { return 8; }
+    if (cascade_index == 2u) { return 12; }
+    return RC_DIRECTION_COUNT;
 }
 
-fn rc_direction_slot(dir: vec3f) -> i32 {
+fn rc_direction_basis(slot: i32, active_count: i32) -> vec3f {
+    let count = clamp(active_count, 1, RC_DIRECTION_COUNT);
+    let clamped_slot = clamp(slot, 0, count - 1);
+    let n = f32(count);
+    let i = f32(clamped_slot) + 0.5;
+    let y = 1.0 - 2.0 * i / n;
+    let r = sqrt(max(0.0, 1.0 - y * y));
+    let theta = GOLDEN_ANGLE * i;
+    return normalize(vec3f(cos(theta) * r, y, sin(theta) * r));
+}
+
+fn rc_direction_slot(dir: vec3f, active_count: i32) -> i32 {
+    let count = clamp(active_count, 1, RC_DIRECTION_COUNT);
     var best_slot = 0;
-    var best_dot = dot(dir, rc_direction_basis(0));
-    for (var slot: i32 = 1; slot < RC_DIRECTION_COUNT; slot = slot + 1) {
-        let d = dot(dir, rc_direction_basis(slot));
+    var best_dot = dot(dir, rc_direction_basis(0, count));
+    for (var slot: i32 = 1; slot < count; slot = slot + 1) {
+        let d = dot(dir, rc_direction_basis(slot, count));
         if (d > best_dot) {
             best_dot = d;
             best_slot = slot;
@@ -1725,6 +1749,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let max_distance = max(rc.meta0.z, 0.0001);
     let block_size = max(rc.meta0.w, 0.000001);
     let cascade_index = u32(rc.meta0.y + 0.5);
+    let active_dir_count = rc_active_direction_count(cascade_index);
     let grid_den = f32(max(1u, resolution - 1u));
     let grid_pos = vec3f(f32(gid.x), f32(gid.y), f32(gid.z)) / grid_den;
     var origin = min_corner + grid_pos * full_extent;
@@ -1760,8 +1785,10 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
             }
         }
         if (!found) {
-            textureStore(dst_volume, coord, vec4f(0.0, 0.0, 0.0, 0.0));
-            textureStore(dst_visibility, coord, vec4f(0.25, 0.25, 0.25, 0.25));
+            for (var clear_slot: i32 = 0; clear_slot < RC_DIRECTION_COUNT; clear_slot = clear_slot + 1) {
+                textureStore(dst_volume, vec3i(coord.x + clear_slot * resolution_i, coord.y, coord.z), vec4f(0.0, 0.0, 0.0, 0.0));
+            }
+            textureStore(dst_visibility, coord, vec4f(0.0, 0.0, 0.0, 0.0));
             return;
         }
         let offset_blocks = vec3f(
@@ -1790,7 +1817,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let direct_sun_scale = select(1.10, 0.62, cheap_hit_shading);
 
     var accum = vec3f(0.0, 0.0, 0.0);
-    var dir_buckets: array<vec3f, 8>;
+    var dir_buckets: array<vec3f, 16>;
     for (var init_slot: i32 = 0; init_slot < RC_DIRECTION_COUNT; init_slot = init_slot + 1) {
         dir_buckets[init_slot] = vec3f(0.0, 0.0, 0.0);
     }
@@ -1845,7 +1872,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let hit_radiance = color * bounce_scale;
                 accum = accum + hit_radiance;
                 let hit_energy = max(max(hit_radiance.r, hit_radiance.g), hit_radiance.b) * (0.35 + 0.65 * facing);
-                let hit_slot = rc_direction_slot(dir);
+                let hit_slot = rc_direction_slot(dir, active_dir_count);
                 dir_buckets[hit_slot] = dir_buckets[hit_slot] + hit_radiance;
                 direction_vector_accum = direction_vector_accum + normalize(dir) * hit_energy;
                 direction_energy_accum = direction_energy_accum + hit_energy;
@@ -1863,7 +1890,8 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
             var merged_from_far = false;
             if (current_cascade + 1u < 4u) {
                 let merge_world_pos = origin + dir * (max_distance * 1.05);
-                let merge_slot = rc_direction_slot(dir);
+                let far_active_dir_count = rc_active_direction_count(current_cascade + 1u);
+                let merge_slot = rc_direction_slot(dir, far_active_dir_count);
                 let far_probe = sample_src_world_rc_dir(current_cascade + 1u, merge_world_pos, resolution_i, merge_slot);
                 let far_vis = sample_src_world_rc_vis(current_cascade + 1u, merge_world_pos, resolution_i);
                 let far_conf = saturate(far_probe.a);
@@ -1889,7 +1917,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 let sky_fill = mix(0.08, 0.13, saturate(origin_sky_visibility));
                 let sky_radiance = sky_rgb * sky_ray_weight * sky_fill;
                 accum = accum + sky_radiance;
-                let sky_slot = rc_direction_slot(dir);
+                let sky_slot = rc_direction_slot(dir, active_dir_count);
                 dir_buckets[sky_slot] = dir_buckets[sky_slot] + sky_radiance;
                 let sky_energy = max(max(sky_radiance.r, sky_radiance.g), sky_radiance.b);
                 direction_vector_accum = direction_vector_accum + normalize(dir) * sky_energy;
@@ -1926,10 +1954,11 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let direction_descriptor = vec4f(dominant_dir * directional_anisotropy, probe_sky_access * valid_fraction);
 
     for (var store_slot: i32 = 0; store_slot < RC_DIRECTION_COUNT; store_slot = store_slot + 1) {
+        let active_scale = select(0.0, 1.0, store_slot < active_dir_count);
         textureStore(
             dst_volume,
             vec3i(coord.x + store_slot * resolution_i, coord.y, coord.z),
-            vec4f(dir_buckets[store_slot] * inv_ray_count * solid_radiance_scale, valid_fraction),
+            vec4f(dir_buckets[store_slot] * inv_ray_count * solid_radiance_scale * active_scale, valid_fraction * active_scale),
         );
     }
     textureStore(dst_visibility, coord, direction_descriptor);
@@ -1946,7 +1975,14 @@ struct RcUpdateParams {
     controls: vec4f,
 }
 
-const RC_DIRECTION_COUNT: i32 = 8;
+const RC_DIRECTION_COUNT: i32 = 16;
+
+fn rc_active_direction_count(cascade_index: u32) -> i32 {
+    if (cascade_index == 0u) { return 4; }
+    if (cascade_index == 1u) { return 8; }
+    if (cascade_index == 2u) { return 12; }
+    return RC_DIRECTION_COUNT;
+}
 
 @group(0) @binding(0) var src_volume: texture_3d<f32>;
 @group(0) @binding(1) var src_visibility: texture_3d<f32>;
@@ -1974,6 +2010,7 @@ fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
     let resolution = i32(resolution_u);
     let coord = vec3i(i32(gid.x), i32(gid.y), i32(gid.z));
     let cascade_index = u32(rc.meta0.y + 0.5);
+    let active_dir_count = rc_active_direction_count(cascade_index);
     let far_filter = clamp(f32(cascade_index) * 0.45, 0.0, 1.0);
 
     let raw_visibility = textureLoad(src_visibility, coord, 0);
@@ -2030,6 +2067,10 @@ fn filter_main(@builtin(global_invocation_id) gid: vec3u) {
     // back into an isotropic probe value.
     for (var dir_slot: i32 = 0; dir_slot < RC_DIRECTION_COUNT; dir_slot = dir_slot + 1) {
         let atlas_coord = vec3i(coord.x + dir_slot * resolution, coord.y, coord.z);
+        if (dir_slot >= active_dir_count) {
+            textureStore(dst_volume, atlas_coord, vec4f(0.0, 0.0, 0.0, 0.0));
+            continue;
+        }
         let raw_volume = textureLoad(src_volume, atlas_coord, 0);
         var filtered_volume = raw_volume * center_weight;
         var volume_weight = center_weight;
