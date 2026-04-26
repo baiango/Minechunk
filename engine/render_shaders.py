@@ -1785,6 +1785,12 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let max_distance = max(rc.meta0.z, 0.0001);
     let block_size = max(rc.meta0.w, 0.000001);
     let cascade_index = u32(rc.meta0.y + 0.5);
+    // v30: real RC-style distance intervals. Each cascade traces a band:
+    // C0 [0, R0], C1 [R0, R1], C2 [R1, R2], C3 [R2, R3].
+    // The far-to-near merge then carries radiance past the end of this band.
+    let interval_start = clamp(rc.controls.z, 0.0, max_distance);
+    let interval_end = max(interval_start + block_size, max(rc.controls.w, interval_start + block_size));
+    let interval_length = max(block_size, interval_end - interval_start);
     let active_dir_count = rc_active_direction_count(cascade_index);
     let grid_den = f32(max(1u, resolution - 1u));
     let grid_pos = vec3f(f32(gid.x), f32(gid.y), f32(gid.z)) / grid_den;
@@ -1840,7 +1846,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     let ray_count = effective_ray_count(cascade_index, origin_sky_visibility);
     let base_ray_count = trace_base_directions();
     let step_count = effective_step_count(cascade_index, origin_sky_visibility);
-    let step_size = max(block_size, max_distance / f32(max(1u, step_count)));
+    let step_size = max(block_size, interval_length / f32(max(1u, step_count)));
     let sun_dir = normalize(rc.light_dir.xyz);
     let direct_sun_strength = max(rc.light0.y, 0.0);
     let indirect_floor = max(rc.light0.z, 0.0);
@@ -1871,12 +1877,12 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
             base_index = min(base_ray_count - 1u, u32((f32(ray_i) + 0.5) * f32(base_ray_count) / f32(ray_count)));
         }
         let dir = direction_for_base_index(base_index, base_ray_count);
-        var dist = step_size * 0.5;
+        var dist = interval_start + step_size * 0.5;
         var hit = false;
-        var hit_distance = max_distance;
+        var hit_distance = interval_end;
 
         loop {
-            if (dist > max_distance) {
+            if (dist > interval_end) {
                 break;
             }
             let sample_pos = origin + dir * dist;
@@ -1898,7 +1904,8 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
 
                 let sky_open = saturate(sky_visibility);
                 let cave_gate = pow(sky_open, 1.35);
-                let falloff = 1.0 - min(1.0, dist / max(max_distance, 0.0001));
+                let interval_t = saturate((dist - interval_start) / max(interval_length, 0.0001));
+                let falloff = 1.0 - interval_t;
                 let occluded_bounce = (1.0 - cave_gate) * (indirect_floor + 0.018) * (0.65 + 0.35 * facing) * (0.55 + 0.45 * falloff);
                 let ambient_sky = mix(0.055, (0.10 + 0.90 * open_hemi) * 0.30, cave_gate);
                 let direct_sun = cave_gate * sun_term * direct_sun_strength * direct_sun_scale * 0.55;
@@ -1925,7 +1932,7 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
             let current_cascade = u32(rc.meta0.y + 0.5);
             var merged_from_far = false;
             if (current_cascade + 1u < 4u) {
-                let merge_world_pos = origin + dir * (max_distance * 1.05);
+                let merge_world_pos = origin + dir * (interval_end + step_size * 0.5);
                 let far_active_dir_count = rc_active_direction_count(current_cascade + 1u);
                 let current_merge_slot = rc_direction_slot(dir, active_dir_count);
                 let far_probe = sample_src_world_rc_angular(current_cascade + 1u, merge_world_pos, resolution_i, dir, far_active_dir_count);

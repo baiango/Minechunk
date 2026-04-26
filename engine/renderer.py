@@ -2582,6 +2582,9 @@ class TerrainRenderer:
         resolution: int,
     ) -> np.ndarray:
         max_distance = float(full_extent) * 0.5
+        interval_scale = max(1.000001, float(WORLDSPACE_RC_INTERVAL_SCALE))
+        interval_start = 0.0 if int(cascade_index) <= 0 else max_distance / interval_scale
+        interval_end = max_distance
         seed = float(getattr(self.world, "seed", 0))
         world_height = float(self.world.height)
         light_dir = tuple(float(v) for v in LIGHT_DIRECTION)
@@ -2618,8 +2621,8 @@ class TerrainRenderer:
                 0.0,
                 float(max_probe_push_blocks),
                 float(WORLDSPACE_RC_INVALID_PROBE_DILATE_RADIANCE_SCALE),
-                0.0,
-                0.0,
+                float(interval_start),
+                float(interval_end),
             ],
             dtype=np.float32,
         )
