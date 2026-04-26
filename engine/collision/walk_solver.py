@@ -300,11 +300,46 @@ def update_camera_walk(renderer: Any, dt: float) -> None:
 
 
 @profile
+def update_camera_fly(renderer: Any, dt: float) -> None:
+    sprinting = renderer._key_active("shift", "shiftleft", "shiftright")
+    speed = SPRINT_FLY_SPEED if sprinting else renderer.camera.move_speed
+    renderer._current_move_speed = float(speed)
+    move = [0.0, 0.0, 0.0]
+
+    forward = flat_forward_vector(renderer.camera.yaw)
+    right = right_vector(renderer.camera.yaw)
+
+    if renderer._key_active("w", "arrowup"):
+        move[0] += forward[0]
+        move[2] += forward[2]
+    if renderer._key_active("s", "arrowdown"):
+        move[0] -= forward[0]
+        move[2] -= forward[2]
+    if renderer._key_active("d", "arrowright"):
+        move[0] += right[0]
+        move[2] += right[2]
+    if renderer._key_active("a", "arrowleft"):
+        move[0] -= right[0]
+        move[2] -= right[2]
+    if renderer._key_active("x"):
+        move[1] += 1.0
+    if renderer._key_active("z"):
+        move[1] -= 1.0
+
+    length = math.sqrt(move[0] * move[0] + move[1] * move[1] + move[2] * move[2])
+    if length > 0.0:
+        scale = speed * dt / length
+        renderer.camera.position[0] += move[0] * scale
+        renderer.camera.position[1] += move[1] * scale
+        renderer.camera.position[2] += move[2] * scale
+
+
+@profile
 def update_camera(renderer: Any, dt: float) -> None:
     if renderer.walk_mode:
         update_camera_walk(renderer, dt)
     else:
-        renderer._update_camera_fly(dt)
+        update_camera_fly(renderer, dt)
         renderer._walk_velocity[:] = [0.0, 0.0, 0.0]
         renderer._camera_on_ground = False
         renderer._jump_queued = False

@@ -63,3 +63,16 @@ This pass makes two previously-facade modules real and moves more renderer-owned
 
 The renderer still owns GPU device creation, pipeline creation, and final render submission, but the visibility and world-space RC subsystems are no longer private method islands inside the renderer class.  The new tests cover the tile-layout math and RC parameter helpers, and the import-boundary test now includes the new modules.
 - `engine/rendering/direct_draw.py` now owns direct/indirect visible-batch draw submission, including the optional native multi-draw fast path.
+
+## One-pass split 3: renderer setup and frame encoding ownership
+
+This pass targets the remaining high-risk renderer concentration: setup code and frame-command encoding.
+
+- `engine/rendering/gpu_resources.py` now owns long-lived GPU buffer creation, bind group layout creation, and render/compute pipeline creation. `TerrainRenderer.__init__` delegates to it instead of embedding hundreds of lines of WGPU setup.
+- `engine/rendering/frame_encoder.py` now owns the per-frame render command encoding path: camera uniform upload, visible batch selection, optional GPU visibility compute dispatch, scene/gbuffer pass, world-space RC composition pass, debug capture copies, and final blit.
+- `engine/input_controller.py` now owns key normalization, keyboard toggles, pointer-drag camera rotation, and canvas event binding.
+- `engine/world_reset.py` now owns the reset path for chunk caches, pending mesh jobs, deferred GPU resource cleanup, world recreation, backend fallback checks, and camera respawn.
+- `engine/profiling_runtime.py` now owns F3 profiling enable/disable state initialization.
+- `engine/collision/walk_solver.py` now also owns free-fly camera motion, so camera update behavior is fully outside the renderer.
+
+`TerrainRenderer` is now mostly an orchestration shell: device/world bootstrap, runtime state fields, resize invalidation, backend diagnostics, small camera helpers, and the draw-frame loop. The extracted modules still mutate renderer state for compatibility, but the biggest remaining monolith—the renderer class—is now small enough to audit by eye.
