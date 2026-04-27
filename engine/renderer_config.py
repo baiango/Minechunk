@@ -140,13 +140,25 @@ class Camera:
         self.pitch = clamp(self.pitch, -1.45, 1.45)
 
 
-_DEFAULT_ENGINE_MODE = ENGINE_MODE_WGPU
+_DEFAULT_ENGINE_MODE = ENGINE_MODE_CPU
+DEFAULT_GPU_CHUNK_PREP_REQUEST_BUDGET_CAP = 8
+DEFAULT_CPU_CHUNK_PREP_REQUEST_BUDGET_CAP = 2
+
+
+def default_chunk_prep_request_budget_cap_for_engine(mode: str) -> int:
+    return (
+        DEFAULT_CPU_CHUNK_PREP_REQUEST_BUDGET_CAP
+        if str(mode).strip().lower() == ENGINE_MODE_CPU
+        else DEFAULT_GPU_CHUNK_PREP_REQUEST_BUDGET_CAP
+    )
+
+
 _engine_mode_env = os.environ.get("MINECHUNK_ENGINE_MODE", "").strip().lower()
 if _engine_mode_env in (ENGINE_MODE_CPU, ENGINE_MODE_WGPU, ENGINE_MODE_METAL):
     engine_mode = _engine_mode_env
 else:
     engine_mode = _DEFAULT_ENGINE_MODE
-chunk_prep_request_budget_cap = 8 if engine_mode != ENGINE_MODE_CPU else 2
+chunk_prep_request_budget_cap = default_chunk_prep_request_budget_cap_for_engine(engine_mode)
 chunk_prep_bootstrap_displayed_ratio_threshold = 0.05
 chunk_prep_use_screen_border_raycast = False
 chunk_prep_screen_raycast_max_distance_world = DEFAULT_RENDER_DISTANCE_WORLD

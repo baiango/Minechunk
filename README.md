@@ -2,7 +2,7 @@
 
 Minechunk is an experimental voxel terrain engine written in Python. This branch is focused on making chunk streaming, terrain generation, meshing, residency, and frame cost visible enough to study instead of hiding the work behind heavy simplification.
 
-This checked-in branch is the **stacked vertical chunk + WGPU compute prototype**.
+This checked-in branch is the **stacked vertical chunk prototype**, with CPU as the safe default and WGPU/Metal selectable for GPU terrain/meshing experiments.
 
 Current defaults:
 
@@ -13,9 +13,9 @@ Current defaults:
 - vertical render radius: `16` chunk layers above and below the camera
 - caves: enabled with 3D noise
 - default movement mode: AABB walk mode with gravity and collision
-- backend mode: `ENGINE_MODE_WGPU`
+- backend mode: `ENGINE_MODE_CPU`
 
-The renderer presents through `wgpu`, and the stacked chunk stream now uses WGPU compute for the main terrain/meshing path.
+The renderer presents through `wgpu`, while the checked-in default keeps terrain generation and meshing on the CPU path unless `MINECHUNK_ENGINE_MODE` or `--engine` selects `wgpu`/`metal`.
 
 ## What This Branch Is For
 
@@ -54,9 +54,8 @@ At full radius, the current cache target is built for roughly `26,301` visible c
 ### Active by default
 
 - stacked vertical chunk coordinates: `(chunk_x, chunk_y, chunk_z)`
-- WGPU terrain surface generation
-- WGPU surface-to-local-voxel expansion
-- WGPU voxel mesh count / scan / emit
+- CPU terrain generation
+- CPU voxel meshing
 - WGPU presentation
 - AABB walk collision
 - profiling HUD
@@ -195,11 +194,31 @@ Run:
 python3 main.py
 ```
 
-Optional fixed-size stress entries:
+Graphical CLI launcher with tunable presets:
 
 ```bash
-python3 render_8x8x8_then_exit.py
-python3 render_16x16x16_then_exit.py
+python3 benchmark_launcher.py
+```
+
+The legacy benchmark wrapper scripts were removed. The launcher now builds and spawns a `main.py` command instead of importing the renderer directly. The GUI stays open after launch, remains responsive while the engine window runs, and does not kill the engine when the launcher is closed. Use `--print-command` to inspect the exact CLI command without launching the engine:
+
+```bash
+python3 benchmark_launcher.py --preset fixed_16x16x16 --print-command
+python3 benchmark_launcher.py --preset fly_forward_4096 --print-command
+```
+
+For automated profiling runs, skip the GUI with `--headless` and override individual knobs. Headless launches are non-blocking by default; add `--wait` only when a script should block until `main.py` exits and return its exit code:
+
+```bash
+python3 benchmark_launcher.py --headless --preset fixed_16x16x16 --engine wgpu --view 16x16x16 --terrain-batch-size 128 --mesh-batch-size 32 --no-rc
+python3 benchmark_launcher.py --headless --wait --preset fly_forward_4096 --target-rendered-chunks 4096 --fly-speed-mps 20 --rc
+```
+
+The same options are available directly through `main.py`:
+
+```bash
+python3 main.py --benchmark-mode fixed --fixed-view 16x16x16 --exit-when-view-ready --no-rc
+python3 main.py --benchmark-mode fly_forward --fixed-view 16x16x16 --target-rendered-chunks 4096 --rc
 ```
 
 ## Backend Notes
@@ -212,13 +231,12 @@ Available modes:
 - `ENGINE_MODE_WGPU`
 - `ENGINE_MODE_METAL`
 
-The checked-in config now uses `ENGINE_MODE_WGPU`. With stacked chunks enabled, that means:
+The checked-in config now uses `ENGINE_MODE_CPU`. With stacked chunks enabled, that means:
 
 - presentation: WGPU
-- terrain surface batches: WGPU compute
-- surface-to-voxel expansion: WGPU compute
-- voxel meshing: WGPU compute
-- collision/block queries: CPU fallback
+- terrain generation: CPU
+- voxel meshing: CPU
+- collision/block queries: CPU
 
 ## Repository Layout
 

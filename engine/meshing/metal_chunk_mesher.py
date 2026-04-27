@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import threading
 from pathlib import Path
 from typing import Callable
 
