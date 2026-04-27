@@ -47,7 +47,7 @@ def test_render_shader_module_stays_a_loader_not_a_shader_dump() -> None:
 
 
 def test_terrain_backends_load_external_shader_assets() -> None:
-    wgpu_backend = (ROOT / "engine" / "terrain" / "backends" / "wgpu_terrain_backend.py").read_text(encoding="utf-8")
+    wgpu_common = (ROOT / "engine" / "terrain" / "backends" / "wgpu_terrain_common.py").read_text(encoding="utf-8")
     metal_backend = (ROOT / "engine" / "terrain" / "backends" / "metal_terrain_backend.py").read_text(encoding="utf-8")
-    assert 'load_shader_text("terrain_surface.wgsl")' in wgpu_backend
+    assert 'load_shader_text("terrain_surface.wgsl")' in wgpu_common
     assert 'load_shader_text("terrain_surface.metal")' in metal_backend
