@@ -671,10 +671,29 @@ class TerrainRenderer:
 
     def encode_render_meshes(self, meshes):
         """Build render commands from an explicit mesh iterable instead of chunk-cache visibility."""
-        return frame_encoder.submit_render(self, meshes=meshes)
+        return self._submit_render(meshes=meshes)
 
     def submit_render_meshes(self, meshes):
         return self.encode_render_meshes(meshes)
+
+    @profile
+    def _submit_render(self, meshes=None):
+        """Encode a frame render pass.
+
+        Kept as an overridable compatibility hook for benchmark entrypoints such
+        as render_fly_forward_4096_then_exit.py, which count chunks after the
+        frame's visible batches have been encoded.
+        """
+        return frame_encoder.submit_render(self, meshes=meshes)
+
+    @profile
+    def _service_auto_exit(self) -> None:
+        """Service auto-exit logic.
+
+        Kept as an overridable compatibility hook for benchmark entrypoints that
+        provide their own completion criteria and status logging.
+        """
+        auto_exit.service_auto_exit(self)
 
     @profile
     def draw_frame(self) -> None:
@@ -690,7 +709,7 @@ class TerrainRenderer:
             world_update_ms = (time.perf_counter() - update_start) * 1000.0
 
             visibility_lookup_ms = self.pipeline.refresh_visibility()
-            encoder, color_view, render_stats = frame_encoder.submit_render(self)
+            encoder, color_view, render_stats = self._submit_render()
             visibility_lookup_ms += render_stats["visibility_lookup_ms"]
             camera_upload_ms = render_stats["camera_upload_ms"]
             swapchain_acquire_ms = render_stats["swapchain_acquire_ms"]
@@ -758,6 +777,6 @@ class TerrainRenderer:
                 hud_profile.profile_end_frame(self, profile_started_at, 0.0)
             raise
         hud_profile.profile_end_frame(self, profile_started_at, wall_frame_ms / 1000.0)
-        auto_exit.service_auto_exit(self)
+        self._service_auto_exit()
         if not self._auto_exit_requested:
             self.canvas.request_draw(self.draw_frame)
