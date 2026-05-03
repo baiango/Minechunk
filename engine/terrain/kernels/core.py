@@ -76,10 +76,15 @@ from .voxel_mesher import (
     _emit_quad_components_ao,
     _emit_voxel_face,
     _solid_at_with_boundaries,
+    build_chunk_surface_run_table_from_heightmap_clipped,
     build_chunk_vertex_array_from_voxels,
     build_chunk_vertex_array_from_voxels_with_boundaries,
+    build_chunk_surface_vertex_array_from_heightmap_clipped,
+    count_chunk_surface_vertices_from_heightmap_clipped,
     count_chunk_voxel_vertices,
     count_chunk_voxel_vertices_with_boundaries,
+    emit_chunk_surface_run_table_vertices,
+    emit_chunk_surface_vertices_from_heightmap_clipped,
 )
 
 __all__ = [name for name in globals() if not name.startswith("__")]

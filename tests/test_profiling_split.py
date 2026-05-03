@@ -36,7 +36,53 @@ def test_hud_font_and_summary_live_in_separate_files():
     assert "def get_hud_font" in hud_font_source
     assert "refresh_frame_breakdown_summary" in summary_source
     assert "RC INTERVALS" in summary_source
-    assert "MEM CPU: TRACK" in summary_source
+    assert "MEM CPU TRACK" in summary_source
+
+
+def test_frame_breakdown_hud_omits_duplicate_aggregate_stats() -> None:
+    summary_source = (ROOT / "engine" / "pipelines" / "profiling_summary.py").read_text(encoding="utf-8")
+    runtime_source = (ROOT / "engine" / "profiling_runtime.py").read_text(encoding="utf-8")
+    frame_summary = summary_source[summary_source.index("def refresh_frame_breakdown_summary") :]
+
+    for required in (
+        "CPU FRAME ISSUE:",
+        "WORLD UPDATE:",
+        "RENDER BACKEND:",
+        "TOTAL DRAW VERTICES:",
+        "DRAW CALLS:",
+    ):
+        assert required in frame_summary
+
+    for duplicate in (
+        "PROCESS MEM:",
+        "MEM MAC:",
+        "MEM CPU:",
+        "MEM GPU:",
+        "MESH ZSTD:",
+        "TILE ZSTD:",
+        "MESH COMPACT:",
+        "TERRAIN ZSTD:",
+        "ZSTD STREAM:",
+        "ZSTD TOTAL:",
+        "MESH SLABS:",
+        "MESH BIGGEST GAP:",
+    ):
+        assert duplicate not in frame_summary
+        assert duplicate not in runtime_source
+
+
+def test_profile_hud_reports_new_generated_and_rendered_chunks() -> None:
+    summary_source = (ROOT / "engine" / "pipelines" / "profiling_summary.py").read_text(encoding="utf-8")
+    renderer_source = (ROOT / "engine" / "renderer.py").read_text(encoding="utf-8")
+    chunk_pipeline_source = (ROOT / "engine" / "pipelines" / "chunk_pipeline.py").read_text(encoding="utf-8")
+
+    assert "CHUNKS NEW GENERATED" in summary_source
+    assert "_profile_chunks_generated" in summary_source
+    assert "_profile_chunks_rendered" in summary_source
+    assert "chunk_generated" in renderer_source
+    assert "chunk_rendered_added" in renderer_source
+    assert "_last_new_rendered_chunks" in renderer_source
+    assert "_last_chunk_stream_generated" in chunk_pipeline_source
 
 
 def test_process_memory_stats_reports_rss() -> None:
@@ -121,3 +167,30 @@ def test_engine_memory_breakdown_separates_cpu_and_gpu_estimates() -> None:
 def test_hud_overlay_does_not_call_removed_renderer_module_helper():
     source = (ROOT / "engine" / "pipelines" / "hud_overlay.py").read_text(encoding="utf-8")
     assert "_renderer_module()" not in source
+
+
+def test_hud_overlay_uses_dedicated_vertex_layout():
+    source = (ROOT / "engine" / "pipelines" / "hud_overlay.py").read_text(encoding="utf-8")
+    pipeline_source = (ROOT / "engine" / "rendering" / "gpu_resource_pipelines.py").read_text(encoding="utf-8")
+    render_section = pipeline_source[
+        pipeline_source.index("self.render_pipeline =") : pipeline_source.index("self.scene_render_pipeline =")
+    ]
+    scene_section = pipeline_source[
+        pipeline_source.index("self.scene_render_pipeline =") : pipeline_source.index("self.gi_pipeline =")
+    ]
+    hud_section = pipeline_source[pipeline_source.index("self.profile_hud_pipeline =") :]
+
+    from engine.pipelines.hud_overlay import HUD_VERTEX_STRIDE, _pack_hud_vertex
+
+    assert HUD_VERTEX_STRIDE == 28
+    assert len(_pack_hud_vertex((0.0, 0.0, 0.0), (1.0, 0.5, 0.25), 0.75)) == HUD_VERTEX_STRIDE
+    assert "pack_vertex" not in source
+    assert '"array_stride": VERTEX_STRIDE' in render_section
+    assert '"shader_location": 2' in render_section
+    assert '"float32x4"' not in render_section
+    assert '"array_stride": VERTEX_STRIDE' in scene_section
+    assert '"shader_location": 2' in scene_section
+    assert '"float32x4"' not in scene_section
+    assert '"array_stride": HUD_VERTEX_STRIDE' in hud_section
+    assert '"float32x4"' in hud_section
+    assert '"shader_location": 2' not in hud_section

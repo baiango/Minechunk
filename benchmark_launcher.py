@@ -17,8 +17,8 @@ MAIN_ENTRYPOINT = PROJECT_ROOT / "main.py"
 class EngineDefaults:
     engine: str = "cpu"
     rc_enabled: bool = False
-    terrain_zstd_enabled: bool = True
-    mesh_zstd_enabled: bool = True
+    terrain_zstd_enabled: bool = False
+    mesh_zstd_enabled: bool = False
     tile_merging_enabled: bool = False
     terrain_batch_size: int = 128
     mesh_batch_size: int = 128
@@ -726,8 +726,8 @@ def _build_arg_parser(default_preset: str) -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=MODE_CHOICES, default=None, help="Run mode override.")
     parser.add_argument("--engine", choices=ENGINE_CHOICES, default=None, help=f"Backend override. Omit for engine default ({ENGINE_DEFAULTS.engine}).")
     parser.add_argument("--rc", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable Radiance Cascades for this run. Use --no-rc to profile without RC. Omit for engine default.")
-    parser.add_argument("--terrain-zstd", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable zstd level-1 compression for CPU-side terrain chunk payloads.")
-    parser.add_argument("--mesh-zstd", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable experimental zstd readback compression for offscreen mesh buffers.")
+    parser.add_argument("--terrain-zstd", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable zstd level-1 compression for CPU-side terrain chunk payloads. Default is off.")
+    parser.add_argument("--mesh-zstd", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable experimental zstd readback compression for offscreen mesh buffers. Default is off.")
     parser.add_argument("--tile-merge", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable merged visible tile GPU buffers. Default is off to reduce footprint.")
     parser.add_argument("--seed", type=int, default=None, help="World seed.")
     parser.add_argument("--view", type=_parse_view_dimensions, default=None, help="View dimensions, for example 16x16x16.")

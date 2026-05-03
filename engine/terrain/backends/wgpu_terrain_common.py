@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,9 +13,10 @@ try:
 except Exception:  # pragma: no cover - optional during CPU-only fallback
     wgpu = None  # type: ignore[assignment]
 
-try:
-    profile  # type: ignore[name-defined]
-except NameError:  # pragma: no cover - only used outside kernprof
+_kernprof_profile = getattr(builtins, "profile", None)
+if callable(_kernprof_profile):
+    profile = _kernprof_profile
+else:  # pragma: no cover - only used outside kernprof
     def profile(func):
         return func
 

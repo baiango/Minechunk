@@ -27,6 +27,7 @@ class MetalTerrainBackend(MetalTerrainBufferOps, MetalTerrainBatchOps, MetalTerr
         chunk_size: int = 64,
         height_limit: int | None = None,
         chunks_per_poll: int = 128,
+        terrain_caves_enabled: bool = True,
     ) -> None:
         if Metal is None:
             raise RuntimeError(
@@ -46,6 +47,7 @@ class MetalTerrainBackend(MetalTerrainBufferOps, MetalTerrainBatchOps, MetalTerr
         self.chunk_size = int(chunk_size)
         self.height_limit = self.chunk_size if height_limit is None else int(height_limit)
         self.chunks_per_poll = max(1, int(chunks_per_poll))
+        self.terrain_caves_enabled = bool(terrain_caves_enabled)
         self.sample_size = self.chunk_size + 2
         self.cell_count = self.sample_size * self.sample_size
 

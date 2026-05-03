@@ -1,8 +1,7 @@
 
 struct VertexInput {
-    @location(0) position: vec4f,
-    @location(1) normal: vec4f,
-    @location(2) color: vec4f,
+    @location(0) position: vec3f,
+    @location(1) color: vec4f,
 }
 
 struct VertexOutput {
@@ -13,7 +12,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.position = input.position;
+    out.position = vec4f(input.position, 1.0);
     out.color = input.color;
     return out;
 }

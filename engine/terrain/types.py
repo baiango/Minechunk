@@ -27,6 +27,10 @@ class ChunkVoxelResult:
     top_boundary: np.ndarray | None = None
     bottom_boundary: np.ndarray | None = None
     is_empty: bool = False
+    is_fully_occluded: bool = False
+    surface_heights: np.ndarray | None = None
+    surface_materials: np.ndarray | None = None
+    use_surface_mesher: bool = False
 
 
 @dataclass(frozen=True)

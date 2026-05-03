@@ -15,7 +15,7 @@ def _mix_u32(value: int) -> int:
     return value
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _hash2(ix: int, iy: int, seed: int) -> float:
     h = ((ix & 0xFFFFFFFF) * 0x9E3779B9) & 0xFFFFFFFF
     h = (h ^ (((iy & 0xFFFFFFFF) * 0x85EBCA6B) & 0xFFFFFFFF)) & 0xFFFFFFFF
@@ -24,7 +24,7 @@ def _hash2(ix: int, iy: int, seed: int) -> float:
     return float(h & 0x00FFFFFF) / 16777215.0
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _hash3(ix: int, iy: int, iz: int, seed: int) -> float:
     h = ((ix & 0xFFFFFFFF) * 0x9E3779B9) & 0xFFFFFFFF
     h = (h ^ (((iy & 0xFFFFFFFF) * 0x85EBCA6B) & 0xFFFFFFFF)) & 0xFFFFFFFF
@@ -34,17 +34,17 @@ def _hash3(ix: int, iy: int, iz: int, seed: int) -> float:
     return float(h & 0x00FFFFFF) / 16777215.0
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _fade(t: float) -> float:
     return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _value_noise_2d(x: float, y: float, seed: int, frequency: float) -> float:
     x *= frequency
     y *= frequency
@@ -71,7 +71,7 @@ def _value_noise_2d(x: float, y: float, seed: int, frequency: float) -> float:
     return _lerp(nx0, nx1, v) * 2.0 - 1.0
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _value_noise_3d(x: float, y: float, z: float, seed: int, frequency: float) -> float:
     x *= frequency
     y *= frequency
@@ -111,4 +111,3 @@ def _value_noise_3d(x: float, y: float, z: float, seed: int, frequency: float) -
     y0v = _lerp(x00, x10, v)
     y1v = _lerp(x01, x11, v)
     return _lerp(y0v, y1v, w) * 2.0 - 1.0
-

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import builtins
+
 from .. import render_contract as render_consts
 
-try:
-    profile  # type: ignore[name-defined]
-except NameError:  # pragma: no cover - only used outside kernprof
+_kernprof_profile = getattr(builtins, "profile", None)
+if callable(_kernprof_profile):
+    profile = _kernprof_profile
+else:  # pragma: no cover - only used outside kernprof
     def profile(func):
         return func
 

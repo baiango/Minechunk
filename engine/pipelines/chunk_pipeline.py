@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from heapq import nsmallest
 import time
 
 import numpy as np
@@ -41,7 +42,6 @@ def _terrain_mesher(renderer):
         return metal_mesher
     return wgpu_mesher
 
-@profile
 def chunk_prep_priority(renderer, chunk_x: int, chunk_y: int, chunk_z: int, camera_chunk_x: int, camera_chunk_y: int, camera_chunk_z: int) -> tuple[float, int, int, int, int]:
     dx = int(chunk_x) - int(camera_chunk_x)
     dy = int(chunk_y) - int(camera_chunk_y)
@@ -112,21 +112,23 @@ def rebuild_chunk_request_queue(renderer, camera_chunk_x: int, camera_chunk_y: i
     backlog_target = max(1, int(_chunk_prep_backlog_target(renderer)))
     queue_target = min(
         len(missing_coords),
-        max(32, backlog_target * 4, int(renderer_module.chunk_prep_request_budget_cap) * 8),
+        max(512, backlog_target * 32, int(renderer_module.chunk_prep_request_budget_cap) * 64),
     )
 
-    ordered = sorted(
-        missing_coords,
-        key=lambda coord: chunk_prep_priority(
-            renderer,
-            int(coord[0]),
-            int(coord[1]),
-            int(coord[2]),
-            current_origin[0],
-            current_origin[1],
-            current_origin[2],
-        ),
-    )[:queue_target]
+    origin_x, origin_y, origin_z = current_origin
+
+    def priority_key(coord) -> tuple[float, int, int, int, int]:
+        dx = int(coord[0]) - origin_x
+        dy = int(coord[1]) - origin_y
+        dz = int(coord[2]) - origin_z
+        distance_sq = float(dx * dx + dz * dz + (dy * dy * 4))
+        above_bias = 1 if dy > 0 else 0
+        return (distance_sq, abs(dy), above_bias, abs(dz), abs(dx))
+
+    if queue_target < len(missing_coords):
+        ordered = nsmallest(queue_target, missing_coords, key=priority_key)
+    else:
+        ordered = sorted(missing_coords, key=priority_key)
 
     renderer._chunk_request_target_coords = set(ordered)
     renderer._chunk_request_queue = deque(ordered)
@@ -216,6 +218,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
         # backend, so WGPU->WGPU and Metal->Metal surface batches can go
         # directly into the matching GPU surface expansion + meshing path.
         ready_surface_batches = renderer.world.poll_ready_chunk_surface_gpu_batches()
+        chunk_stream_generated = 0
         chunk_stream_drained = 0
         chunk_stream_bytes = 0.0
         if ready_surface_batches:
@@ -238,6 +241,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
             )
             for surface_batch in ready_surface_batches:
                 batch_chunk_count = len(surface_batch.chunks)
+                chunk_stream_generated += batch_chunk_count
                 chunk_stream_drained += batch_chunk_count
                 chunk_stream_bytes += float(batch_chunk_count * int(surface_batch.cell_count) * 8)
             staged_meshes = meshing_stage.enqueue_surface_gpu_batches_for_meshing(renderer, ready_surface_batches)
@@ -255,9 +259,11 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
             if callable(poll_voxel_payloads)
             else renderer.world.poll_ready_chunk_voxel_batches()
         )
+        chunk_stream_generated = len(ready_results)
         chunk_stream_bytes = 0.0
         chunk_stream_drained = 0
         drain_budget = max(1, renderer.mesh_batch_size)
+        terrain_zstd_active = _terrain_zstd_enabled(renderer)
         ready_results.sort(
             key=lambda result: chunk_prep_priority(
                 renderer,
@@ -272,15 +278,18 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
         for result in ready_results:
             key = (int(result.chunk_x), int(getattr(result, "chunk_y", 0)), int(result.chunk_z))
             renderer._pending_chunk_coords.discard(key)
-            queued = _queue_voxel_result_for_meshing(renderer, result)
-            zstd_stats = compressed_chunk_voxel_results_stats((queued,))
-            if int(zstd_stats.get("entries", 0)) > 0:
-                terrain_zstd_stream_entries += int(zstd_stats["entries"])
-                terrain_zstd_stream_raw_bytes += int(zstd_stats["raw_bytes"])
-                terrain_zstd_stream_compressed_bytes += int(zstd_stats["compressed_bytes"])
-                renderer._terrain_zstd_total_entries = int(getattr(renderer, "_terrain_zstd_total_entries", 0)) + int(zstd_stats["entries"])
-                renderer._terrain_zstd_total_raw_bytes = int(getattr(renderer, "_terrain_zstd_total_raw_bytes", 0)) + int(zstd_stats["raw_bytes"])
-                renderer._terrain_zstd_total_compressed_bytes = int(getattr(renderer, "_terrain_zstd_total_compressed_bytes", 0)) + int(zstd_stats["compressed_bytes"])
+            if terrain_zstd_active:
+                queued = _queue_voxel_result_for_meshing(renderer, result)
+                zstd_stats = compressed_chunk_voxel_results_stats((queued,))
+                if int(zstd_stats.get("entries", 0)) > 0:
+                    terrain_zstd_stream_entries += int(zstd_stats["entries"])
+                    terrain_zstd_stream_raw_bytes += int(zstd_stats["raw_bytes"])
+                    terrain_zstd_stream_compressed_bytes += int(zstd_stats["compressed_bytes"])
+                    renderer._terrain_zstd_total_entries = int(getattr(renderer, "_terrain_zstd_total_entries", 0)) + int(zstd_stats["entries"])
+                    renderer._terrain_zstd_total_raw_bytes = int(getattr(renderer, "_terrain_zstd_total_raw_bytes", 0)) + int(zstd_stats["raw_bytes"])
+                    renderer._terrain_zstd_total_compressed_bytes = int(getattr(renderer, "_terrain_zstd_total_compressed_bytes", 0)) + int(zstd_stats["compressed_bytes"])
+            else:
+                renderer._pending_voxel_mesh_results.append(result)
         while renderer._pending_voxel_mesh_results and drain_budget > 0:
             batch_size = min(renderer.mesh_batch_size, len(renderer._pending_voxel_mesh_results))
             batch_size = min(batch_size, drain_budget)
@@ -291,7 +300,7 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
                 continue
             for result in pending_batch:
                 chunk_stream_bytes += float(chunk_voxel_result_stream_nbytes(result))
-            batch = _decompress_voxel_mesh_batch_for_meshing(pending_batch)
+            batch = _decompress_voxel_mesh_batch_for_meshing(pending_batch) if terrain_zstd_active else pending_batch
             meshes = meshing_stage.make_chunk_mesh_batch_from_terrain(renderer, batch)
             mesh_cache.store_chunk_meshes(renderer, meshes)
 
@@ -351,14 +360,17 @@ def prepare_chunks(renderer, dt: float) -> tuple[float, float]:
         ]
         for batch in reversed(request_batches):
             renderer.world.request_chunk_voxel_batch(batch)
+        missing_coords.difference_update(request_coords)
         for coord in request_coords:
             pending_chunk_coords.add(coord)
-            missing_coords.discard(coord)
 
     renderer._last_new_displayed_chunks = len(displayed_chunk_coords - renderer._last_displayed_chunk_coords)
     renderer._last_displayed_chunk_coords = set(displayed_chunk_coords)
     chunk_stream_ms = (time.perf_counter() - prep_start) * 1000.0
+    renderer._last_chunk_stream_generated = chunk_stream_generated
     renderer._last_chunk_stream_drained = chunk_stream_drained
+    renderer._profile_chunks_generated = int(getattr(renderer, "_profile_chunks_generated", 0)) + int(chunk_stream_generated)
+    renderer._profile_chunks_rendered = int(getattr(renderer, "_profile_chunks_rendered", 0)) + int(getattr(renderer, "_last_new_rendered_chunks", 0))
     profiling.record_frame_breakdown_sample(renderer, "chunk_stream_bytes", chunk_stream_bytes)
     profiling.record_frame_breakdown_sample(renderer, "terrain_zstd_stream_entries", terrain_zstd_stream_entries)
     profiling.record_frame_breakdown_sample(renderer, "terrain_zstd_stream_raw_bytes", terrain_zstd_stream_raw_bytes)

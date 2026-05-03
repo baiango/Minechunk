@@ -29,7 +29,15 @@ from .wgpu_terrain_voxels import WgpuTerrainVoxelMixin
 
 
 class WgpuTerrainBackend(WgpuTerrainVoxelMixin, WgpuTerrainBatchMixin):
-    def __init__(self, device, seed: int, chunk_size: int, height_limit: int, chunks_per_poll: int = 128) -> None:
+    def __init__(
+        self,
+        device,
+        seed: int,
+        chunk_size: int,
+        height_limit: int,
+        chunks_per_poll: int = 128,
+        terrain_caves_enabled: bool = True,
+    ) -> None:
         if wgpu is None:
             raise RuntimeError("wgpu is unavailable.")
         self.device = device
@@ -37,6 +45,7 @@ class WgpuTerrainBackend(WgpuTerrainVoxelMixin, WgpuTerrainBatchMixin):
         self.chunk_size = int(chunk_size)
         self.height_limit = int(height_limit)
         self.chunks_per_poll = max(1, int(chunks_per_poll))
+        self.terrain_caves_enabled = bool(terrain_caves_enabled)
         self.sample_size = self.chunk_size + 2
         self.cell_count = self.sample_size * self.sample_size
         self._pending_jobs: deque[list[tuple[int, int, int]]] = deque()

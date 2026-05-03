@@ -45,6 +45,7 @@ def fill_chunk_voxel_grid(
     chunk_size: int,
     seed: int,
     height_limit: int,
+    carve_caves: bool = True,
 ) -> None:
     sample_size = chunk_size + 2
     origin_x = chunk_x * chunk_size - 1
@@ -67,6 +68,7 @@ def fill_chunk_voxel_grid(
                 int(surface_material),
                 seed,
                 height_limit,
+                carve_caves,
             )
             if material == AIR:
                 continue
@@ -84,6 +86,7 @@ def fill_stacked_chunk_voxel_grid(
     chunk_size: int,
     seed: int,
     world_height_limit: int,
+    carve_caves: bool = True,
 ) -> None:
     sample_size = chunk_size + 2
     origin_x = chunk_x * chunk_size - 1
@@ -113,6 +116,7 @@ def fill_stacked_chunk_voxel_grid(
                 int(surface_material),
                 seed,
                 world_height_limit,
+                carve_caves,
             )
             if material == AIR:
                 continue
@@ -130,6 +134,7 @@ def fill_stacked_chunk_vertical_neighbor_planes(
     chunk_size: int,
     seed: int,
     world_height_limit: int,
+    carve_caves: bool = True,
 ) -> None:
     sample_size = chunk_size + 2
     origin_x = chunk_x * chunk_size - 1
@@ -157,6 +162,7 @@ def fill_stacked_chunk_vertical_neighbor_planes(
                 solid_surface_material,
                 seed,
                 world_height_limit,
+                carve_caves,
             ) != AIR:
                 top_plane[local_z, local_x] = 1
         if bottom_in_bounds and bottom_world_y < solid_surface_height:
@@ -168,6 +174,7 @@ def fill_stacked_chunk_vertical_neighbor_planes(
                 solid_surface_material,
                 seed,
                 world_height_limit,
+                carve_caves,
             ) != AIR:
                 bottom_plane[local_z, local_x] = 1
 
@@ -184,6 +191,7 @@ def fill_stacked_chunk_voxel_grid_with_neighbor_planes(
     chunk_size: int,
     seed: int,
     world_height_limit: int,
+    carve_caves: bool = True,
 ) -> None:
     sample_size = chunk_size + 2
     probe_heights = np.empty(sample_size * sample_size, dtype=np.uint32)
@@ -210,6 +218,7 @@ def fill_stacked_chunk_voxel_grid_with_neighbor_planes(
         chunk_size,
         seed,
         world_height_limit,
+        carve_caves,
     )
 
 
@@ -227,6 +236,7 @@ def fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface(
     chunk_size: int,
     seed: int,
     world_height_limit: int,
+    carve_caves: bool = True,
 ) -> None:
     sample_size = chunk_size + 2
     origin_x = chunk_x * chunk_size - 1
@@ -256,7 +266,7 @@ def fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface(
             block_column = blocks[:, local_z, local_x]
             material_column = materials[:, local_z, local_x]
             for world_y in range(fill_start_y, fill_end_y):
-                if _should_carve_cave(world_x, world_y, world_z, solid_surface_height, seed, world_height_limit):
+                if carve_caves and _should_carve_cave(world_x, world_y, world_z, solid_surface_height, seed, world_height_limit):
                     continue
                 local_y = world_y - origin_y
                 if world_y == 0:
@@ -271,11 +281,11 @@ def fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface(
                 material_column[local_y] = material
 
         if top_in_bounds and top_world_y < solid_surface_height:
-            if not _should_carve_cave(world_x, top_world_y, world_z, solid_surface_height, seed, world_height_limit):
+            if not carve_caves or not _should_carve_cave(world_x, top_world_y, world_z, solid_surface_height, seed, world_height_limit):
                 top_plane[local_z, local_x] = 1
 
         if bottom_in_bounds and bottom_world_y < solid_surface_height:
-            if not _should_carve_cave(world_x, bottom_world_y, world_z, solid_surface_height, seed, world_height_limit):
+            if not carve_caves or not _should_carve_cave(world_x, bottom_world_y, world_z, solid_surface_height, seed, world_height_limit):
                 bottom_plane[local_z, local_x] = 1
 
 
@@ -308,5 +318,3 @@ def expand_chunk_surface_to_voxel_grid(
                     material = surface_material
                 blocks[y, local_z, local_x] = 1
                 materials[y, local_z, local_x] = material
-
-

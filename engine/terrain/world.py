@@ -60,6 +60,7 @@ def _create_preferred_gpu_backend(
     chunks_per_poll: int,
     *,
     prefer_metal_backend: bool = False,
+    terrain_caves_enabled: bool = True,
 ):
     errors: list[str] = []
 
@@ -83,6 +84,7 @@ def _create_preferred_gpu_backend(
                         chunk_size,
                         height_limit,
                         chunks_per_poll=chunks_per_poll,
+                        terrain_caves_enabled=terrain_caves_enabled,
                     )
                 except Exception as exc:
                     errors.append(f"Metal terrain backend could not be created via {label} ({exc!s})")
@@ -107,6 +109,7 @@ def _create_preferred_gpu_backend(
                 chunk_size,
                 height_limit,
                 chunks_per_poll=chunks_per_poll,
+                terrain_caves_enabled=terrain_caves_enabled,
             )
         except Exception as exc:
             errors.append(f"wgpu terrain backend could not be created ({_format_backend_error(exc)})")
@@ -141,6 +144,7 @@ class VoxelWorld:
         terrain_batch_size: int = 1 if WORLD_HEIGHT_BLOCKS > 256 else 16,
         terrain_zstd_enabled: bool = TERRAIN_ZSTD_ENABLED,
         terrain_zstd_cache_limit: int | None = None,
+        terrain_caves_enabled: bool = True,
     ) -> None:
         self.seed = int(seed)
         self.chunk_size = int(CHUNK_SIZE)
@@ -148,6 +152,7 @@ class VoxelWorld:
         self.block_size = float(BLOCK_SIZE)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
         self.terrain_zstd_enabled = bool(terrain_zstd_enabled)
+        self.terrain_caves_enabled = bool(terrain_caves_enabled)
         self._terrain_zstd_cache_limit = int(MAX_CACHED_CHUNKS if terrain_zstd_cache_limit is None else max(0, int(terrain_zstd_cache_limit)))
         self._terrain_zstd_cache: OrderedDict[tuple[int, int, int], CompressedChunkVoxelResult] = OrderedDict()
         self._terrain_zstd_cache_raw_bytes = 0
@@ -163,6 +168,7 @@ class VoxelWorld:
             self.height,
             self.chunk_size,
             chunks_per_poll=self.terrain_batch_size,
+            terrain_caves_enabled=self.terrain_caves_enabled,
         )
         self._gpu_backend_error: BaseException | None = None
         if prefer_gpu_terrain:
@@ -174,6 +180,7 @@ class VoxelWorld:
                     self.height,
                     self.terrain_batch_size,
                     prefer_metal_backend=prefer_metal_backend,
+                    terrain_caves_enabled=self.terrain_caves_enabled,
                 )
             except Exception as exc:
                 self._gpu_backend_error = exc
@@ -191,6 +198,7 @@ class VoxelWorld:
                     self.height,
                     self.chunk_size,
                     chunks_per_poll=self.terrain_batch_size,
+                    terrain_caves_enabled=self.terrain_caves_enabled,
                 )
 
     def set_terrain_zstd_cache_limit(self, limit: int | None) -> None:
@@ -273,6 +281,8 @@ class VoxelWorld:
         if (
             require_meshing_boundaries
             and not bool(cached.is_empty)
+            and not bool(getattr(cached, "is_fully_occluded", False))
+            and not bool(getattr(cached, "use_surface_mesher", False))
             and (cached.top_boundary is None or cached.bottom_boundary is None)
         ):
             return None
@@ -342,7 +352,7 @@ class VoxelWorld:
                 return int(AIR)
             return int(STONE if int(blocks[local_y, sample_z, sample_x]) != 0 else AIR)
 
-        return int(terrain_block_material_at(x, y, z, self.seed, self.height))
+        return int(terrain_block_material_at(x, y, z, self.seed, self.height, self.terrain_caves_enabled))
 
 
     def raycast_blocks(

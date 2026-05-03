@@ -963,6 +963,9 @@ def process_deferred_mesh_output_frees(renderer) -> None:
 @profile
 def retain_chunk_mesh_storage(renderer, mesh: ChunkMesh) -> None:
     if mesh.allocation_id is None:
+        shared_empty_buffer = getattr(renderer, "_shared_empty_chunk_vertex_buffer", None)
+        if shared_empty_buffer is not None and mesh.vertex_buffer is shared_empty_buffer:
+            return
         renderer._retain_mesh_buffer(mesh.vertex_buffer)
         return
     allocation = renderer._mesh_allocations.get(mesh.allocation_id)

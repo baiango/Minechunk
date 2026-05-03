@@ -96,7 +96,7 @@ def test_low_level_modules_do_not_import_renderer_runtime():
 def test_render_contract_exports_shared_renderer_constants():
     from engine import render_contract
 
-    assert render_contract.VERTEX_STRIDE == 48
-    assert render_contract.VERTEX_COMPONENTS == 12
+    assert render_contract.VERTEX_STRIDE == 36
+    assert render_contract.VERTEX_COMPONENTS == 9
     assert render_contract.CHUNK_WORLD_SIZE == render_contract.CHUNK_SIZE * render_contract.BLOCK_SIZE
     assert render_contract.chunk_prep_request_budget_cap >= 1

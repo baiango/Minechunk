@@ -64,6 +64,10 @@ class CompressedChunkVoxelResult:
     top_boundary: _ArraySegment | None = None
     bottom_boundary: _ArraySegment | None = None
     is_empty: bool = False
+    is_fully_occluded: bool = False
+    surface_heights: _ArraySegment | None = None
+    surface_materials: _ArraySegment | None = None
+    use_surface_mesher: bool = False
 
     @property
     def raw_nbytes(self) -> int:
@@ -72,6 +76,10 @@ class CompressedChunkVoxelResult:
             total += int(self.top_boundary.raw_nbytes)
         if self.bottom_boundary is not None:
             total += int(self.bottom_boundary.raw_nbytes)
+        if self.surface_heights is not None:
+            total += int(self.surface_heights.raw_nbytes)
+        if self.surface_materials is not None:
+            total += int(self.surface_materials.raw_nbytes)
         return total
 
     @property
@@ -120,7 +128,9 @@ def compress_chunk_voxel_result(result: ChunkVoxelResult | CompressedChunkVoxelR
         assert materials_segment is not None
 
         top_segment, raw_offset = _write_array(writer, raw_offset, getattr(result, "top_boundary", None))
-        bottom_segment, _raw_offset = _write_array(writer, raw_offset, getattr(result, "bottom_boundary", None))
+        bottom_segment, raw_offset = _write_array(writer, raw_offset, getattr(result, "bottom_boundary", None))
+        surface_heights_segment, raw_offset = _write_array(writer, raw_offset, getattr(result, "surface_heights", None))
+        surface_materials_segment, _raw_offset = _write_array(writer, raw_offset, getattr(result, "surface_materials", None))
     finally:
         writer.close()
 
@@ -135,6 +145,10 @@ def compress_chunk_voxel_result(result: ChunkVoxelResult | CompressedChunkVoxelR
         top_boundary=top_segment,
         bottom_boundary=bottom_segment,
         is_empty=bool(getattr(result, "is_empty", False)),
+        is_fully_occluded=bool(getattr(result, "is_fully_occluded", False)),
+        surface_heights=surface_heights_segment,
+        surface_materials=surface_materials_segment,
+        use_surface_mesher=bool(getattr(result, "use_surface_mesher", False)),
     )
 
 
@@ -156,6 +170,10 @@ def decompress_chunk_voxel_result(
         top_boundary=None if result.top_boundary is None else _decompress_array(raw_payload, result.top_boundary, copy=copy),
         bottom_boundary=None if result.bottom_boundary is None else _decompress_array(raw_payload, result.bottom_boundary, copy=copy),
         is_empty=bool(result.is_empty),
+        is_fully_occluded=bool(result.is_fully_occluded),
+        surface_heights=None if result.surface_heights is None else _decompress_array(raw_payload, result.surface_heights, copy=copy),
+        surface_materials=None if result.surface_materials is None else _decompress_array(raw_payload, result.surface_materials, copy=copy),
+        use_surface_mesher=bool(result.use_surface_mesher),
     )
 
 
@@ -169,13 +187,31 @@ def chunk_voxel_result_raw_nbytes(result: ChunkVoxelResult | CompressedChunkVoxe
         total += int(top_boundary.nbytes)
     if bottom_boundary is not None:
         total += int(bottom_boundary.nbytes)
+    surface_heights = getattr(result, "surface_heights", None)
+    surface_materials = getattr(result, "surface_materials", None)
+    if surface_heights is not None:
+        total += int(surface_heights.nbytes)
+    if surface_materials is not None:
+        total += int(surface_materials.nbytes)
     return total
 
 
 def chunk_voxel_result_stream_nbytes(result: ChunkVoxelResult | CompressedChunkVoxelResult) -> int:
     if isinstance(result, CompressedChunkVoxelResult):
-        return int(result.blocks.raw_nbytes) + int(result.materials.raw_nbytes)
-    return int(result.blocks.nbytes) + int(result.materials.nbytes)
+        total = int(result.blocks.raw_nbytes) + int(result.materials.raw_nbytes)
+        if result.surface_heights is not None:
+            total += int(result.surface_heights.raw_nbytes)
+        if result.surface_materials is not None:
+            total += int(result.surface_materials.raw_nbytes)
+        return total
+    total = int(result.blocks.nbytes) + int(result.materials.nbytes)
+    surface_heights = getattr(result, "surface_heights", None)
+    surface_materials = getattr(result, "surface_materials", None)
+    if surface_heights is not None:
+        total += int(surface_heights.nbytes)
+    if surface_materials is not None:
+        total += int(surface_materials.nbytes)
+    return total
 
 
 def compressed_chunk_voxel_results_stats(values: Iterable[object], seen_ids: set[int] | None = None) -> dict[str, int]:

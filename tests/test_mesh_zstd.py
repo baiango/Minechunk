@@ -541,14 +541,17 @@ def test_mesh_zstd_cli_defaults_and_launcher_flags() -> None:
     from engine import renderer_config as cfg
     from main import _build_arg_parser
 
-    assert cfg.MESH_ZSTD_ENABLED is True
+    assert cfg.MESH_ZSTD_ENABLED is False
     parser = _build_arg_parser()
-    assert parser.parse_args([]).mesh_zstd is None
+    assert parser.parse_args([]).mesh_zstd is False
+    assert parser.parse_args(["--mesh-zstd"]).mesh_zstd is True
     assert parser.parse_args(["--no-mesh-zstd"]).mesh_zstd is False
 
-    enabled_command = build_entrypoint_command(LauncherConfig(name="test", mode="interactive"))
+    enabled_command = build_entrypoint_command(LauncherConfig(name="test", mode="interactive", mesh_zstd_enabled=True))
+    default_command = build_entrypoint_command(LauncherConfig(name="test", mode="interactive"))
     disabled_command = build_entrypoint_command(
         LauncherConfig(name="test", mode="interactive", mesh_zstd_enabled=False)
     )
     assert "--mesh-zstd" in enabled_command
+    assert "--no-mesh-zstd" in default_command
     assert "--no-mesh-zstd" in disabled_command

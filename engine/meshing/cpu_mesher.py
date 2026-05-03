@@ -10,7 +10,12 @@ from .. import render_contract as render_consts
 from ..cache import mesh_allocator as mesh_cache
 from ..meshing_types import ChunkMesh
 from ..terrain.types import ChunkVoxelResult
-from ..terrain.kernels import build_chunk_vertex_array_from_voxels_with_boundaries
+from ..terrain.kernels import (
+    build_chunk_surface_run_table_from_heightmap_clipped,
+    build_chunk_surface_vertex_array_from_heightmap_clipped,
+    build_chunk_vertex_array_from_voxels_with_boundaries,
+    emit_chunk_surface_run_table_vertices,
+)
 
 try:
     profile  # type: ignore[name-defined]
@@ -86,6 +91,14 @@ def make_chunk_mesh_fast(
 
 _EMPTY_VERTEX_ARRAY = np.empty((0, int(getattr(_renderer_module(), "VERTEX_COMPONENTS", 12))), dtype=np.float32)
 
+
+def _surface_mesher_payload(result: ChunkVoxelResult) -> tuple[np.ndarray, np.ndarray] | None:
+    surface_heights = getattr(result, "surface_heights", None)
+    surface_materials = getattr(result, "surface_materials", None)
+    if bool(getattr(result, "use_surface_mesher", False)) and surface_heights is not None and surface_materials is not None:
+        return surface_heights, surface_materials
+    return None
+
 @profile
 def _empty_vertical_neighbor_planes(voxel_grid) -> tuple[np.ndarray, np.ndarray]:
     sample_size = int(voxel_grid.shape[1]) if getattr(voxel_grid, "ndim", 0) >= 2 else int(_renderer_module().CHUNK_SIZE) + 2
@@ -131,10 +144,159 @@ def build_chunk_vertex_array(
         chunk_max_height = int(chunk_y * renderer_module.CHUNK_SIZE + np.max(voxel_grid))
     return used_vertex_array, used_vertex_count, chunk_max_height
 
+
+@profile
+def build_chunk_vertex_array_from_terrain_result(
+    renderer,
+    result: ChunkVoxelResult,
+    chunk_x: int,
+    chunk_y: int,
+    chunk_z: int,
+) -> tuple[np.ndarray, int, int]:
+    renderer_module = _renderer_module()
+    chunk_max_height = int(chunk_y * renderer_module.CHUNK_SIZE + result.blocks.shape[0])
+    surface_heights = getattr(result, "surface_heights", None)
+    surface_materials = getattr(result, "surface_materials", None)
+    if bool(getattr(result, "use_surface_mesher", False)) and surface_heights is not None and surface_materials is not None:
+        vertex_array, vertex_count = build_chunk_surface_vertex_array_from_heightmap_clipped(
+            surface_heights,
+            surface_materials,
+            chunk_x,
+            chunk_z,
+            renderer_module.CHUNK_SIZE,
+            int(result.blocks.shape[0]),
+            float(renderer_module.BLOCK_SIZE),
+            int(chunk_y),
+        )
+        used_vertex_count = int(vertex_count)
+        return vertex_array[:used_vertex_count], used_vertex_count, chunk_max_height
+    return build_chunk_vertex_array(
+        renderer,
+        result.blocks,
+        result.materials,
+        chunk_x,
+        chunk_y,
+        chunk_z,
+        getattr(result, "top_boundary", None),
+        getattr(result, "bottom_boundary", None),
+    )
+
+
+@profile
+def _cpu_make_surface_chunk_mesh_batch(renderer, terrain_results: list[ChunkVoxelResult]) -> list[ChunkMesh] | None:
+    renderer_module = _renderer_module()
+    vertex_stride = int(renderer_module.VERTEX_STRIDE)
+    vertex_components = int(renderer_module.VERTEX_COMPONENTS)
+    chunk_size = int(renderer_module.CHUNK_SIZE)
+    block_size = float(renderer_module.BLOCK_SIZE)
+    created_at = time.perf_counter()
+    chunk_entries: list[tuple[int, int, int, np.ndarray | None, int, int, int, int]] = []
+    total_vertex_count = 0
+
+    for result in terrain_results:
+        chunk_x = int(result.chunk_x)
+        chunk_y = int(getattr(result, "chunk_y", 0))
+        chunk_z = int(result.chunk_z)
+        height_limit = int(result.blocks.shape[0])
+        chunk_max_height = int(chunk_y * chunk_size + height_limit)
+        if bool(getattr(result, "is_empty", False)) or bool(getattr(result, "is_fully_occluded", False)):
+            chunk_entries.append((chunk_x, chunk_y, chunk_z, None, 0, height_limit, chunk_max_height, 0))
+            continue
+
+        surface_payload = _surface_mesher_payload(result)
+        if surface_payload is None:
+            return None
+
+        surface_heights, surface_materials = surface_payload
+        run_table, run_count, vertex_count = build_chunk_surface_run_table_from_heightmap_clipped(
+            surface_heights,
+            surface_materials,
+            chunk_size,
+            height_limit,
+            chunk_y,
+        )
+        chunk_entries.append((chunk_x, chunk_y, chunk_z, run_table, int(run_count), height_limit, chunk_max_height, int(vertex_count)))
+        total_vertex_count += vertex_count
+
+    empty_buffer = _shared_empty_chunk_vertex_buffer(renderer)
+    if total_vertex_count <= 0:
+        return [
+            make_chunk_mesh_fast(
+                renderer,
+                chunk_x=chunk_x,
+                chunk_y=chunk_y,
+                chunk_z=chunk_z,
+                vertex_count=0,
+                vertex_buffer=empty_buffer,
+                vertex_offset=0,
+                max_height=chunk_max_height,
+                created_at=created_at,
+                allocation_id=None,
+            )
+            for chunk_x, chunk_y, chunk_z, _run_table, _run_count, _height_limit, chunk_max_height, _vertex_count in chunk_entries
+        ]
+
+    total_vertex_bytes = total_vertex_count * vertex_stride
+    batch_allocation = mesh_cache.allocate_mesh_output_range(renderer, total_vertex_bytes)
+    batch_buffer = batch_allocation.buffer
+    batch_base_offset = int(batch_allocation.offset_bytes)
+    upload_vertices = np.empty((total_vertex_count, vertex_components), dtype=np.float32)
+
+    meshes: list[ChunkMesh] = []
+    cursor_vertices = 0
+    for chunk_x, chunk_y, chunk_z, run_table, run_count, height_limit, chunk_max_height, vertex_count in chunk_entries:
+        if vertex_count > 0:
+            if run_table is None:
+                raise RuntimeError("Surface chunk has vertices but no surface run table.")
+            emitted_count = int(
+                emit_chunk_surface_run_table_vertices(
+                    upload_vertices,
+                    cursor_vertices,
+                    run_table,
+                    run_count,
+                    chunk_x,
+                    chunk_z,
+                    chunk_size,
+                    block_size,
+                )
+            )
+            if emitted_count != vertex_count:
+                raise RuntimeError(f"Surface mesher emitted {emitted_count} vertices, expected {vertex_count}.")
+            vertex_buffer = batch_buffer
+            vertex_offset = batch_base_offset + cursor_vertices * vertex_stride
+            allocation_id = batch_allocation.allocation_id
+            cursor_vertices += vertex_count
+        else:
+            vertex_buffer = empty_buffer
+            vertex_offset = 0
+            allocation_id = None
+        meshes.append(
+            make_chunk_mesh_fast(
+                renderer,
+                chunk_x=chunk_x,
+                chunk_y=chunk_y,
+                chunk_z=chunk_z,
+                vertex_count=vertex_count,
+                vertex_buffer=vertex_buffer,
+                vertex_offset=vertex_offset,
+                max_height=chunk_max_height,
+                created_at=created_at,
+                allocation_id=allocation_id,
+            )
+        )
+
+    renderer.device.queue.write_buffer(batch_buffer, batch_base_offset, memoryview(upload_vertices.view(np.uint8).reshape(-1)))
+    return meshes
+
+
 @profile
 def _cpu_make_chunk_mesh_batch(renderer, terrain_results: list[ChunkVoxelResult]) -> list[ChunkMesh]:
     if not terrain_results:
         return []
+
+    surface_meshes = _cpu_make_surface_chunk_mesh_batch(renderer, terrain_results)
+    if surface_meshes is not None:
+        return surface_meshes
 
     if len(terrain_results) == 1:
         result = terrain_results[0]
@@ -143,7 +305,7 @@ def _cpu_make_chunk_mesh_batch(renderer, terrain_results: list[ChunkVoxelResult]
         chunk_z = int(result.chunk_z)
         chunk_max_height = int(chunk_y * _renderer_module().CHUNK_SIZE + result.blocks.shape[0])
         created_at = time.perf_counter()
-        if bool(getattr(result, "is_empty", False)):
+        if bool(getattr(result, "is_empty", False)) or bool(getattr(result, "is_fully_occluded", False)):
             return [
                 make_chunk_mesh_fast(
                     renderer,
@@ -158,16 +320,13 @@ def _cpu_make_chunk_mesh_batch(renderer, terrain_results: list[ChunkVoxelResult]
                     allocation_id=None,
                 )
             ]
-        vertex_array, vertex_count, chunk_max_height = build_chunk_vertex_array(
+        vertex_array, vertex_count, chunk_max_height = build_chunk_vertex_array_from_terrain_result(
             renderer,
-            result.blocks,
-            result.materials,
+            result,
             chunk_x,
             chunk_y,
             chunk_z,
-            getattr(result, "top_boundary", None),
-            getattr(result, "bottom_boundary", None),
-                    )
+        )
         if int(vertex_count) <= 0:
             return [
                 make_chunk_mesh_fast(
@@ -211,23 +370,18 @@ def _cpu_make_chunk_mesh_batch(renderer, terrain_results: list[ChunkVoxelResult]
         chunk_x = int(result.chunk_x)
         chunk_y = int(getattr(result, "chunk_y", 0))
         chunk_z = int(result.chunk_z)
-        top_plane = getattr(result, "top_boundary", None)
-        bottom_plane = getattr(result, "bottom_boundary", None)
-        if bool(getattr(result, "is_empty", False)):
+        if bool(getattr(result, "is_empty", False)) or bool(getattr(result, "is_fully_occluded", False)):
             vertex_array = _EMPTY_VERTEX_ARRAY
             vertex_count = 0
             chunk_max_height = int(chunk_y * _renderer_module().CHUNK_SIZE + result.blocks.shape[0])
         else:
-            vertex_array, vertex_count, chunk_max_height = build_chunk_vertex_array(
+            vertex_array, vertex_count, chunk_max_height = build_chunk_vertex_array_from_terrain_result(
                 renderer,
-                result.blocks,
-                result.materials,
+                result,
                 chunk_x,
                 chunk_y,
                 chunk_z,
-                top_plane,
-                bottom_plane,
-                            )
+            )
         vertex_bytes = int(vertex_count) * int(_renderer_module().VERTEX_STRIDE)
         built_chunks.append(
             (
@@ -267,10 +421,18 @@ def _cpu_make_chunk_mesh_batch(renderer, terrain_results: list[ChunkVoxelResult]
     batch_base_offset = batch_allocation.offset_bytes
 
     upload_bytes = np.empty(total_vertex_bytes, dtype=np.uint8) if total_vertex_bytes > 0 else None
+    empty_buffer = _shared_empty_chunk_vertex_buffer(renderer)
     meshes: list[ChunkMesh] = []
     cursor_bytes = 0
     for chunk_x, chunk_y, chunk_z, vertex_array, vertex_count, vertex_bytes, chunk_max_height in built_chunks:
-        vertex_offset = batch_base_offset + cursor_bytes
+        if vertex_bytes > 0:
+            vertex_buffer = batch_buffer
+            vertex_offset = batch_base_offset + cursor_bytes
+            allocation_id = batch_allocation.allocation_id
+        else:
+            vertex_buffer = empty_buffer
+            vertex_offset = 0
+            allocation_id = None
         if vertex_bytes > 0 and upload_bytes is not None:
             upload_bytes[cursor_bytes : cursor_bytes + vertex_bytes] = vertex_array.view(np.uint8).reshape(-1)
         meshes.append(
@@ -280,11 +442,11 @@ def _cpu_make_chunk_mesh_batch(renderer, terrain_results: list[ChunkVoxelResult]
                 chunk_y=chunk_y,
                 chunk_z=chunk_z,
                 vertex_count=vertex_count,
-                vertex_buffer=batch_buffer,
+                vertex_buffer=vertex_buffer,
                 vertex_offset=vertex_offset,
                 max_height=chunk_max_height,
                 created_at=created_at,
-                allocation_id=batch_allocation.allocation_id,
+                allocation_id=allocation_id,
             )
         )
         cursor_bytes += vertex_bytes

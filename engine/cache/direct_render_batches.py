@@ -72,7 +72,9 @@ def _append_direct_render_batch_grouped(
         render_batch_groups[key] = _create_direct_render_batch_group_entry(vertex_buffer, binding_offset, vertex_count, first_vertex)
         return
     batches = entry[2]
-    assert isinstance(batches, list)
+    if not isinstance(batches, list):
+        batches = list(batches)
+        entry[2] = batches
     if batches:
         last_vertex_buffer, last_binding_offset, last_vertex_count, last_first_vertex = batches[-1]
         if (
@@ -149,10 +151,12 @@ def _extend_grouped_render_batch_groups(
             continue
         entry = render_batch_groups.get(key)
         if entry is None:
-            render_batch_groups[key] = [vertex_buffer, int(binding_offset), list(batches_to_add), int(batches_to_add[-1][3]), False]
+            render_batch_groups[key] = [vertex_buffer, int(binding_offset), batches_to_add, int(batches_to_add[-1][3]), False]
             continue
         batches = entry[2]
-        assert isinstance(batches, list)
+        if not isinstance(batches, list):
+            batches = list(batches)
+            entry[2] = batches
         first_new = batches_to_add[0]
         last_existing = batches[-1] if batches else None
         if last_existing is not None:
@@ -190,7 +194,6 @@ def _finalize_direct_render_batch_groups(
     if len(render_batch_groups) == 1:
         only_entry = next(iter(render_batch_groups.values()))
         only_batches = only_entry[2]
-        assert isinstance(only_batches, list)
         if len(only_batches) <= 1:
             return list(only_batches)
         if not bool(only_entry[4]):
@@ -201,7 +204,6 @@ def _finalize_direct_render_batch_groups(
     normalized_append = normalized.append
     for entry in render_batch_groups.values():
         batches = entry[2]
-        assert isinstance(batches, list)
         batch_count = len(batches)
         if batch_count <= 0:
             continue
@@ -212,7 +214,10 @@ def _finalize_direct_render_batch_groups(
             normalized_extend(batches)
             continue
 
-        batches.sort(key=lambda item: item[3])
+        if isinstance(batches, list):
+            batches.sort(key=lambda item: item[3])
+        else:
+            batches = sorted(batches, key=lambda item: item[3])
         last_vertex_buffer, last_binding_offset, last_vertex_count, last_first_vertex = batches[0]
         last_binding_offset = int(last_binding_offset)
         last_vertex_count = int(last_vertex_count)
@@ -243,21 +248,51 @@ def _normalize_direct_render_batches(
     if len(render_batches) <= 1:
         return render_batches
 
-    grouped: OrderedDict[tuple[int, int], list[tuple[wgpu.GPUBuffer, int, int, int]]] = OrderedDict()
+    grouped: OrderedDict[tuple[int, int], list[object]] = OrderedDict()
     for vertex_buffer, binding_offset, vertex_count, first_vertex in render_batches:
-        key = (id(vertex_buffer), int(binding_offset))
-        group = grouped.get(key)
-        if group is None:
-            group = []
-            grouped[key] = group
-        group.append((vertex_buffer, int(binding_offset), int(vertex_count), int(first_vertex)))
+        vertex_count = int(vertex_count)
+        if vertex_count <= 0:
+            continue
+        binding_offset = int(binding_offset)
+        first_vertex = int(first_vertex)
+        key = (id(vertex_buffer), binding_offset)
+        entry = grouped.get(key)
+        batch = (vertex_buffer, binding_offset, vertex_count, first_vertex)
+        if entry is None:
+            grouped[key] = [vertex_buffer, binding_offset, [batch], first_vertex, False]
+            continue
+        if first_vertex < int(entry[3]):
+            entry[4] = True
+        entry[3] = first_vertex
+        entry[2].append(batch)
 
     normalized: list[tuple[wgpu.GPUBuffer, int, int, int]] = []
-    for batches in grouped.values():
-        if len(batches) > 1:
+    normalized_append = normalized.append
+    for entry in grouped.values():
+        batches = entry[2]
+        batch_count = len(batches)
+        if batch_count <= 0:
+            continue
+        if batch_count == 1:
+            normalized_append(batches[0])
+            continue
+        if bool(entry[4]):
             batches.sort(key=lambda item: item[3])
-        for vertex_buffer, binding_offset, vertex_count, first_vertex in batches:
-            _append_direct_render_batch(normalized, vertex_buffer, binding_offset, vertex_count, first_vertex)
+        last_vertex_buffer, last_binding_offset, last_vertex_count, last_first_vertex = batches[0]
+        for vertex_buffer, binding_offset, vertex_count, first_vertex in batches[1:]:
+            if (
+                last_vertex_buffer is vertex_buffer
+                and int(last_binding_offset) == int(binding_offset)
+                and int(last_first_vertex) + int(last_vertex_count) == int(first_vertex)
+            ):
+                last_vertex_count = int(last_vertex_count) + int(vertex_count)
+                continue
+            normalized_append((last_vertex_buffer, int(last_binding_offset), int(last_vertex_count), int(last_first_vertex)))
+            last_vertex_buffer = vertex_buffer
+            last_binding_offset = binding_offset
+            last_vertex_count = vertex_count
+            last_first_vertex = first_vertex
+        normalized_append((last_vertex_buffer, int(last_binding_offset), int(last_vertex_count), int(last_first_vertex)))
     return normalized
 
 

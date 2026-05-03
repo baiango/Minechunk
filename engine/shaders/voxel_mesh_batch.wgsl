@@ -4,12 +4,6 @@ struct BatchParams {
     world_scale_and_pad: vec4f,
 }
 
-struct Vertex {
-    position: vec4f,
-    normal: vec4f,
-    color: vec4f,
-}
-
 struct BlockBuffer {
     values: array<u32>,
 }
@@ -31,7 +25,7 @@ struct AtomicCountBuffer {
 }
 
 struct VertexBuffer {
-    values: array<Vertex>,
+    values: array<f32>,
 }
 
 @group(0) @binding(0) var<storage, read> blocks: BlockBuffer;
@@ -85,7 +79,16 @@ fn face_color(material: u32, height: u32, _shade: f32) -> vec3f {
 }
 
 fn emit_vertex(position: vec3f, normal: vec3f, color: vec3f, slot: u32) {
-    vertices.values[slot] = Vertex(vec4f(position, 1.0), vec4f(normal, 0.0), vec4f(color, 1.0));
+    let base = slot * 9u;
+    vertices.values[base + 0u] = position.x;
+    vertices.values[base + 1u] = position.y;
+    vertices.values[base + 2u] = position.z;
+    vertices.values[base + 3u] = normal.x;
+    vertices.values[base + 4u] = normal.y;
+    vertices.values[base + 5u] = normal.z;
+    vertices.values[base + 6u] = color.x;
+    vertices.values[base + 7u] = color.y;
+    vertices.values[base + 8u] = color.z;
 }
 
 fn emit_triangle_at(base: u32, a: vec3f, b: vec3f, c: vec3f, normal: vec3f, color_a: vec3f, color_b: vec3f, color_c: vec3f) {

@@ -16,7 +16,7 @@ _MATERIAL_COLOR_B = (0.0, 0.20, 0.38, 0.18, 0.24, 0.49, 0.98)
 
 MAX_FACES_PER_CELL = 5
 VERTICES_PER_FACE = 6
-VERTEX_COMPONENTS = 12
+VERTEX_COMPONENTS = 9
 
 @njit(cache=True, fastmath=True)
 def _terrain_color(height: int) -> tuple[float, float, float]:
@@ -50,4 +50,3 @@ def _voxel_material_color(material: int, height: int) -> tuple[float, float, flo
     if material == SNOW:
         return 0.95, 0.97, 0.98
     return _terrain_color(height)
-

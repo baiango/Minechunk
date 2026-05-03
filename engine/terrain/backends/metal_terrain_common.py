@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Shared Metal terrain backend types and optional imports."""
 
+import builtins
 from dataclasses import dataclass
 
 import numpy as np
@@ -17,9 +18,10 @@ except Exception as exc:  # pragma: no cover
 else:
     _METAL_IMPORT_ERROR = None
 
-try:
-    profile  # type: ignore[name-defined]
-except NameError:  # pragma: no cover
+_kernprof_profile = getattr(builtins, "profile", None)
+if callable(_kernprof_profile):
+    profile = _kernprof_profile
+else:  # pragma: no cover
     def profile(func):
         return func
 

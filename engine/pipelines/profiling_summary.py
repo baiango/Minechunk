@@ -600,6 +600,8 @@ def refresh_profile_summary(renderer, now: float) -> None:
     avg_cpu_ms = renderer.profile_window_cpu_ms / max(1, renderer.profile_window_frames)
     avg_fps = profile_average_fps(renderer)
     frame_p50_ms, frame_p95_ms, frame_p99_ms = profile_frame_time_percentiles(renderer)
+    generated_chunks = int(getattr(renderer, "_profile_chunks_generated", 0))
+    rendered_chunks = int(getattr(renderer, "_profile_chunks_rendered", 0))
 
     slab_stats = mesh_cache.mesh_output_allocator_stats(renderer)
     slab_count, slab_total_bytes, slab_used_bytes, slab_free_bytes, slab_largest_free_bytes, slab_alloc_count = slab_stats
@@ -639,6 +641,7 @@ def refresh_profile_summary(renderer, now: float) -> None:
     lines = [
         f"AVG FPS {avg_fps:5.1f}  CPU {avg_cpu_ms:5.1f}MS",
         f"FRAME P50 {frame_p50_ms:5.1f}MS  P95 {frame_p95_ms:5.1f}MS  P99 {frame_p99_ms:5.1f}MS",
+        f"CHUNKS NEW GENERATED {generated_chunks:4d}  RENDERED {rendered_chunks:4d}",
         f"RENDER API  {renderer.render_api_label}",
         f"RENDER BACKEND {renderer.render_backend_label}",
         f"ENGINE MODE {renderer.engine_mode_label}",
@@ -665,6 +668,8 @@ def refresh_profile_summary(renderer, now: float) -> None:
     renderer.profile_window_cpu_ms = 0.0
     renderer.profile_window_frames = 0
     renderer.profile_window_frame_times = []
+    renderer._profile_chunks_generated = 0
+    renderer._profile_chunks_rendered = 0
 
 
 def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
@@ -703,41 +708,6 @@ def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
     visible_chunk_targets = int(round(frame_breakdown_average(renderer, "visible_chunk_targets")))
     visible_chunks = int(round(frame_breakdown_average(renderer, "visible_chunks")))
     visible_but_not_ready = max(0, visible_chunk_targets - visible_chunks)
-    process_memory = process_memory_stats()
-    terrain_zstd = terrain_zstd_runtime_stats(renderer)
-    mesh_zstd_stats = mesh_zstd.mesh_zstd_runtime_stats(renderer)
-    tile_zstd_stats = tile_zstd.tile_zstd_runtime_stats(renderer)
-    mesh_compaction_stats = mesh_cache.mesh_output_compaction_stats(renderer)
-    pressure_stats = memory_pressure_stats(renderer)
-    terrain_zstd_stream_ratio = (
-        float(terrain_zstd["stream_raw_bytes"]) / max(1.0, float(terrain_zstd["stream_compressed_bytes"]))
-        if float(terrain_zstd["stream_compressed_bytes"]) > 0.0
-        else 0.0
-    )
-    terrain_zstd_total_ratio = (
-        float(terrain_zstd["total_raw_bytes"]) / max(1.0, float(terrain_zstd["total_compressed_bytes"]))
-        if int(terrain_zstd["total_compressed_bytes"]) > 0
-        else 0.0
-    )
-    terrain_zstd_status = "BYPASS" if terrain_zstd["bypassed"] else ("ON" if terrain_zstd["enabled"] else "OFF")
-    mesh_zstd_ratio = (
-        float(mesh_zstd_stats["cache_raw_bytes"]) / max(1.0, float(mesh_zstd_stats["cache_compressed_bytes"]))
-        if int(mesh_zstd_stats["cache_compressed_bytes"]) > 0
-        else 0.0
-    )
-    tile_zstd_ratio = (
-        float(tile_zstd_stats["cache_raw_bytes"]) / max(1.0, float(tile_zstd_stats["cache_compressed_bytes"]))
-        if int(tile_zstd_stats["cache_compressed_bytes"]) > 0
-        else 0.0
-    )
-    slab_stats = mesh_cache.mesh_output_allocator_stats(renderer)
-    slab_count, slab_total_bytes, slab_used_bytes, slab_free_bytes, slab_largest_free_bytes, slab_alloc_count = slab_stats
-    memory = engine_memory_breakdown_stats(
-        renderer,
-        process_memory=process_memory,
-        terrain_zstd=terrain_zstd,
-        slab_stats=slab_stats,
-    )
 
     camera_x = float(renderer.camera.position[0])
     camera_y = float(renderer.camera.position[1])
@@ -801,8 +771,6 @@ def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
         f"RC AGE C0/C1/C2/C3: {rc_age_text} FRAMES",
         f"RC INTERVALS: {rc_interval_text}",
         f"RC SNAPSHOT F7: {rc_snapshot_path}",
-        f"MESH SLABS: {slab_count}  USED {slab_used_bytes / (1024.0 * 1024.0):4.1f} MIB  FREE {slab_free_bytes / (1024.0 * 1024.0):4.1f} MIB",
-        f"MESH BIGGEST GAP: {slab_largest_free_bytes / (1024.0 * 1024.0):4.1f} MIB  ALLOCS {slab_alloc_count}",
         f"CPU FRAME ISSUE: {avg_issue_encode:5.1f} MS",
         f"  WORLD UPDATE: {avg_world_update:5.1f} MS",
         f"  VISIBILITY LOOKUP: {avg_visibility_lookup:5.1f} MS",
@@ -813,17 +781,6 @@ def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
         f"  COMMAND FINISH: {avg_command_finish:5.1f} MS",
         f"  QUEUE SUBMIT: {avg_queue_submit:5.1f} MS",
         f"WALL FRAME: {avg_wall_frame:5.1f} MS",
-        f"PROCESS MEM: FOOT {_format_bytes_short(int(process_memory['footprint_bytes']))}  RSS {_format_bytes_short(int(process_memory['rss_bytes']))}  PEAK {_format_bytes_short(int(process_memory['peak_rss_bytes']))}",
-        f"MEM MAC: INT {_format_bytes_short(int(process_memory['internal_bytes']))}  IO {_format_bytes_short(int(process_memory['iokit_bytes']))}  GFX {_format_bytes_short(int(process_memory['graphics_footprint_bytes']))}  REUSE {_format_bytes_short(int(process_memory['reusable_bytes']))}  COMP {_format_bytes_short(int(process_memory['compressed_bytes']))}  RELIEF {_format_bytes_short(int(pressure_stats['last_relief_bytes']))}",
-        f"MEM CPU: TRACK {_format_bytes_short(memory['tracked_cpu_bytes'])}  TERR {_format_bytes_short(memory['terrain_payload_cpu_bytes'])}  COLL {memory['collision_entries']}/{_format_bytes_short(memory['collision_cpu_bytes'])}  SCR {_format_bytes_short(memory['scratch_numpy_cpu_bytes'])}",
-        f"MEM CPU: OTHER FOOT {_format_bytes_short(memory['other_footprint_bytes'])}  OTHER RSS {_format_bytes_short(memory['other_rss_bytes'])}  RAWQ {memory['terrain_raw_queue_entries']}/{_format_bytes_short(memory['terrain_raw_queue_cpu_bytes'])}",
-        f"MEM GPU: EST {_format_bytes_short(memory['gpu_estimated_bytes'])}  SLABS {_format_bytes_short(memory['mesh_slab_total_bytes'])}  TILE {_format_bytes_short(memory['tile_render_gpu_bytes'])}  TRANS {_format_bytes_short(memory['gpu_transient_bytes'])}",
-        f"MESH ZSTD: {'ON' if mesh_zstd_stats['enabled'] else 'OFF'}  CACHE {mesh_zstd_stats['cache_entries']}/{mesh_zstd_stats['cache_limit']} RAW {_format_bytes_short(mesh_zstd_stats['cache_raw_bytes'])} COMP {_format_bytes_short(mesh_zstd_stats['cache_compressed_bytes'])} RATIO {mesh_zstd_ratio:4.1f}X  PENDING {mesh_zstd_stats['pending_entries']}/{_format_bytes_short(mesh_zstd_stats['pending_raw_bytes'])}",
-        f"TILE ZSTD: {'ON' if tile_zstd_stats['enabled'] else 'OFF'}  CACHE {tile_zstd_stats['cache_entries']}/{tile_zstd_stats['cache_limit']} RAW {_format_bytes_short(tile_zstd_stats['cache_raw_bytes'])} COMP {_format_bytes_short(tile_zstd_stats['cache_compressed_bytes'])} RATIO {tile_zstd_ratio:4.1f}X  PENDING {tile_zstd_stats['pending_entries']}/{_format_bytes_short(tile_zstd_stats['pending_raw_bytes'])}",
-        f"MESH COMPACT: SLABS {mesh_compaction_stats['source_slabs']}  {_format_bytes_short(mesh_compaction_stats['retired_slab_bytes'])}->{_format_bytes_short(mesh_compaction_stats['new_slab_bytes'])}  RECLAIM {_format_bytes_short(mesh_compaction_stats['net_reclaimed_bytes'])}  TOTAL {_format_bytes_short(mesh_compaction_stats['before_slab_bytes'])}->{_format_bytes_short(mesh_compaction_stats['after_slab_bytes'])}  COPY {_format_bytes_short(mesh_compaction_stats['copied_bytes'])}  PEND {_format_bytes_short(mesh_compaction_stats['pending_retired_bytes'])}",
-        f"TERRAIN ZSTD: {terrain_zstd_status}  LIVE {terrain_zstd['live_entries']}  CACHE {terrain_zstd['cache_entries']}/{_format_bytes_short(float(terrain_zstd['cache_compressed_bytes']))}  QUEUE {terrain_zstd['queue_entries']}/{_format_bytes_short(float(terrain_zstd['queue_compressed_bytes']))}",
-        f"ZSTD STREAM: {float(terrain_zstd['stream_entries']):4.1f}/F  RAW {_format_bytes_short(float(terrain_zstd['stream_raw_bytes']))}  COMP {_format_bytes_short(float(terrain_zstd['stream_compressed_bytes']))}  RATIO {terrain_zstd_stream_ratio:4.1f}X",
-        f"ZSTD TOTAL: {int(terrain_zstd['total_entries'])}  RAW {_format_bytes_short(int(terrain_zstd['total_raw_bytes']))}  COMP {_format_bytes_short(int(terrain_zstd['total_compressed_bytes']))}  RATIO {terrain_zstd_total_ratio:4.1f}X",
         f"TOTAL DRAW VERTICES: {visible_vertices:,}",
         f"VISIBLE BUT NOT READY: {visible_but_not_ready}",
         f"PENDING CHUNK REQUESTS: {pending_chunk_requests}",

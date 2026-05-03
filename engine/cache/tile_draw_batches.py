@@ -16,7 +16,6 @@ from .cached_tile_batches import (
 from . import tile_zstd
 from .direct_render_batches import (
     _draw_batches_to_render_batches,
-    _extend_direct_render_batches,
     _extend_direct_render_batches_grouped,
     _extend_grouped_render_batch_groups,
     _finalize_direct_render_batch_groups,
@@ -45,7 +44,7 @@ def build_tile_draw_batches(
     *,
     age_gate: bool,
     direct_render_batches: list[tuple[wgpu.GPUBuffer, int, int, int]] | None = None,
-    direct_render_batch_groups: OrderedDict[tuple[int, int], list[tuple[wgpu.GPUBuffer, int, int, int]]] | None = None,
+    direct_render_batch_groups: OrderedDict[tuple[int, int], list[object]] | None = None,
 ) -> tuple[list[ChunkDrawBatch], int, int, int, float]:
     from .tile_mesh_cache import (
         _flush_merged_tile_buffer_reuse_queue,
@@ -156,7 +155,7 @@ def build_tile_draw_batches(
     draw_batches_extend = draw_batches.extend
     draw_batches_append = draw_batches.append
     grouped_extend = _extend_direct_render_batches_grouped
-    direct_extend = _extend_direct_render_batches
+    direct_render_batches_extend = direct_render_batches.extend if direct_render_batches is not None else None
 
     for tile_key_value in tile_iterable:
         existing = tile_render_batches_get(tile_key_value)
@@ -189,7 +188,7 @@ def build_tile_draw_batches(
                         else:
                             grouped_extend(direct_render_batch_groups, cached_render_batches)
                     elif direct_render_batches is not None:
-                        direct_extend(direct_render_batches, cached_render_batches)
+                        direct_render_batches_extend(cached_render_batches)
                     else:
                         draw_batches_extend(cached_draw_batches)
                 merged_chunk_count += tile_merged
@@ -202,6 +201,22 @@ def build_tile_draw_batches(
         if meshes is None:
             tile_meshes = visible_tile_active_meshes_get(tile_key_value)
             if not tile_meshes:
+                if tile_is_dirty:
+                    renderer._tile_dirty_keys.discard(tile_key_value)
+                    visible_tile_dirty_keys.discard(tile_key_value)
+                    stale_batch = tile_render_batches.pop(tile_key_value, None)
+                    if stale_batch is not None and getattr(stale_batch, "owns_vertex_buffer", False) and stale_batch.vertex_buffer is not None:
+                        _queue_merged_tile_buffer_for_reuse(
+                            renderer,
+                            stale_batch.vertex_buffer,
+                            int(
+                                getattr(stale_batch, "owned_vertex_buffer_capacity_bytes", 0)
+                                or (int(getattr(stale_batch, "vertex_count", 0)) * int(renderer_module.VERTEX_STRIDE))
+                            ),
+                        )
+                    tile_zstd_cache = getattr(renderer, "_tile_zstd_cache", None)
+                    if tile_zstd_cache is not None:
+                        tile_zstd_cache.pop(tile_key_value, None)
                 continue
         else:
             tile_meshes = tile_groups[tile_key_value]
@@ -226,7 +241,7 @@ def build_tile_draw_batches(
                         else:
                             _extend_direct_render_batches_grouped(direct_render_batch_groups, getattr(existing, "cached_render_batches", ()))
                     elif direct_render_batches is not None:
-                        _extend_direct_render_batches(direct_render_batches, getattr(existing, "cached_render_batches", ()))
+                        direct_render_batches_extend(getattr(existing, "cached_render_batches", ()))
                     else:
                         draw_batches.extend(cached_draw_batches)
                 merged_chunk_count += tile_merged
@@ -294,7 +309,7 @@ def build_tile_draw_batches(
             if direct_render_batch_groups is not None:
                 _extend_grouped_render_batch_groups(direct_render_batch_groups, batch.cached_grouped_render_batches)
             elif direct_render_batches is not None:
-                direct_extend(direct_render_batches, batch.cached_render_batches)
+                direct_render_batches_extend(batch.cached_render_batches)
             else:
                 draw_batches_extend(tile_draw_batches)
             visible_chunk_count += tile_mesh_count
@@ -338,7 +353,7 @@ def build_tile_draw_batches(
             if direct_render_batch_groups is not None:
                 _extend_grouped_render_batch_groups(direct_render_batch_groups, batch.cached_grouped_render_batches)
             elif direct_render_batches is not None:
-                direct_extend(direct_render_batches, batch.cached_render_batches)
+                direct_render_batches_extend(batch.cached_render_batches)
             else:
                 draw_batches_append(single_draw_batch)
             visible_chunk_count += 1
@@ -403,7 +418,7 @@ def build_tile_draw_batches(
             if direct_render_batch_groups is not None:
                 _extend_grouped_render_batch_groups(direct_render_batch_groups, batch.cached_grouped_render_batches)
             elif direct_render_batches is not None:
-                direct_extend(direct_render_batches, batch.cached_render_batches)
+                direct_render_batches_extend(batch.cached_render_batches)
             else:
                 draw_batches_extend(tile_draw_batches)
             visible_chunk_count += tile_visible_chunk_count
@@ -506,7 +521,7 @@ def build_tile_draw_batches(
         if direct_render_batch_groups is not None:
             _extend_grouped_render_batch_groups(direct_render_batch_groups, batch.cached_grouped_render_batches)
         elif direct_render_batches is not None:
-            direct_extend(direct_render_batches, batch.cached_render_batches)
+            direct_render_batches_extend(batch.cached_render_batches)
         else:
             draw_batches_extend(batch.cached_draw_batches)
         merged_chunk_count += batch.merged_chunk_count

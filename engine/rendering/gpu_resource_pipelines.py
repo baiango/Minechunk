@@ -19,6 +19,7 @@ from ..render_shaders import (
     WORLDSPACE_RC_FILTER_SHADER,
     WORLDSPACE_RC_TRACE_SHADER,
 )
+from ..pipelines.hud_overlay import HUD_VERTEX_STRIDE
 
 
 def create_gpu_pipelines(renderer) -> None:
@@ -98,9 +99,9 @@ def create_gpu_pipelines(renderer) -> None:
                     "array_stride": VERTEX_STRIDE,
                     "step_mode": "vertex",
                     "attributes": [
-                        {"shader_location": 0, "offset": 0, "format": "float32x4"},
-                        {"shader_location": 1, "offset": 16, "format": "float32x4"},
-                        {"shader_location": 2, "offset": 32, "format": "float32x4"},
+                        {"shader_location": 0, "offset": 0, "format": "float32x3"},
+                        {"shader_location": 1, "offset": 12, "format": "float32x3"},
+                        {"shader_location": 2, "offset": 24, "format": "float32x3"},
                     ],
                 }
             ],
@@ -130,9 +131,9 @@ def create_gpu_pipelines(renderer) -> None:
                     "array_stride": VERTEX_STRIDE,
                     "step_mode": "vertex",
                     "attributes": [
-                        {"shader_location": 0, "offset": 0, "format": "float32x4"},
-                        {"shader_location": 1, "offset": 16, "format": "float32x4"},
-                        {"shader_location": 2, "offset": 32, "format": "float32x4"},
+                        {"shader_location": 0, "offset": 0, "format": "float32x3"},
+                        {"shader_location": 1, "offset": 12, "format": "float32x3"},
+                        {"shader_location": 2, "offset": 24, "format": "float32x3"},
                     ],
                 }
             ],
@@ -215,12 +216,11 @@ def create_gpu_pipelines(renderer) -> None:
             "entry_point": "vs_main",
             "buffers": [
                 {
-                    "array_stride": VERTEX_STRIDE,
+                    "array_stride": HUD_VERTEX_STRIDE,
                     "step_mode": "vertex",
                     "attributes": [
-                        {"shader_location": 0, "offset": 0, "format": "float32x4"},
-                        {"shader_location": 1, "offset": 16, "format": "float32x4"},
-                        {"shader_location": 2, "offset": 32, "format": "float32x4"},
+                        {"shader_location": 0, "offset": 0, "format": "float32x3"},
+                        {"shader_location": 1, "offset": 12, "format": "float32x4"},
                     ],
                 }
             ],
@@ -251,4 +251,3 @@ def create_gpu_pipelines(renderer) -> None:
             "cull_mode": "none",
         },
     )
-

@@ -28,6 +28,7 @@ from .voxel_ao import (
 )
 from .voxel_emit import (
     _emit_quad_components_ao,
+    _emit_quad_components_uniform_color,
     _emit_voxel_face,
 )
 from .voxel_faces import (
@@ -44,7 +45,7 @@ from .voxel_faces import (
 _U64_ALL = np.uint64(0xFFFFFFFFFFFFFFFF)
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def _low_u64_bits(bit_count: int) -> np.uint64:
     if bit_count <= 0:
         return np.uint64(0)
@@ -53,14 +54,14 @@ def _low_u64_bits(bit_count: int) -> np.uint64:
     return (np.uint64(1) << bit_count) - np.uint64(1)
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def _valid_chunk_bit_mask(chunk_size: int) -> np.uint64:
     if chunk_size >= 64:
         return _U64_ALL
     return _low_u64_bits(chunk_size)
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def _ctz_u64(value: np.uint64) -> int:
     bits = np.uint64(value)
     index = 0
@@ -84,7 +85,7 @@ def _ctz_u64(value: np.uint64) -> int:
     return index
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def _popcount_u64(value: np.uint64) -> int:
     bits = np.uint64(value)
     count = 0
@@ -94,7 +95,7 @@ def _popcount_u64(value: np.uint64) -> int:
     return count
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def _row_occupancy_bits(row: np.ndarray, chunk_size: int) -> np.uint64:
     bits = np.uint64(0)
     for bit_index in range(chunk_size):
@@ -103,7 +104,7 @@ def _row_occupancy_bits(row: np.ndarray, chunk_size: int) -> np.uint64:
     return bits
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def _row_material_break_bits(row_materials: np.ndarray, chunk_size: int) -> np.uint64:
     bits = np.uint64(0)
     previous = int(row_materials[1])
@@ -115,7 +116,7 @@ def _row_material_break_bits(row_materials: np.ndarray, chunk_size: int) -> np.u
     return bits
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def _east_neighbor_bits(row: np.ndarray, row_bits: np.uint64, chunk_size: int) -> np.uint64:
     bits = row_bits >> 1
     if row[chunk_size + 1] != 0:
@@ -123,7 +124,7 @@ def _east_neighbor_bits(row: np.ndarray, row_bits: np.uint64, chunk_size: int) -
     return bits
 
 
-@njit(cache=True)
+@njit(cache=True, inline="always")
 def _west_neighbor_bits(row: np.ndarray, row_bits: np.uint64, valid_mask: np.uint64) -> np.uint64:
     bits = (row_bits << 1) & valid_mask
     if row[0] != 0:
@@ -167,7 +168,7 @@ def _chunk_unit_face_vertex_count_from_bits(
     return face_count * VERTICES_PER_FACE
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _material_rgb(material: int, y: int) -> tuple[float, float, float]:
     if 0 <= material <= SNOW:
         return _MATERIAL_COLOR_R[material], _MATERIAL_COLOR_G[material], _MATERIAL_COLOR_B[material]
@@ -182,7 +183,7 @@ def _material_rgb(material: int, y: int) -> tuple[float, float, float]:
     return 0.28, 0.54, 0.22
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _emit_top_run(vertices, vertex_index, plane_above, material, y, local_z, start_x, end_x, origin_x, origin_y, origin_z, step):
     cr, cg, cb = _material_rgb(material, y)
     x0 = origin_x + float(start_x - 1) * step
@@ -190,18 +191,15 @@ def _emit_top_run(vertices, vertex_index, plane_above, material, y, local_z, sta
     y1 = origin_y + float(y + 1) * step
     z0 = origin_z + float(local_z - 1) * step
     z1 = origin_z + float(local_z) * step
-    return _emit_quad_components_ao(
+    return _emit_quad_components_uniform_color(
         vertices, vertex_index,
         x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1,
         0.0, 1.0, 0.0,
         cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
     )
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _emit_bottom_run(vertices, vertex_index, plane_below, material, y, local_z, start_x, end_x, origin_x, origin_y, origin_z, step):
     cr, cg, cb = _material_rgb(material, y)
     x0 = origin_x + float(start_x - 1) * step
@@ -209,18 +207,15 @@ def _emit_bottom_run(vertices, vertex_index, plane_below, material, y, local_z, 
     y0 = origin_y + float(y) * step
     z0 = origin_z + float(local_z - 1) * step
     z1 = origin_z + float(local_z) * step
-    return _emit_quad_components_ao(
+    return _emit_quad_components_uniform_color(
         vertices, vertex_index,
         x0, y0, z0, x0, y0, z1, x1, y0, z1, x1, y0, z0,
         0.0, -1.0, 0.0,
         cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
     )
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _emit_south_run(vertices, vertex_index, plane, plane_above, plane_below, material, y, local_z, start_x, end_x, origin_x, origin_y, origin_z, step):
     cr, cg, cb = _material_rgb(material, y)
     x0 = origin_x + float(start_x - 1) * step
@@ -228,18 +223,15 @@ def _emit_south_run(vertices, vertex_index, plane, plane_above, plane_below, mat
     y0 = origin_y + float(y) * step
     y1 = y0 + step
     z1 = origin_z + float(local_z) * step
-    return _emit_quad_components_ao(
+    return _emit_quad_components_uniform_color(
         vertices, vertex_index,
         x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1,
         0.0, 0.0, 1.0,
         cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
     )
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _emit_north_run(vertices, vertex_index, plane, plane_above, plane_below, material, y, local_z, start_x, end_x, origin_x, origin_y, origin_z, step):
     cr, cg, cb = _material_rgb(material, y)
     x0 = origin_x + float(start_x - 1) * step
@@ -247,18 +239,15 @@ def _emit_north_run(vertices, vertex_index, plane, plane_above, plane_below, mat
     y0 = origin_y + float(y) * step
     y1 = y0 + step
     z0 = origin_z + float(local_z - 1) * step
-    return _emit_quad_components_ao(
+    return _emit_quad_components_uniform_color(
         vertices, vertex_index,
         x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0,
         0.0, 0.0, -1.0,
         cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
     )
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _emit_east_run(vertices, vertex_index, plane, plane_above, plane_below, material, y, local_x, start_z, end_z, origin_x, origin_y, origin_z, step):
     cr, cg, cb = _material_rgb(material, y)
     x1 = origin_x + float(local_x) * step
@@ -266,18 +255,15 @@ def _emit_east_run(vertices, vertex_index, plane, plane_above, plane_below, mate
     y1 = y0 + step
     z0 = origin_z + float(start_z - 1) * step
     z1 = origin_z + float(end_z - 1) * step
-    return _emit_quad_components_ao(
+    return _emit_quad_components_uniform_color(
         vertices, vertex_index,
         x1, y0, z0, x1, y1, z0, x1, y1, z1, x1, y0, z1,
         1.0, 0.0, 0.0,
         cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
     )
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _emit_west_run(vertices, vertex_index, plane, plane_above, plane_below, material, y, local_x, start_z, end_z, origin_x, origin_y, origin_z, step):
     cr, cg, cb = _material_rgb(material, y)
     x0 = origin_x + float(local_x - 1) * step
@@ -285,15 +271,1074 @@ def _emit_west_run(vertices, vertex_index, plane, plane_above, plane_below, mate
     y1 = y0 + step
     z0 = origin_z + float(start_z - 1) * step
     z1 = origin_z + float(end_z - 1) * step
-    return _emit_quad_components_ao(
+    return _emit_quad_components_uniform_color(
         vertices, vertex_index,
         x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0,
         -1.0, 0.0, 0.0,
         cr, cg, cb,
-        cr, cg, cb,
-        cr, cg, cb,
+    )
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _emit_top_surface_run(vertices, vertex_index, material, surface_height, local_z, start_x, end_x, origin_x, origin_z, step):
+    cr, cg, cb = _material_rgb(material, surface_height - 1)
+    x0 = origin_x + float(start_x - 1) * step
+    x1 = origin_x + float(end_x - 1) * step
+    y1 = float(surface_height) * step
+    z0 = origin_z + float(local_z - 1) * step
+    z1 = origin_z + float(local_z) * step
+    return _emit_quad_components_uniform_color(
+        vertices, vertex_index,
+        x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1,
+        0.0, 1.0, 0.0,
         cr, cg, cb,
     )
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _emit_top_surface_rect(vertices, vertex_index, material, surface_height, start_x, end_x, start_z, end_z, origin_x, origin_z, step):
+    cr, cg, cb = _material_rgb(material, surface_height - 1)
+    x0 = origin_x + float(start_x - 1) * step
+    x1 = origin_x + float(end_x - 1) * step
+    y1 = float(surface_height) * step
+    z0 = origin_z + float(start_z - 1) * step
+    z1 = origin_z + float(end_z - 1) * step
+    return _emit_quad_components_uniform_color(
+        vertices, vertex_index,
+        x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1,
+        0.0, 1.0, 0.0,
+        cr, cg, cb,
+    )
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _emit_bottom_surface_run(vertices, vertex_index, local_z, start_x, end_x, origin_x, origin_z, step):
+    cr, cg, cb = _material_rgb(BEDROCK, 0)
+    x0 = origin_x + float(start_x - 1) * step
+    x1 = origin_x + float(end_x - 1) * step
+    z0 = origin_z + float(local_z - 1) * step
+    z1 = origin_z + float(local_z) * step
+    return _emit_quad_components_uniform_color(
+        vertices, vertex_index,
+        x0, 0.0, z0, x0, 0.0, z1, x1, 0.0, z1, x1, 0.0, z0,
+        0.0, -1.0, 0.0,
+        cr, cg, cb,
+    )
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _emit_surface_side_span(vertices, vertex_index, face_kind, material, y_start, y_end, local_x, local_z, origin_x, origin_z, step):
+    cr, cg, cb = _material_rgb(material, y_end - 1)
+    x0 = origin_x + float(local_x - 1) * step
+    x1 = origin_x + float(local_x) * step
+    y0 = float(y_start) * step
+    y1 = float(y_end) * step
+    z0 = origin_z + float(local_z - 1) * step
+    z1 = origin_z + float(local_z) * step
+    if face_kind == 0:
+        return _emit_quad_components_uniform_color(
+            vertices, vertex_index,
+            x1, y0, z0, x1, y1, z0, x1, y1, z1, x1, y0, z1,
+            1.0, 0.0, 0.0,
+            cr, cg, cb,
+        )
+    if face_kind == 1:
+        return _emit_quad_components_uniform_color(
+            vertices, vertex_index,
+            x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0,
+            -1.0, 0.0, 0.0,
+            cr, cg, cb,
+        )
+    if face_kind == 2:
+        return _emit_quad_components_uniform_color(
+            vertices, vertex_index,
+            x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1,
+            0.0, 0.0, 1.0,
+            cr, cg, cb,
+        )
+    return _emit_quad_components_uniform_color(
+        vertices, vertex_index,
+        x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0,
+        0.0, 0.0, -1.0,
+        cr, cg, cb,
+    )
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _emit_surface_side_run(vertices, vertex_index, face_kind, material, y_start, y_end, fixed_local, start_axis, end_axis, origin_x, origin_z, step):
+    cr, cg, cb = _material_rgb(material, y_end - 1)
+    y0 = float(y_start) * step
+    y1 = float(y_end) * step
+    if face_kind == 0:
+        x1 = origin_x + float(fixed_local) * step
+        z0 = origin_z + float(start_axis - 1) * step
+        z1 = origin_z + float(end_axis - 1) * step
+        return _emit_quad_components_uniform_color(
+            vertices, vertex_index,
+            x1, y0, z0, x1, y1, z0, x1, y1, z1, x1, y0, z1,
+            1.0, 0.0, 0.0,
+            cr, cg, cb,
+        )
+    if face_kind == 1:
+        x0 = origin_x + float(fixed_local - 1) * step
+        z0 = origin_z + float(start_axis - 1) * step
+        z1 = origin_z + float(end_axis - 1) * step
+        return _emit_quad_components_uniform_color(
+            vertices, vertex_index,
+            x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0,
+            -1.0, 0.0, 0.0,
+            cr, cg, cb,
+        )
+    if face_kind == 2:
+        x0 = origin_x + float(start_axis - 1) * step
+        x1 = origin_x + float(end_axis - 1) * step
+        z1 = origin_z + float(fixed_local) * step
+        return _emit_quad_components_uniform_color(
+            vertices, vertex_index,
+            x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1,
+            0.0, 0.0, 1.0,
+            cr, cg, cb,
+        )
+    x0 = origin_x + float(start_axis - 1) * step
+    x1 = origin_x + float(end_axis - 1) * step
+    z0 = origin_z + float(fixed_local - 1) * step
+    return _emit_quad_components_uniform_color(
+        vertices, vertex_index,
+        x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0,
+        0.0, 0.0, -1.0,
+        cr, cg, cb,
+    )
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _count_surface_material_spans(surface_height: int, y_start: int, y_end: int) -> int:
+    count = 0
+    start = y_start
+    stop = min(y_end, 1)
+    if start < stop:
+        count += 1
+    start = max(y_start, 1)
+    stop = min(y_end, surface_height - 4)
+    if start < stop:
+        count += 1
+    start = max(y_start, surface_height - 4)
+    stop = min(y_end, surface_height - 1)
+    if start < stop:
+        count += 1
+    start = max(y_start, surface_height - 1)
+    if start < y_end:
+        count += 1
+    return count
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _emit_surface_material_spans(vertices, vertex_index, face_kind, surface_height, surface_material, y_start, y_end, local_x, local_z, origin_x, origin_z, step):
+    start = y_start
+    stop = min(y_end, 1)
+    if start < stop:
+        vertex_index = _emit_surface_side_span(vertices, vertex_index, face_kind, BEDROCK, start, stop, local_x, local_z, origin_x, origin_z, step)
+    start = max(y_start, 1)
+    stop = min(y_end, surface_height - 4)
+    if start < stop:
+        vertex_index = _emit_surface_side_span(vertices, vertex_index, face_kind, STONE, start, stop, local_x, local_z, origin_x, origin_z, step)
+    start = max(y_start, surface_height - 4)
+    stop = min(y_end, surface_height - 1)
+    if start < stop:
+        vertex_index = _emit_surface_side_span(vertices, vertex_index, face_kind, DIRT, start, stop, local_x, local_z, origin_x, origin_z, step)
+    start = max(y_start, surface_height - 1)
+    if start < y_end:
+        vertex_index = _emit_surface_side_span(vertices, vertex_index, face_kind, surface_material, start, y_end, local_x, local_z, origin_x, origin_z, step)
+    return vertex_index
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _surface_material_span_at(surface_height: int, surface_material: int, y_start: int, y_end: int, span_index: int) -> tuple[int, int, int, int]:
+    if span_index == 0:
+        start = y_start
+        stop = min(y_end, 1)
+        material = BEDROCK
+    elif span_index == 1:
+        start = max(y_start, 1)
+        stop = min(y_end, surface_height - 4)
+        material = STONE
+    elif span_index == 2:
+        start = max(y_start, surface_height - 4)
+        stop = min(y_end, surface_height - 1)
+        material = DIRT
+    else:
+        start = max(y_start, surface_height - 1)
+        stop = y_end
+        material = surface_material
+    if start < stop:
+        return 1, int(material), int(start), int(stop)
+    return 0, 0, 0, 0
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _surface_side_interval_material(surface_height: int, surface_material: int, y_end: int) -> int:
+    sample_y = y_end - 1
+    if sample_y <= 0:
+        return BEDROCK
+    if sample_y < surface_height - 4:
+        return STONE
+    if sample_y < surface_height - 1:
+        return DIRT
+    return surface_material
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _surface_face_material_span(
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    origin_y: int,
+    top_y: int,
+    local_x: int,
+    local_z: int,
+    face_kind: int,
+    span_index: int,
+) -> tuple[int, int, int, int]:
+    index = local_z * sample_size + local_x
+    surface_height = int(surface_heights[index])
+    if surface_height <= origin_y:
+        return 0, 0, 0, 0
+    y_end = min(top_y, surface_height)
+    if y_end <= origin_y:
+        return 0, 0, 0, 0
+    if face_kind == 0:
+        neighbor_height = int(surface_heights[index + 1])
+    elif face_kind == 1:
+        neighbor_height = int(surface_heights[index - 1])
+    elif face_kind == 2:
+        neighbor_height = int(surface_heights[index + sample_size])
+    else:
+        neighbor_height = int(surface_heights[index - sample_size])
+    y_start = max(origin_y, neighbor_height)
+    if y_start >= y_end:
+        return 0, 0, 0, 0
+    return _surface_material_span_at(surface_height, int(surface_materials[index]), y_start, y_end, span_index)
+
+
+@njit(cache=True, fastmath=True, inline="always")
+def _surface_face_interval(
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    origin_y: int,
+    top_y: int,
+    local_x: int,
+    local_z: int,
+    face_kind: int,
+) -> tuple[int, int, int, int, int]:
+    index = local_z * sample_size + local_x
+    surface_height = int(surface_heights[index])
+    if surface_height <= origin_y:
+        return 0, 0, 0, 0, 0
+    y_end = min(top_y, surface_height)
+    if y_end <= origin_y:
+        return 0, 0, 0, 0, 0
+    if face_kind == 0:
+        neighbor_height = int(surface_heights[index + 1])
+    elif face_kind == 1:
+        neighbor_height = int(surface_heights[index - 1])
+    elif face_kind == 2:
+        neighbor_height = int(surface_heights[index + sample_size])
+    else:
+        neighbor_height = int(surface_heights[index - sample_size])
+    y_start = max(origin_y, neighbor_height)
+    if y_start >= y_end:
+        return 0, 0, 0, 0, 0
+    return 1, surface_height, int(surface_materials[index]), y_start, y_end
+
+
+@njit(cache=True, fastmath=True)
+def _count_surface_side_runs_z(
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    chunk_size: int,
+    origin_y: int,
+    top_y: int,
+    face_kind: int,
+) -> int:
+    run_count = 0
+    for local_x in range(1, chunk_size + 1):
+        active_valid = 0
+        active_material = 0
+        active_y_start = 0
+        active_y_end = 0
+        for local_z in range(1, chunk_size + 1):
+            interval_valid, surface_height, surface_material, y_start, y_end = _surface_face_interval(
+                surface_heights,
+                surface_materials,
+                sample_size,
+                origin_y,
+                top_y,
+                local_x,
+                local_z,
+                face_kind,
+            )
+            if interval_valid != 0:
+                material = _surface_side_interval_material(surface_height, surface_material, y_end)
+                if active_valid != 0 and active_material == material and active_y_start == y_start and active_y_end == y_end:
+                    continue
+                if active_valid != 0:
+                    run_count += 1
+                active_valid = 1
+                active_material = material
+                active_y_start = y_start
+                active_y_end = y_end
+            elif active_valid != 0:
+                run_count += 1
+                active_valid = 0
+        if active_valid != 0:
+            run_count += 1
+    return run_count * VERTICES_PER_FACE
+
+
+@njit(cache=True, fastmath=True)
+def _count_surface_side_runs_x(
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    chunk_size: int,
+    origin_y: int,
+    top_y: int,
+    face_kind: int,
+) -> int:
+    run_count = 0
+    for local_z in range(1, chunk_size + 1):
+        active_valid = 0
+        active_material = 0
+        active_y_start = 0
+        active_y_end = 0
+        for local_x in range(1, chunk_size + 1):
+            interval_valid, surface_height, surface_material, y_start, y_end = _surface_face_interval(
+                surface_heights,
+                surface_materials,
+                sample_size,
+                origin_y,
+                top_y,
+                local_x,
+                local_z,
+                face_kind,
+            )
+            if interval_valid != 0:
+                material = _surface_side_interval_material(surface_height, surface_material, y_end)
+                if active_valid != 0 and active_material == material and active_y_start == y_start and active_y_end == y_end:
+                    continue
+                if active_valid != 0:
+                    run_count += 1
+                active_valid = 1
+                active_material = material
+                active_y_start = y_start
+                active_y_end = y_end
+            elif active_valid != 0:
+                run_count += 1
+                active_valid = 0
+        if active_valid != 0:
+            run_count += 1
+    return run_count * VERTICES_PER_FACE
+
+
+@njit(cache=True, fastmath=True)
+def _emit_surface_side_runs_z(
+    vertices: np.ndarray,
+    vertex_index: int,
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    chunk_size: int,
+    origin_y: int,
+    top_y: int,
+    face_kind: int,
+    origin_x: float,
+    origin_z: float,
+    step: float,
+) -> int:
+    for local_x in range(1, chunk_size + 1):
+        active_valid = 0
+        active_material = 0
+        active_y_start = 0
+        active_y_end = 0
+        active_start_axis = 0
+        for local_z in range(1, chunk_size + 1):
+            interval_valid, surface_height, surface_material, y_start, y_end = _surface_face_interval(
+                surface_heights,
+                surface_materials,
+                sample_size,
+                origin_y,
+                top_y,
+                local_x,
+                local_z,
+                face_kind,
+            )
+            if interval_valid != 0:
+                material = _surface_side_interval_material(surface_height, surface_material, y_end)
+                if active_valid != 0 and active_material == material and active_y_start == y_start and active_y_end == y_end:
+                    continue
+                if active_valid != 0:
+                    vertex_index = _emit_surface_side_run(
+                        vertices,
+                        vertex_index,
+                        face_kind,
+                        active_material,
+                        active_y_start,
+                        active_y_end,
+                        local_x,
+                        active_start_axis,
+                        local_z,
+                        origin_x,
+                        origin_z,
+                        step,
+                    )
+                active_valid = 1
+                active_material = material
+                active_y_start = y_start
+                active_y_end = y_end
+                active_start_axis = local_z
+            elif active_valid != 0:
+                vertex_index = _emit_surface_side_run(
+                    vertices,
+                    vertex_index,
+                    face_kind,
+                    active_material,
+                    active_y_start,
+                    active_y_end,
+                    local_x,
+                    active_start_axis,
+                    local_z,
+                    origin_x,
+                    origin_z,
+                    step,
+                )
+                active_valid = 0
+        if active_valid != 0:
+            vertex_index = _emit_surface_side_run(
+                vertices,
+                vertex_index,
+                face_kind,
+                active_material,
+                active_y_start,
+                active_y_end,
+                local_x,
+                active_start_axis,
+                chunk_size + 1,
+                origin_x,
+                origin_z,
+                step,
+            )
+    return vertex_index
+
+
+@njit(cache=True, fastmath=True)
+def _emit_surface_side_runs_x(
+    vertices: np.ndarray,
+    vertex_index: int,
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    chunk_size: int,
+    origin_y: int,
+    top_y: int,
+    face_kind: int,
+    origin_x: float,
+    origin_z: float,
+    step: float,
+) -> int:
+    for local_z in range(1, chunk_size + 1):
+        active_valid = 0
+        active_material = 0
+        active_y_start = 0
+        active_y_end = 0
+        active_start_axis = 0
+        for local_x in range(1, chunk_size + 1):
+            interval_valid, surface_height, surface_material, y_start, y_end = _surface_face_interval(
+                surface_heights,
+                surface_materials,
+                sample_size,
+                origin_y,
+                top_y,
+                local_x,
+                local_z,
+                face_kind,
+            )
+            if interval_valid != 0:
+                material = _surface_side_interval_material(surface_height, surface_material, y_end)
+                if active_valid != 0 and active_material == material and active_y_start == y_start and active_y_end == y_end:
+                    continue
+                if active_valid != 0:
+                    vertex_index = _emit_surface_side_run(
+                        vertices,
+                        vertex_index,
+                        face_kind,
+                        active_material,
+                        active_y_start,
+                        active_y_end,
+                        local_z,
+                        active_start_axis,
+                        local_x,
+                        origin_x,
+                        origin_z,
+                        step,
+                    )
+                active_valid = 1
+                active_material = material
+                active_y_start = y_start
+                active_y_end = y_end
+                active_start_axis = local_x
+            elif active_valid != 0:
+                vertex_index = _emit_surface_side_run(
+                    vertices,
+                    vertex_index,
+                    face_kind,
+                    active_material,
+                    active_y_start,
+                    active_y_end,
+                    local_z,
+                    active_start_axis,
+                    local_x,
+                    origin_x,
+                    origin_z,
+                    step,
+                )
+                active_valid = 0
+        if active_valid != 0:
+            vertex_index = _emit_surface_side_run(
+                vertices,
+                vertex_index,
+                face_kind,
+                active_material,
+                active_y_start,
+                active_y_end,
+                local_z,
+                active_start_axis,
+                chunk_size + 1,
+                origin_x,
+                origin_z,
+                step,
+            )
+    return vertex_index
+
+
+@njit(cache=True, fastmath=True)
+def _count_top_surface_rect_vertices(
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    chunk_size: int,
+    origin_y: int,
+    top_y: int,
+) -> int:
+    consumed = np.zeros((sample_size, sample_size), dtype=np.uint8)
+    rect_count = 0
+    for local_z in range(1, chunk_size + 1):
+        for local_x in range(1, chunk_size + 1):
+            if consumed[local_z, local_x] != 0:
+                continue
+            index = local_z * sample_size + local_x
+            surface_height = int(surface_heights[index])
+            if surface_height <= origin_y or surface_height > top_y:
+                continue
+            material = int(surface_materials[index])
+            end_x = local_x + 1
+            while end_x <= chunk_size:
+                next_index = local_z * sample_size + end_x
+                if consumed[local_z, end_x] != 0 or int(surface_heights[next_index]) != surface_height or int(surface_materials[next_index]) != material:
+                    break
+                end_x += 1
+            end_z = local_z + 1
+            while end_z <= chunk_size:
+                row_matches = True
+                for scan_x in range(local_x, end_x):
+                    next_index = end_z * sample_size + scan_x
+                    if consumed[end_z, scan_x] != 0 or int(surface_heights[next_index]) != surface_height or int(surface_materials[next_index]) != material:
+                        row_matches = False
+                        break
+                if not row_matches:
+                    break
+                end_z += 1
+            for mark_z in range(local_z, end_z):
+                for mark_x in range(local_x, end_x):
+                    consumed[mark_z, mark_x] = 1
+            rect_count += 1
+    return rect_count * VERTICES_PER_FACE
+
+
+@njit(cache=True, fastmath=True)
+def _emit_top_surface_rects(
+    vertices: np.ndarray,
+    vertex_index: int,
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    chunk_size: int,
+    origin_y: int,
+    top_y: int,
+    origin_x: float,
+    origin_z: float,
+    step: float,
+) -> int:
+    consumed = np.zeros((sample_size, sample_size), dtype=np.uint8)
+    for local_z in range(1, chunk_size + 1):
+        for local_x in range(1, chunk_size + 1):
+            if consumed[local_z, local_x] != 0:
+                continue
+            index = local_z * sample_size + local_x
+            surface_height = int(surface_heights[index])
+            if surface_height <= origin_y or surface_height > top_y:
+                continue
+            material = int(surface_materials[index])
+            end_x = local_x + 1
+            while end_x <= chunk_size:
+                next_index = local_z * sample_size + end_x
+                if consumed[local_z, end_x] != 0 or int(surface_heights[next_index]) != surface_height or int(surface_materials[next_index]) != material:
+                    break
+                end_x += 1
+            end_z = local_z + 1
+            while end_z <= chunk_size:
+                row_matches = True
+                for scan_x in range(local_x, end_x):
+                    next_index = end_z * sample_size + scan_x
+                    if consumed[end_z, scan_x] != 0 or int(surface_heights[next_index]) != surface_height or int(surface_materials[next_index]) != material:
+                        row_matches = False
+                        break
+                if not row_matches:
+                    break
+                end_z += 1
+            for mark_z in range(local_z, end_z):
+                for mark_x in range(local_x, end_x):
+                    consumed[mark_z, mark_x] = 1
+            vertex_index = _emit_top_surface_rect(vertices, vertex_index, material, surface_height, local_x, end_x, local_z, end_z, origin_x, origin_z, step)
+    return vertex_index
+
+
+@njit(cache=True, fastmath=True)
+def _append_top_surface_rect_runs(
+    runs: np.ndarray,
+    run_index: int,
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    chunk_size: int,
+    origin_y: int,
+    top_y: int,
+) -> int:
+    consumed = np.zeros((sample_size, sample_size), dtype=np.uint8)
+    for local_z in range(1, chunk_size + 1):
+        for local_x in range(1, chunk_size + 1):
+            if consumed[local_z, local_x] != 0:
+                continue
+            index = local_z * sample_size + local_x
+            surface_height = int(surface_heights[index])
+            if surface_height <= origin_y or surface_height > top_y:
+                continue
+            material = int(surface_materials[index])
+            end_x = local_x + 1
+            while end_x <= chunk_size:
+                next_index = local_z * sample_size + end_x
+                if consumed[local_z, end_x] != 0 or int(surface_heights[next_index]) != surface_height or int(surface_materials[next_index]) != material:
+                    break
+                end_x += 1
+            end_z = local_z + 1
+            while end_z <= chunk_size:
+                row_matches = True
+                for scan_x in range(local_x, end_x):
+                    next_index = end_z * sample_size + scan_x
+                    if consumed[end_z, scan_x] != 0 or int(surface_heights[next_index]) != surface_height or int(surface_materials[next_index]) != material:
+                        row_matches = False
+                        break
+                if not row_matches:
+                    break
+                end_z += 1
+            for mark_z in range(local_z, end_z):
+                for mark_x in range(local_x, end_x):
+                    consumed[mark_z, mark_x] = 1
+            runs[run_index, 0] = 4
+            runs[run_index, 1] = material
+            runs[run_index, 2] = surface_height
+            runs[run_index, 3] = 0
+            runs[run_index, 4] = local_x
+            runs[run_index, 5] = end_x
+            runs[run_index, 6] = local_z
+            runs[run_index, 7] = end_z
+            run_index += 1
+    return run_index
+
+
+@njit(cache=True, fastmath=True)
+def _append_surface_side_runs_z(
+    runs: np.ndarray,
+    run_index: int,
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    chunk_size: int,
+    origin_y: int,
+    top_y: int,
+    face_kind: int,
+) -> int:
+    for local_x in range(1, chunk_size + 1):
+        active_valid = 0
+        active_material = 0
+        active_y_start = 0
+        active_y_end = 0
+        active_start_axis = 0
+        for local_z in range(1, chunk_size + 1):
+            interval_valid, surface_height, surface_material, y_start, y_end = _surface_face_interval(
+                surface_heights,
+                surface_materials,
+                sample_size,
+                origin_y,
+                top_y,
+                local_x,
+                local_z,
+                face_kind,
+            )
+            if interval_valid != 0:
+                material = _surface_side_interval_material(surface_height, surface_material, y_end)
+                if active_valid != 0 and active_material == material and active_y_start == y_start and active_y_end == y_end:
+                    continue
+                if active_valid != 0:
+                    runs[run_index, 0] = face_kind
+                    runs[run_index, 1] = active_material
+                    runs[run_index, 2] = active_y_start
+                    runs[run_index, 3] = active_y_end
+                    runs[run_index, 4] = local_x
+                    runs[run_index, 5] = active_start_axis
+                    runs[run_index, 6] = local_z
+                    runs[run_index, 7] = 0
+                    run_index += 1
+                active_valid = 1
+                active_material = material
+                active_y_start = y_start
+                active_y_end = y_end
+                active_start_axis = local_z
+            elif active_valid != 0:
+                runs[run_index, 0] = face_kind
+                runs[run_index, 1] = active_material
+                runs[run_index, 2] = active_y_start
+                runs[run_index, 3] = active_y_end
+                runs[run_index, 4] = local_x
+                runs[run_index, 5] = active_start_axis
+                runs[run_index, 6] = local_z
+                runs[run_index, 7] = 0
+                run_index += 1
+                active_valid = 0
+        if active_valid != 0:
+            runs[run_index, 0] = face_kind
+            runs[run_index, 1] = active_material
+            runs[run_index, 2] = active_y_start
+            runs[run_index, 3] = active_y_end
+            runs[run_index, 4] = local_x
+            runs[run_index, 5] = active_start_axis
+            runs[run_index, 6] = chunk_size + 1
+            runs[run_index, 7] = 0
+            run_index += 1
+    return run_index
+
+
+@njit(cache=True, fastmath=True)
+def _append_surface_side_runs_x(
+    runs: np.ndarray,
+    run_index: int,
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    sample_size: int,
+    chunk_size: int,
+    origin_y: int,
+    top_y: int,
+    face_kind: int,
+) -> int:
+    for local_z in range(1, chunk_size + 1):
+        active_valid = 0
+        active_material = 0
+        active_y_start = 0
+        active_y_end = 0
+        active_start_axis = 0
+        for local_x in range(1, chunk_size + 1):
+            interval_valid, surface_height, surface_material, y_start, y_end = _surface_face_interval(
+                surface_heights,
+                surface_materials,
+                sample_size,
+                origin_y,
+                top_y,
+                local_x,
+                local_z,
+                face_kind,
+            )
+            if interval_valid != 0:
+                material = _surface_side_interval_material(surface_height, surface_material, y_end)
+                if active_valid != 0 and active_material == material and active_y_start == y_start and active_y_end == y_end:
+                    continue
+                if active_valid != 0:
+                    runs[run_index, 0] = face_kind
+                    runs[run_index, 1] = active_material
+                    runs[run_index, 2] = active_y_start
+                    runs[run_index, 3] = active_y_end
+                    runs[run_index, 4] = local_z
+                    runs[run_index, 5] = active_start_axis
+                    runs[run_index, 6] = local_x
+                    runs[run_index, 7] = 0
+                    run_index += 1
+                active_valid = 1
+                active_material = material
+                active_y_start = y_start
+                active_y_end = y_end
+                active_start_axis = local_x
+            elif active_valid != 0:
+                runs[run_index, 0] = face_kind
+                runs[run_index, 1] = active_material
+                runs[run_index, 2] = active_y_start
+                runs[run_index, 3] = active_y_end
+                runs[run_index, 4] = local_z
+                runs[run_index, 5] = active_start_axis
+                runs[run_index, 6] = local_x
+                runs[run_index, 7] = 0
+                run_index += 1
+                active_valid = 0
+        if active_valid != 0:
+            runs[run_index, 0] = face_kind
+            runs[run_index, 1] = active_material
+            runs[run_index, 2] = active_y_start
+            runs[run_index, 3] = active_y_end
+            runs[run_index, 4] = local_z
+            runs[run_index, 5] = active_start_axis
+            runs[run_index, 6] = chunk_size + 1
+            runs[run_index, 7] = 0
+            run_index += 1
+    return run_index
+
+
+@njit(cache=True, fastmath=True)
+def build_chunk_surface_run_table_from_heightmap_clipped(
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    chunk_size: int,
+    height_limit: int,
+    chunk_y: int = 0,
+) -> tuple[np.ndarray, int, int]:
+    sample_size = chunk_size + 2
+    origin_y = int(chunk_y) * int(chunk_size)
+    top_y = origin_y + int(height_limit)
+    max_runs = chunk_size * chunk_size * 5
+    if origin_y == 0:
+        max_runs += chunk_size
+    runs = np.empty((max_runs, 8), dtype=np.int32)
+    run_index = 0
+
+    run_index = _append_top_surface_rect_runs(runs, run_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y)
+
+    if origin_y == 0:
+        for local_z in range(1, chunk_size + 1):
+            local_x = 1
+            while local_x <= chunk_size:
+                index = local_z * sample_size + local_x
+                if int(surface_heights[index]) > 0:
+                    run_end = local_x + 1
+                    while run_end <= chunk_size and int(surface_heights[local_z * sample_size + run_end]) > 0:
+                        run_end += 1
+                    runs[run_index, 0] = 5
+                    runs[run_index, 1] = BEDROCK
+                    runs[run_index, 2] = 0
+                    runs[run_index, 3] = 0
+                    runs[run_index, 4] = local_z
+                    runs[run_index, 5] = local_x
+                    runs[run_index, 6] = run_end
+                    runs[run_index, 7] = 0
+                    run_index += 1
+                    local_x = run_end
+                else:
+                    local_x += 1
+
+    run_index = _append_surface_side_runs_z(runs, run_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 0)
+    run_index = _append_surface_side_runs_z(runs, run_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 1)
+    run_index = _append_surface_side_runs_x(runs, run_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 2)
+    run_index = _append_surface_side_runs_x(runs, run_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 3)
+    return runs[:run_index], run_index, run_index * VERTICES_PER_FACE
+
+
+@njit(cache=True, fastmath=True)
+def emit_chunk_surface_run_table_vertices(
+    vertices: np.ndarray,
+    vertex_offset: int,
+    runs: np.ndarray,
+    run_count: int,
+    chunk_x: int,
+    chunk_z: int,
+    chunk_size: int,
+    block_size: float = 1.0,
+) -> int:
+    step = float(block_size)
+    origin_x = float(chunk_x * chunk_size) * step
+    origin_z = float(chunk_z * chunk_size) * step
+    start_vertex_index = int(vertex_offset)
+    vertex_index = start_vertex_index
+    for run_index in range(run_count):
+        face_kind = int(runs[run_index, 0])
+        material = int(runs[run_index, 1])
+        if face_kind == 4:
+            vertex_index = _emit_top_surface_rect(
+                vertices,
+                vertex_index,
+                material,
+                int(runs[run_index, 2]),
+                int(runs[run_index, 4]),
+                int(runs[run_index, 5]),
+                int(runs[run_index, 6]),
+                int(runs[run_index, 7]),
+                origin_x,
+                origin_z,
+                step,
+            )
+        elif face_kind == 5:
+            vertex_index = _emit_bottom_surface_run(
+                vertices,
+                vertex_index,
+                int(runs[run_index, 4]),
+                int(runs[run_index, 5]),
+                int(runs[run_index, 6]),
+                origin_x,
+                origin_z,
+                step,
+            )
+        else:
+            vertex_index = _emit_surface_side_run(
+                vertices,
+                vertex_index,
+                face_kind,
+                material,
+                int(runs[run_index, 2]),
+                int(runs[run_index, 3]),
+                int(runs[run_index, 4]),
+                int(runs[run_index, 5]),
+                int(runs[run_index, 6]),
+                origin_x,
+                origin_z,
+                step,
+            )
+    return vertex_index - start_vertex_index
+
+
+@njit(cache=True, fastmath=True)
+def _count_clipped_surface_vertices(
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    chunk_size: int,
+    height_limit: int,
+    chunk_y: int,
+) -> int:
+    sample_size = chunk_size + 2
+    origin_y = int(chunk_y) * int(chunk_size)
+    top_y = origin_y + int(height_limit)
+    vertex_count = 0
+    vertex_count += _count_top_surface_rect_vertices(surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y)
+
+    if origin_y == 0:
+        for local_z in range(1, chunk_size + 1):
+            local_x = 1
+            while local_x <= chunk_size:
+                index = local_z * sample_size + local_x
+                if int(surface_heights[index]) > 0:
+                    run_end = local_x + 1
+                    while run_end <= chunk_size and int(surface_heights[local_z * sample_size + run_end]) > 0:
+                        run_end += 1
+                    vertex_count += VERTICES_PER_FACE
+                    local_x = run_end
+                else:
+                    local_x += 1
+
+    vertex_count += _count_surface_side_runs_z(surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 0)
+    vertex_count += _count_surface_side_runs_z(surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 1)
+    vertex_count += _count_surface_side_runs_x(surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 2)
+    vertex_count += _count_surface_side_runs_x(surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 3)
+    return vertex_count
+
+
+@njit(cache=True, fastmath=True)
+def count_chunk_surface_vertices_from_heightmap_clipped(
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    chunk_size: int,
+    height_limit: int,
+    chunk_y: int = 0,
+) -> int:
+    return _count_clipped_surface_vertices(surface_heights, surface_materials, chunk_size, height_limit, chunk_y)
+
+
+@njit(cache=True, fastmath=True)
+def emit_chunk_surface_vertices_from_heightmap_clipped(
+    vertices: np.ndarray,
+    vertex_offset: int,
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    chunk_x: int,
+    chunk_z: int,
+    chunk_size: int,
+    height_limit: int,
+    block_size: float = 1.0,
+    chunk_y: int = 0,
+) -> int:
+    sample_size = chunk_size + 2
+    origin_y = int(chunk_y) * int(chunk_size)
+    top_y = origin_y + int(height_limit)
+    step = float(block_size)
+    origin_x = float(chunk_x * chunk_size) * step
+    origin_z = float(chunk_z * chunk_size) * step
+    start_vertex_index = int(vertex_offset)
+    vertex_index = start_vertex_index
+
+    vertex_index = _emit_top_surface_rects(vertices, vertex_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, origin_x, origin_z, step)
+
+    if origin_y == 0:
+        for local_z in range(1, chunk_size + 1):
+            local_x = 1
+            while local_x <= chunk_size:
+                index = local_z * sample_size + local_x
+                if int(surface_heights[index]) > 0:
+                    run_end = local_x + 1
+                    while run_end <= chunk_size and int(surface_heights[local_z * sample_size + run_end]) > 0:
+                        run_end += 1
+                    vertex_index = _emit_bottom_surface_run(vertices, vertex_index, local_z, local_x, run_end, origin_x, origin_z, step)
+                    local_x = run_end
+                else:
+                    local_x += 1
+
+    vertex_index = _emit_surface_side_runs_z(vertices, vertex_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 0, origin_x, origin_z, step)
+    vertex_index = _emit_surface_side_runs_z(vertices, vertex_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 1, origin_x, origin_z, step)
+    vertex_index = _emit_surface_side_runs_x(vertices, vertex_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 2, origin_x, origin_z, step)
+    vertex_index = _emit_surface_side_runs_x(vertices, vertex_index, surface_heights, surface_materials, sample_size, chunk_size, origin_y, top_y, 3, origin_x, origin_z, step)
+    return vertex_index - start_vertex_index
+
+
+@njit(cache=True, fastmath=True)
+def build_chunk_surface_vertex_array_from_heightmap_clipped(
+    surface_heights: np.ndarray,
+    surface_materials: np.ndarray,
+    chunk_x: int,
+    chunk_z: int,
+    chunk_size: int,
+    height_limit: int,
+    block_size: float = 1.0,
+    chunk_y: int = 0,
+) -> tuple[np.ndarray, int]:
+    vertex_count = count_chunk_surface_vertices_from_heightmap_clipped(surface_heights, surface_materials, chunk_size, height_limit, chunk_y)
+    vertices = np.empty((vertex_count, VERTEX_COMPONENTS), dtype=np.float32)
+    if vertex_count == 0:
+        return vertices, 0
+    emitted_count = emit_chunk_surface_vertices_from_heightmap_clipped(
+        vertices,
+        0,
+        surface_heights,
+        surface_materials,
+        chunk_x,
+        chunk_z,
+        chunk_size,
+        height_limit,
+        block_size,
+        chunk_y,
+    )
+    return vertices[:emitted_count], emitted_count
 
 
 @njit(cache=True, fastmath=True)

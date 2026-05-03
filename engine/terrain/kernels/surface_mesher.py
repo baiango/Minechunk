@@ -29,15 +29,12 @@ def _write_vertex(
     row[0] = position[0]
     row[1] = position[1]
     row[2] = position[2]
-    row[3] = 1.0
-    row[4] = normal[0]
-    row[5] = normal[1]
-    row[6] = normal[2]
-    row[7] = 0.0
-    row[8] = color[0]
-    row[9] = color[1]
-    row[10] = color[2]
-    row[11] = alpha
+    row[3] = normal[0]
+    row[4] = normal[1]
+    row[5] = normal[2]
+    row[6] = color[0]
+    row[7] = color[1]
+    row[8] = color[2]
     return vertex_index + 1
 
 

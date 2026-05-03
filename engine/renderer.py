@@ -84,11 +84,14 @@ class TerrainRenderer:
         terrain_zstd_enabled: bool | None = None,
         mesh_zstd_enabled: bool | None = None,
         tile_merging_enabled: bool | None = None,
+        postprocess_enabled: bool | None = None,
+        terrain_caves_enabled: bool | None = None,
     ) -> None:
         default_use_gpu = _engine_mode_uses_gpu_path()
         self.use_gpu_terrain = default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)
         self.use_gpu_meshing = default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)
         self.terrain_zstd_enabled = bool(TERRAIN_ZSTD_ENABLED if terrain_zstd_enabled is None else terrain_zstd_enabled)
+        self.terrain_caves_enabled = True if terrain_caves_enabled is None else bool(terrain_caves_enabled)
         self.mesh_zstd_enabled = bool(MESH_ZSTD_ENABLED if mesh_zstd_enabled is None else mesh_zstd_enabled)
         self.tile_merging_enabled = bool(TILE_MERGING_ENABLED if tile_merging_enabled is None else tile_merging_enabled)
         self.tile_zstd_enabled = bool(TILE_ZSTD_ENABLED and self.mesh_zstd_enabled and self.tile_merging_enabled)
@@ -139,6 +142,7 @@ class TerrainRenderer:
             prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
             terrain_zstd_enabled=self.terrain_zstd_enabled,
+            terrain_caves_enabled=self.terrain_caves_enabled,
         )
         if engine_mode == ENGINE_MODE_METAL and self.world.terrain_backend_label() != "Metal" and not _allow_metal_fallback():
             failure = getattr(self.world, "_gpu_backend_error", None)
@@ -187,7 +191,7 @@ class TerrainRenderer:
         self._pending_rc_debug_capture_request: dict | None = None
         self._pending_rc_debug_readbacks: list[dict] = []
         self._worldspace_rc_last_capture_paths: list[str] = []
-        self.final_present_enabled = True
+        self.final_present_enabled = True if postprocess_enabled is None else bool(postprocess_enabled)
         self._postprocess_size = (0, 0)
         self.postprocess_msaa_sample_count = 4 if int(POSTPROCESS_MSAA_SAMPLE_COUNT) > 1 else 1
         self.scene_color_texture = None
@@ -310,6 +314,7 @@ class TerrainRenderer:
         self._shared_empty_chunk_vertex_buffer = None
         self._visible_displayed_coords: set[tuple[int, int, int]] = set()
         self._visible_missing_coords: set[tuple[int, int, int]] = set()
+        self._visible_display_state_incremental = False
         self._chunk_request_target_coords: set[tuple[int, int, int]] = set()
         self._chunk_request_queue: deque[tuple[int, int, int]] = deque()
         self._chunk_request_queue_origin: tuple[int, int, int] | None = None
@@ -424,7 +429,9 @@ class TerrainRenderer:
             "visibility_lookup": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "chunk_stream": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "chunk_stream_bytes": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
+            "chunk_generated": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "chunk_displayed_added": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
+            "chunk_rendered_added": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "terrain_zstd_stream_entries": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "terrain_zstd_stream_raw_bytes": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "terrain_zstd_stream_compressed_bytes": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
@@ -461,9 +468,14 @@ class TerrainRenderer:
         self._last_frame_visible_chunks = 0
         self._last_frame_visible_vertices = 0
         self._last_new_displayed_chunks = 0
+        self._last_new_rendered_chunks = 0
+        self._last_chunk_stream_generated = 0
         self._last_chunk_stream_drained = 0
         self._last_frame_visible_batches = 0
         self._last_displayed_chunk_coords: set[tuple[int, int, int]] = set()
+        self._last_rendered_chunk_coords: set[tuple[int, int, int]] = set()
+        self._profile_chunks_generated = 0
+        self._profile_chunks_rendered = 0
         self._voxel_mesh_scratch_capacity = 0
         self._voxel_mesh_scratch_sample_size = 0
         self._voxel_mesh_scratch_height_limit = 0
@@ -619,8 +631,8 @@ class TerrainRenderer:
     def _update_camera(self, dt: float) -> None:
         walk_solver.update_camera(self, dt)
 
-    def _ensure_depth_buffer(self) -> None:
-        width, height = self.canvas.get_physical_size()
+    def _ensure_depth_buffer(self, physical_size: tuple[int, int] | None = None) -> None:
+        width, height = self.canvas.get_physical_size() if physical_size is None else physical_size
         if (width, height) == self.depth_size:
             return
         self.depth_size = (width, height)
@@ -755,6 +767,9 @@ class TerrainRenderer:
             self._last_frame_merged_batches = merged_chunks
             self._last_frame_visible_chunks = visible_chunks
             self._last_frame_visible_vertices = visible_vertices
+            rendered_chunk_coords = set(self._visible_displayed_coords)
+            self._last_new_rendered_chunks = len(rendered_chunk_coords - self._last_rendered_chunk_coords)
+            self._last_rendered_chunk_coords = rendered_chunk_coords
 
             hud_profile.draw_profile_hud(self, encoder, color_view)
             hud_profile.draw_frame_breakdown_hud(self, encoder, color_view)
@@ -776,7 +791,9 @@ class TerrainRenderer:
             hud_profile.record_frame_breakdown_sample(self, "world_update", world_update_ms)
             hud_profile.record_frame_breakdown_sample(self, "visibility_lookup", visibility_lookup_ms)
             hud_profile.record_frame_breakdown_sample(self, "chunk_stream", chunk_stream_ms)
+            hud_profile.record_frame_breakdown_sample(self, "chunk_generated", float(self._last_chunk_stream_generated))
             hud_profile.record_frame_breakdown_sample(self, "chunk_displayed_added", float(self._last_new_displayed_chunks))
+            hud_profile.record_frame_breakdown_sample(self, "chunk_rendered_added", float(self._last_new_rendered_chunks))
             hud_profile.record_frame_breakdown_sample(self, "camera_upload", camera_upload_ms)
             hud_profile.record_frame_breakdown_sample(self, "swapchain_acquire", swapchain_acquire_ms)
             hud_profile.record_frame_breakdown_sample(self, "render_encode", render_encode_ms)

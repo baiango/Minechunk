@@ -39,6 +39,14 @@ def regenerate_world(renderer, metal_mesher, allow_metal_fallback) -> None:
     self._chunk_request_queue_origin = None
     self._chunk_request_queue_view_signature = None
     self._chunk_request_queue_dirty = True
+    self._last_displayed_chunk_coords.clear()
+    self._last_rendered_chunk_coords.clear()
+    self._last_new_displayed_chunks = 0
+    self._last_new_rendered_chunks = 0
+    self._last_chunk_stream_generated = 0
+    self._last_chunk_stream_drained = 0
+    self._profile_chunks_generated = 0
+    self._profile_chunks_rendered = 0
     self._pending_voxel_mesh_results.clear()
     self._pending_surface_gpu_batches.clear()
     self._pending_surface_gpu_batches_chunk_total = 0

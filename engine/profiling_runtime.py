@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from .pipelines import profiling as hud_profile
-from .renderer_config import PROFILE_REPORT_INTERVAL, SWAPCHAIN_MAX_FPS, SWAPCHAIN_USE_VSYNC
+from .renderer_config import PROFILE_REPORT_INTERVAL
 from .world_constants import CHUNK_SIZE
 
 
@@ -28,9 +28,27 @@ def enable(renderer) -> None:
     renderer.profile_hud_lines = []
     renderer.profile_hud_vertex_bytes = b""
     renderer.profile_hud_vertex_count = 0
+    renderer._profile_chunks_generated = 0
+    renderer._profile_chunks_rendered = 0
+    renderer._last_rendered_chunk_coords = set(getattr(renderer, "_visible_displayed_coords", ()))
     renderer._frame_breakdown_next_refresh = now
     renderer.frame_breakdown_lines = [
         f"FRAME BREAKDOWN @ DIMENSION {renderer.render_dimension_chunks}x{renderer.render_dimension_chunks} CHUNKS",
+        "MOVE SPEED: --.- B/S",
+        "CAM POS M: --.-- --.-- --.--",
+        "CAM POS B: --.- --.- --.-",
+        "RENDER BACKEND: --",
+        "TERRAIN BACKEND: --",
+        "MESH BACKEND: --",
+        f"CHUNK DIMS: {CHUNK_SIZE}x{CHUNK_SIZE}x{CHUNK_SIZE}",
+        f"BACKEND POLL SIZE: {renderer.terrain_batch_size}",
+        f"MESH DRAIN SIZE: {renderer.mesh_batch_size}",
+        "RC: -- DEBUG --:--",
+        "RC FIELD: RES -- DIRS -- FILTER -- TEMP --.--",
+        "RC UPDATE: -- SCHED -- DIRTY -- REJECT -- BURST --",
+        "RC AGE C0/C1/C2/C3: --/--/--/-- FRAMES",
+        "RC INTERVALS: --",
+        "RC SNAPSHOT F7: -",
         "CPU FRAME ISSUE: --.- MS",
         "  WORLD UPDATE: --.- MS",
         "  VISIBILITY LOOKUP: --.- MS",
@@ -40,22 +58,10 @@ def enable(renderer) -> None:
         "  RENDER ENCODE: --.- MS",
         "  COMMAND FINISH: --.- MS",
         "  QUEUE SUBMIT: --.- MS",
-        f"CHUNK DIMS: {CHUNK_SIZE}x{CHUNK_SIZE}x{CHUNK_SIZE}",
-        f"BACKEND POLL SIZE: {renderer.terrain_batch_size}",
-        f"MESH DRAIN SIZE: {renderer.mesh_batch_size}",
-        f"PRESENT PACING: FPS {SWAPCHAIN_MAX_FPS}  VSYNC {'ON' if SWAPCHAIN_USE_VSYNC else 'OFF'}",
-        "MESH SLABS: --  USED --.- MIB  FREE --.- MIB",
-        "MESH BIGGEST GAP: --.- MIB  ALLOCS --",
-        "TOTAL DRAW VERTICES: --",
         "WALL FRAME: --.- MS",
-        "PROCESS MEM: FOOT --  RSS --  PEAK --",
-        "MEM MAC: INT --  IO --  GFX --  REUSE --  COMP --  RELIEF --",
-        "MEM CPU: TRACK --  TERR --  COLL --/--  SCR --",
-        "MEM CPU: OTHER FOOT --  OTHER RSS --  RAWQ --/--",
-        "MEM GPU: EST --  SLABS --  TILE --  TRANS --",
-        "MESH ZSTD: --  CACHE --/-- RAW -- COMP -- RATIO --.-X  PENDING --/--",
-        "TILE ZSTD: --  CACHE --/-- RAW -- COMP -- RATIO --.-X  PENDING --/--",
-        "MESH COMPACT: SLABS --  ---->--  RECLAIM --  TOTAL ---->--  COPY --  PEND --",
+        "TOTAL DRAW VERTICES: --",
+        "VISIBLE BUT NOT READY: --",
+        "PENDING CHUNK REQUESTS: --",
         "DRAW CALLS: --",
         "VISIBLE MERGED CHUNKS (VISIBLE ONLY): --",
     ]
@@ -73,6 +79,8 @@ def disable(renderer) -> None:
     renderer.profile_hud_lines = []
     renderer.profile_hud_vertex_bytes = b""
     renderer.profile_hud_vertex_count = 0
+    renderer._profile_chunks_generated = 0
+    renderer._profile_chunks_rendered = 0
     renderer.frame_breakdown_lines = []
     renderer.frame_breakdown_vertex_bytes = b""
     renderer.frame_breakdown_vertex_count = 0

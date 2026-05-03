@@ -29,9 +29,11 @@ class RendererLaunchConfig:
     fly_speed_mps: float = DEFAULT_BENCHMARK_FLY_SPEED_MPS
     target_rendered_chunks: int = 4096
     status_log_interval_s: float = 1.0
-    terrain_zstd_enabled: bool | None = None
-    mesh_zstd_enabled: bool | None = None
+    terrain_zstd_enabled: bool | None = False
+    terrain_caves_enabled: bool | None = None
+    mesh_zstd_enabled: bool | None = False
     tile_merging_enabled: bool | None = None
+    postprocess_enabled: bool | None = None
 
 
 def _normalized_mode(mode: str) -> str:
@@ -90,10 +92,14 @@ def _renderer_kwargs(config: RendererLaunchConfig) -> dict[str, Any]:
         kwargs["mesh_batch_size"] = max(1, int(config.mesh_batch_size))
     if config.terrain_zstd_enabled is not None:
         kwargs["terrain_zstd_enabled"] = bool(config.terrain_zstd_enabled)
+    if config.terrain_caves_enabled is not None:
+        kwargs["terrain_caves_enabled"] = bool(config.terrain_caves_enabled)
     if config.mesh_zstd_enabled is not None:
         kwargs["mesh_zstd_enabled"] = bool(config.mesh_zstd_enabled)
     if config.tile_merging_enabled is not None:
         kwargs["tile_merging_enabled"] = bool(config.tile_merging_enabled)
+    if config.postprocess_enabled is not None:
+        kwargs["postprocess_enabled"] = bool(config.postprocess_enabled)
     return kwargs
 
 

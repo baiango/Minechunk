@@ -27,24 +27,35 @@ def submit_render(renderer, meshes=None):
     orchestration object.
     """
     self = renderer
-    self._ensure_depth_buffer()
+    use_postprocess = bool(self.final_present_enabled)
+    physical_width, physical_height = self.canvas.get_physical_size()
+    if not use_postprocess and (physical_width, physical_height) != self.depth_size:
+        self._ensure_depth_buffer((physical_width, physical_height))
     right, up, forward = self._camera_basis()
+    camera_position = tuple(float(value) for value in self.camera.position)
+    focal = 1.0 / math.tan(math.radians(90.0) * 0.5)
+    aspect = max(1.0, float(physical_width) / max(1.0, float(physical_height)))
+    near = max(0.02, 0.1 * BLOCK_SIZE)
+    far = max(128.0 * BLOCK_SIZE, DEFAULT_RENDER_DISTANCE_WORLD * 1.25)
+    camera_uniform_signature = (camera_position, right, up, forward, focal, aspect, near, far)
     camera_upload_start = time.perf_counter()
-    self.device.queue.write_buffer(
-        self.camera_buffer,
-        0,
-        pack_camera_uniform(
-            tuple(self.camera.position),
-            right,
-            up,
-            forward,
-            1.0 / math.tan(math.radians(90.0) * 0.5),
-            max(1.0, self.canvas.get_physical_size()[0] / max(1.0, float(self.canvas.get_physical_size()[1]))),
-            max(0.02, 0.1 * BLOCK_SIZE),
-            max(128.0 * BLOCK_SIZE, DEFAULT_RENDER_DISTANCE_WORLD * 1.25),
-            LIGHT_DIRECTION,
-        ),
-    )
+    if getattr(self, "_camera_uniform_signature", None) != camera_uniform_signature:
+        self.device.queue.write_buffer(
+            self.camera_buffer,
+            0,
+            pack_camera_uniform(
+                camera_position,
+                right,
+                up,
+                forward,
+                focal,
+                aspect,
+                near,
+                far,
+                LIGHT_DIRECTION,
+            ),
+        )
+        self._camera_uniform_signature = camera_uniform_signature
     camera_upload_ms = (time.perf_counter() - camera_upload_start) * 1000.0
 
     encoder = self.device.create_command_encoder()
@@ -128,7 +139,6 @@ def submit_render(renderer, meshes=None):
     swapchain_acquire_ms = (time.perf_counter() - acquire_start) * 1000.0
     color_view = current_texture.create_view()
 
-    use_postprocess = bool(self.final_present_enabled)
     if use_postprocess:
         postprocess_targets.ensure_postprocess_targets(self)
         assert self.scene_color_view is not None

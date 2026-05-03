@@ -19,6 +19,7 @@ def surface_result_to_voxel_result(
     sample_size: int,
     seed: int,
     height_limit: int,
+    terrain_caves_enabled: bool = True,
 ) -> ChunkVoxelResult:
     chunk_x = int(surface_result.chunk_x)
     chunk_y = int(getattr(surface_result, "chunk_y", 0))
@@ -26,16 +27,25 @@ def surface_result_to_voxel_result(
     top_boundary = None
     bottom_boundary = None
     is_empty_chunk = False
+    is_fully_occluded_chunk = False
 
     if VERTICAL_CHUNK_STACK_ENABLED:
         local_height = int(chunk_size)
         origin_y = chunk_y * int(chunk_size)
+        top_world_y = origin_y + local_height
         blocks = np.zeros((local_height, sample_size, sample_size), dtype=np.uint8)
         voxel_materials = np.zeros((local_height, sample_size, sample_size), dtype=np.uint32)
         top_boundary = np.zeros((sample_size, sample_size), dtype=np.uint8)
         bottom_boundary = np.zeros((sample_size, sample_size), dtype=np.uint8)
-        is_empty_chunk = int(np.max(surface_result.heights)) <= origin_y
-        if not is_empty_chunk:
+        max_surface_height = int(np.max(surface_result.heights))
+        min_surface_height = int(np.min(surface_result.heights))
+        is_empty_chunk = max_surface_height <= origin_y
+        is_fully_occluded_chunk = (
+            not bool(terrain_caves_enabled)
+            and origin_y > 0
+            and min_surface_height > top_world_y
+        )
+        if not is_empty_chunk and not is_fully_occluded_chunk:
             fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface(
                 blocks,
                 voxel_materials,
@@ -49,6 +59,7 @@ def surface_result_to_voxel_result(
                 int(chunk_size),
                 int(seed),
                 int(height_limit),
+                bool(terrain_caves_enabled),
             )
     else:
         blocks = np.zeros((height_limit, sample_size, sample_size), dtype=np.uint8)
@@ -72,6 +83,7 @@ def surface_result_to_voxel_result(
         top_boundary=top_boundary,
         bottom_boundary=bottom_boundary,
         is_empty=is_empty_chunk,
+        is_fully_occluded=is_fully_occluded_chunk,
     )
 
 
@@ -82,6 +94,7 @@ def surface_results_to_voxel_results(
     sample_size: int,
     seed: int,
     height_limit: int,
+    terrain_caves_enabled: bool = True,
 ) -> list[ChunkVoxelResult]:
     return [
         surface_result_to_voxel_result(
@@ -90,6 +103,7 @@ def surface_results_to_voxel_results(
             sample_size=sample_size,
             seed=seed,
             height_limit=height_limit,
+            terrain_caves_enabled=terrain_caves_enabled,
         )
         for surface_result in surface_results
     ]
@@ -118,11 +132,21 @@ class WgpuTerrainVoxelMixin:
                 self.chunk_size,
                 self.seed,
                 self.height_limit,
+                self.terrain_caves_enabled,
             )
             return blocks, voxel_materials
         blocks = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint8)
         voxel_materials = np.zeros((self.height_limit, self.sample_size, self.sample_size), dtype=np.uint32)
-        cpu_fill_chunk_voxel_grid(blocks, voxel_materials, int(chunk_x), int(chunk_z), self.chunk_size, self.seed, self.height_limit)
+        cpu_fill_chunk_voxel_grid(
+            blocks,
+            voxel_materials,
+            int(chunk_x),
+            int(chunk_z),
+            self.chunk_size,
+            self.seed,
+            self.height_limit,
+            self.terrain_caves_enabled,
+        )
         return blocks, voxel_materials
 
     @profile
@@ -137,6 +161,7 @@ class WgpuTerrainVoxelMixin:
             sample_size=self.sample_size,
             seed=self.seed,
             height_limit=self.height_limit,
+            terrain_caves_enabled=self.terrain_caves_enabled,
         )
 
     def has_pending_chunk_voxel_batches(self) -> bool:
@@ -150,4 +175,5 @@ class WgpuTerrainVoxelMixin:
             sample_size=self.sample_size,
             seed=self.seed,
             height_limit=self.height_limit,
+            terrain_caves_enabled=self.terrain_caves_enabled,
         )

@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import struct
+
 import wgpu
 
 from .. import render_contract as render_consts
-from ..render_utils import pack_vertex, screen_to_ndc
+from ..render_utils import screen_to_ndc
 from .hud_font import hud_glyph_rows
+
+HUD_VERTEX_STRIDE = 28
+
+
+def _pack_hud_vertex(position: tuple[float, float, float], color: tuple[float, float, float], alpha: float) -> bytes:
+    return struct.pack(
+        "<7f",
+        position[0],
+        position[1],
+        position[2],
+        color[0],
+        color[1],
+        color[2],
+        alpha,
+    )
 
 
 def build_hud_vertices(renderer, lines: list[str], *, align_right: bool = False) -> tuple[bytes, int]:
@@ -35,12 +52,12 @@ def build_hud_vertices(renderer, lines: list[str], *, align_right: bool = False)
     def add_quad(px0: float, py0: float, px1: float, py1: float, color: tuple[float, float, float], alpha: float) -> None:
         x0, y0 = screen_to_ndc(px0, py0, screen_w, screen_h)
         x1, y1 = screen_to_ndc(px1, py1, screen_w, screen_h)
-        vertices.append(pack_vertex((x0, y0, 0.0), (0.0, 0.0, 1.0), color, alpha))
-        vertices.append(pack_vertex((x1, y0, 0.0), (0.0, 0.0, 1.0), color, alpha))
-        vertices.append(pack_vertex((x1, y1, 0.0), (0.0, 0.0, 1.0), color, alpha))
-        vertices.append(pack_vertex((x0, y0, 0.0), (0.0, 0.0, 1.0), color, alpha))
-        vertices.append(pack_vertex((x1, y1, 0.0), (0.0, 0.0, 1.0), color, alpha))
-        vertices.append(pack_vertex((x0, y1, 0.0), (0.0, 0.0, 1.0), color, alpha))
+        vertices.append(_pack_hud_vertex((x0, y0, 0.0), color, alpha))
+        vertices.append(_pack_hud_vertex((x1, y0, 0.0), color, alpha))
+        vertices.append(_pack_hud_vertex((x1, y1, 0.0), color, alpha))
+        vertices.append(_pack_hud_vertex((x0, y0, 0.0), color, alpha))
+        vertices.append(_pack_hud_vertex((x1, y1, 0.0), color, alpha))
+        vertices.append(_pack_hud_vertex((x0, y1, 0.0), color, alpha))
 
     panel_x = 12.0
     panel_y = 12.0
@@ -134,4 +151,3 @@ def draw_frame_breakdown_hud(renderer, encoder, color_view) -> None:
     if not renderer.profiling_enabled:
         return
     draw_hud_overlay(renderer, encoder, color_view, renderer.frame_breakdown_vertex_buffer, renderer.frame_breakdown_vertex_count)
-

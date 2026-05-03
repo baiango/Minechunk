@@ -82,6 +82,117 @@ def _coalesce_bool(value: bool | None, default: bool) -> bool:
     return default if value is None else bool(value)
 
 
+def _warm_numba_cache() -> None:
+    import numpy as np
+
+    from engine.render_constants import VERTEX_COMPONENTS
+    from engine.world_constants import BLOCK_SIZE, CHUNK_SIZE, WORLD_HEIGHT_BLOCKS
+    from engine.terrain.kernels import (
+        build_chunk_surface_run_table_from_heightmap_clipped,
+        build_chunk_surface_vertex_array_from_heightmap_clipped,
+        build_chunk_vertex_array_from_voxels_with_boundaries,
+        count_chunk_surface_vertices_from_heightmap_clipped,
+        emit_chunk_surface_run_table_vertices,
+        emit_chunk_surface_vertices_from_heightmap_clipped,
+        fill_chunk_surface_grids,
+        fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface,
+        surface_profile_at,
+    )
+
+    seed = 1337
+    chunk_size = int(CHUNK_SIZE)
+    sample_size = chunk_size + 2
+    world_height = int(WORLD_HEIGHT_BLOCKS)
+    local_height = chunk_size
+
+    heights = np.empty(sample_size * sample_size, dtype=np.uint32)
+    surface_materials = np.empty(sample_size * sample_size, dtype=np.uint32)
+    blocks = np.zeros((local_height, sample_size, sample_size), dtype=np.uint8)
+    materials = np.zeros((local_height, sample_size, sample_size), dtype=np.uint32)
+    top_boundary = np.zeros((sample_size, sample_size), dtype=np.uint8)
+    bottom_boundary = np.zeros((sample_size, sample_size), dtype=np.uint8)
+
+    surface_profile_at(0.0, 0.0, seed, world_height)
+    fill_chunk_surface_grids(heights, surface_materials, 0, 0, chunk_size, seed, world_height)
+    fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface(
+        blocks,
+        materials,
+        top_boundary,
+        bottom_boundary,
+        heights,
+        surface_materials,
+        0,
+        0,
+        0,
+        chunk_size,
+        seed,
+        world_height,
+        True,
+    )
+    build_chunk_vertex_array_from_voxels_with_boundaries(
+        blocks,
+        materials,
+        0,
+        0,
+        chunk_size,
+        local_height,
+        top_boundary,
+        bottom_boundary,
+        float(BLOCK_SIZE),
+        0,
+    )
+    build_chunk_surface_vertex_array_from_heightmap_clipped(
+        heights,
+        surface_materials,
+        0,
+        0,
+        chunk_size,
+        local_height,
+        float(BLOCK_SIZE),
+        0,
+    )
+    surface_vertex_count = count_chunk_surface_vertices_from_heightmap_clipped(
+        heights,
+        surface_materials,
+        chunk_size,
+        local_height,
+        0,
+    )
+    surface_vertices = np.empty((surface_vertex_count, int(VERTEX_COMPONENTS)), dtype=np.float32)
+    if surface_vertex_count > 0:
+        emit_chunk_surface_vertices_from_heightmap_clipped(
+            surface_vertices,
+            0,
+            heights,
+            surface_materials,
+            0,
+            0,
+            chunk_size,
+            local_height,
+            float(BLOCK_SIZE),
+            0,
+        )
+    surface_run_table, surface_run_count, surface_run_vertex_count = build_chunk_surface_run_table_from_heightmap_clipped(
+        heights,
+        surface_materials,
+        chunk_size,
+        local_height,
+        0,
+    )
+    surface_run_vertices = np.empty((surface_run_vertex_count, int(VERTEX_COMPONENTS)), dtype=np.float32)
+    if surface_run_vertex_count > 0:
+        emit_chunk_surface_run_table_vertices(
+            surface_run_vertices,
+            0,
+            surface_run_table,
+            surface_run_count,
+            0,
+            0,
+            chunk_size,
+            float(BLOCK_SIZE),
+        )
+
+
 def _build_renderer_from_args(args: argparse.Namespace):
     from engine.benchmark_runtime import RendererLaunchConfig, make_renderer
 
@@ -97,8 +208,10 @@ def _build_renderer_from_args(args: argparse.Namespace):
         terrain_batch_size=args.terrain_batch_size,
         mesh_batch_size=args.mesh_batch_size,
         terrain_zstd_enabled=args.terrain_zstd,
+        terrain_caves_enabled=args.terrain_caves,
         mesh_zstd_enabled=args.mesh_zstd,
         tile_merging_enabled=args.tile_merge,
+        postprocess_enabled=args.postprocess,
         freeze_view_origin=_coalesce_bool(args.freeze_view_origin, mode == "fixed"),
         freeze_camera=_coalesce_bool(args.freeze_camera, mode == "fixed"),
         exit_when_view_ready=_coalesce_bool(args.exit_when_view_ready, False),
@@ -136,20 +249,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--terrain-zstd",
         action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable or disable zstd level-1 compression for CPU-side terrain chunk payloads. Default is off.",
+    )
+    parser.add_argument(
+        "--terrain-caves",
+        action=argparse.BooleanOptionalAction,
         default=None,
-        help="Enable or disable zstd level-1 compression for CPU-side terrain chunk payloads.",
+        help="Enable or disable cave carving in terrain voxel fills. Use --no-terrain-caves to isolate surface/meshing cost.",
     )
     parser.add_argument(
         "--mesh-zstd",
         action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Enable or disable experimental zstd readback compression for offscreen mesh buffers.",
+        default=False,
+        help="Enable or disable experimental zstd readback compression for offscreen mesh buffers. Default is off.",
     )
     parser.add_argument(
         "--tile-merge",
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable or disable merged visible tile GPU buffers. Default is off to reduce footprint.",
+    )
+    parser.add_argument(
+        "--postprocess",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable the postprocess/G-buffer/final-blit path. Use --no-postprocess for direct no-RC profiling.",
     )
     parser.add_argument("--seed", type=int, default=1337, help="World seed.")
     parser.add_argument(
@@ -176,20 +301,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-rendered-chunks", type=int, default=4096, help="Unique rendered chunk target for fly-forward mode.")
     parser.add_argument("--status-log-interval-s", type=float, default=1.0, help="Fly-forward status log interval in seconds.")
     parser.add_argument("--start-profiling-hud", action="store_true", help="Enable the profiling HUD immediately after renderer creation.")
+    parser.add_argument(
+        "--cache-numba-only",
+        action="store_true",
+        help="Compile/cache the CPU Numba terrain and meshing kernels, then exit without creating a renderer.",
+    )
     return parser
 
 
 def _summarize_launch(args: argparse.Namespace) -> str:
     rc_text = "default" if args.rc is None else ("on" if args.rc else "off")
     terrain_zstd_text = "default" if args.terrain_zstd is None else ("on" if args.terrain_zstd else "off")
+    terrain_caves_text = "default" if args.terrain_caves is None else ("on" if args.terrain_caves else "off")
     mesh_zstd_text = "default" if args.mesh_zstd is None else ("on" if args.mesh_zstd else "off")
     tile_merge_text = "default" if args.tile_merge is None else ("on" if args.tile_merge else "off")
+    postprocess_text = "default" if args.postprocess is None else ("on" if args.postprocess else "off")
     engine_text = args.engine or "configured"
     view_text = "default" if args.fixed_view is None else "×".join(str(value) for value in args.fixed_view)
     return (
         f"mode={args.benchmark_mode}, engine={engine_text}, rc={rc_text}, "
-        f"terrain_zstd={terrain_zstd_text}, mesh_zstd={mesh_zstd_text}, tile_merge={tile_merge_text}, "
-        f"view={view_text}, terrain_batch={args.terrain_batch_size or 'default'}, "
+        f"terrain_zstd={terrain_zstd_text}, terrain_caves={terrain_caves_text}, "
+        f"mesh_zstd={mesh_zstd_text}, tile_merge={tile_merge_text}, "
+        f"postprocess={postprocess_text}, view={view_text}, terrain_batch={args.terrain_batch_size or 'default'}, "
         f"mesh_batch={args.mesh_batch_size or 'default'}, chunk_budget={args.chunk_request_budget_cap or 'default'}"
     )
 
@@ -207,6 +340,12 @@ def main(argv: list[str] | None = None) -> None:
         tile_merging_enabled=args.tile_merge,
         allow_metal_fallback=bool(args.allow_metal_fallback),
     )
+
+    if args.cache_numba_only:
+        print("Info: warming Numba CPU kernel cache")
+        _warm_numba_cache()
+        print("Info: Numba CPU kernel cache warmed")
+        return
 
     print(f"Info: Minechunk launch config {_summarize_launch(args)}")
     renderer = _build_renderer_from_args(args)

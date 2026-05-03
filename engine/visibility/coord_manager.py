@@ -43,11 +43,7 @@ def rebuild_visible_missing_tracking(renderer: Any) -> None:
 
     renderer._visible_displayed_coords = displayed
     renderer._visible_display_state_dirty = False
-    renderer._chunk_request_target_coords = set()
-    renderer._chunk_request_queue.clear()
-    renderer._chunk_request_queue_origin = None
-    renderer._chunk_request_queue_view_signature = None
-    renderer._chunk_request_queue_dirty = True
+    renderer._visible_display_state_incremental = False
 
 
 @profile
@@ -58,7 +54,11 @@ def refresh_visible_chunk_set(renderer: Any) -> float:
         refresh_visible_chunk_coords(renderer)
         rebuild_visible_missing_tracking(renderer)
     elif bool(getattr(renderer, "_visible_display_state_dirty", False)):
-        rebuild_visible_missing_tracking(renderer)
+        if bool(getattr(renderer, "_visible_display_state_incremental", False)):
+            renderer._visible_display_state_dirty = False
+            renderer._visible_display_state_incremental = False
+        else:
+            rebuild_visible_missing_tracking(renderer)
     warn_if_visible_exceeds_cache(renderer)
     return (time.perf_counter() - visibility_start) * 1000.0
 
@@ -170,6 +170,7 @@ def refresh_visible_chunk_coords(renderer: Any) -> None:
     renderer._visible_prefetched_displayed_coords = displayed_coords
     renderer._visible_displayed_coords = set(displayed_coords)
     renderer._visible_display_state_dirty = False
+    renderer._visible_display_state_incremental = False
     renderer._visible_tile_dirty_keys = {
         key for key in renderer._tile_dirty_keys if key in renderer._visible_tile_key_set
     }

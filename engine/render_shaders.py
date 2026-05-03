@@ -34,16 +34,10 @@ def build_tile_merge_shader(merged_tile_max_chunks: int) -> str:
         for index in range(merged_tile_max_chunks)
     )
     source_cases = "\n".join(
-        f"        case {index}u: {{ return src_{index}.values[local_vertex]; }}"
+        f"        case {index}u: {{ return src_{index}.values[local_component]; }}"
         for index in range(merged_tile_max_chunks)
     )
     return f"""
-struct Vertex {{
-    position: vec4f,
-    normal: vec4f,
-    color: vec4f,
-}}
-
 struct MergeMeta {{
     vertex_count: u32,
     dst_first_vertex: u32,
@@ -63,7 +57,7 @@ struct MergeParams {{
 }}
 
 struct VertexBuffer {{
-    values: array<Vertex>,
+    values: array<f32>,
 }}
 
 {source_bindings}
@@ -71,11 +65,11 @@ struct VertexBuffer {{
 @group(0) @binding({merged_tile_max_chunks + 1}) var<uniform> merge_params: MergeParams;
 @group(0) @binding({merged_tile_max_chunks + 2}) var<storage, read_write> merged_vertices: VertexBuffer;
 
-fn read_source_vertex(chunk_index: u32, local_vertex: u32) -> Vertex {{
+fn read_source_component(chunk_index: u32, local_component: u32) -> f32 {{
     switch (chunk_index) {{
 {source_cases}
         default: {{
-            return src_0.values[local_vertex];
+            return src_0.values[local_component];
         }}
     }}
 }}
@@ -103,7 +97,11 @@ fn combine_main(@builtin(global_invocation_id) gid: vec3u) {{
     }}
 
     let dst_first_vertex = merge_meta.values[chunk_index].dst_first_vertex;
-    merged_vertices.values[dst_first_vertex + local_vertex] = read_source_vertex(chunk_index, local_vertex);
+    let dst_first_component = (dst_first_vertex + local_vertex) * 9u;
+    let src_first_component = local_vertex * 9u;
+    for (var component = 0u; component < 9u; component += 1u) {{
+        merged_vertices.values[dst_first_component + component] = read_source_component(chunk_index, src_first_component + component);
+    }}
 }}
 """
 

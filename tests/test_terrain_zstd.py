@@ -10,7 +10,7 @@ import pytest
 from engine.terrain.types import ChunkVoxelResult
 
 
-def _sample_voxel_result(*, empty: bool = False, boundaries: bool = True) -> ChunkVoxelResult:
+def _sample_voxel_result(*, empty: bool = False, boundaries: bool = True, fully_occluded: bool = False) -> ChunkVoxelResult:
     blocks = np.zeros((4, 6, 6), dtype=np.uint8)
     materials = np.zeros((4, 6, 6), dtype=np.uint32)
     if not empty:
@@ -30,6 +30,7 @@ def _sample_voxel_result(*, empty: bool = False, boundaries: bool = True) -> Chu
         top_boundary=top_boundary,
         bottom_boundary=bottom_boundary,
         is_empty=empty,
+        is_fully_occluded=fully_occluded,
     )
 
 
@@ -45,7 +46,7 @@ def test_chunk_voxel_zstd_round_trip_preserves_payload(empty: bool, boundaries: 
     pytest.importorskip("zstandard")
     from engine.terrain.compression import compress_chunk_voxel_result, decompress_chunk_voxel_result
 
-    result = _sample_voxel_result(empty=empty, boundaries=boundaries)
+    result = _sample_voxel_result(empty=empty, boundaries=boundaries, fully_occluded=(empty and not boundaries))
     compressed = compress_chunk_voxel_result(result)
     assert compressed.compressed_nbytes == len(compressed.payload)
     assert compressed.blocks.offset == 0
@@ -57,6 +58,7 @@ def test_chunk_voxel_zstd_round_trip_preserves_payload(empty: bool, boundaries: 
     assert (restored.chunk_x, restored.chunk_y, restored.chunk_z) == (4, 2, -3)
     assert restored.source == "test"
     assert restored.is_empty is empty
+    assert restored.is_fully_occluded is (empty and not boundaries)
     assert restored.blocks.dtype == result.blocks.dtype
     assert restored.materials.dtype == result.materials.dtype
     assert restored.blocks.flags.writeable
@@ -77,6 +79,28 @@ def test_chunk_voxel_zstd_round_trip_preserves_payload(empty: bool, boundaries: 
     assert not restored_views.materials.flags.writeable
     np.testing.assert_array_equal(restored_views.blocks, result.blocks)
     np.testing.assert_array_equal(restored_views.materials, result.materials)
+
+
+def test_chunk_voxel_zstd_round_trip_preserves_surface_mesher_payload() -> None:
+    pytest.importorskip("zstandard")
+    from engine.terrain.compression import compress_chunk_voxel_result, decompress_chunk_voxel_result
+
+    surface_heights = np.arange(36, dtype=np.uint32)
+    surface_materials = np.full(36, 1, dtype=np.uint32)
+    result = replace(
+        _sample_voxel_result(empty=True, boundaries=False),
+        surface_heights=surface_heights,
+        surface_materials=surface_materials,
+        use_surface_mesher=True,
+    )
+
+    compressed = compress_chunk_voxel_result(result)
+    restored = decompress_chunk_voxel_result(compressed)
+
+    assert compressed.use_surface_mesher is True
+    assert restored.use_surface_mesher is True
+    np.testing.assert_array_equal(restored.surface_heights, surface_heights)
+    np.testing.assert_array_equal(restored.surface_materials, surface_materials)
 
 
 def test_voxel_world_zstd_cache_eviction_and_clear() -> None:
@@ -338,12 +362,17 @@ def test_terrain_zstd_cli_defaults_and_launcher_flags() -> None:
     from main import _build_arg_parser
     from benchmark_launcher import LauncherConfig, build_entrypoint_command
 
-    assert cfg.TERRAIN_ZSTD_ENABLED is True
+    assert cfg.TERRAIN_ZSTD_ENABLED is False
     parser = _build_arg_parser()
-    assert parser.parse_args([]).terrain_zstd is None
+    assert parser.parse_args([]).terrain_zstd is False
+    assert parser.parse_args(["--terrain-zstd"]).terrain_zstd is True
     assert parser.parse_args(["--no-terrain-zstd"]).terrain_zstd is False
 
-    command = build_entrypoint_command(
-        LauncherConfig(name="test", mode="interactive", terrain_zstd_enabled=False)
+    enabled_command = build_entrypoint_command(
+        LauncherConfig(name="test", mode="interactive", terrain_zstd_enabled=True)
     )
+    command = build_entrypoint_command(
+        LauncherConfig(name="test", mode="interactive")
+    )
+    assert "--terrain-zstd" in enabled_command
     assert "--no-terrain-zstd" in command

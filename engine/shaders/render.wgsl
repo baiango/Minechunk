@@ -8,9 +8,9 @@ struct CameraUniform {
 }
 
 struct VertexInput {
-    @location(0) position: vec4f,
-    @location(1) normal: vec4f,
-    @location(2) color: vec4f,
+    @location(0) position: vec3f,
+    @location(1) normal: vec3f,
+    @location(2) color: vec3f,
 }
 
 struct VertexOutput {
@@ -36,7 +36,7 @@ fn face_direction_shade(normal: vec3f) -> f32 {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    let world = input.position.xyz;
+    let world = input.position;
     let to_point = world - camera.position.xyz;
     let view_x = dot(to_point, camera.right.xyz);
     let view_y = dot(to_point, camera.up.xyz);
@@ -50,8 +50,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let clip_y = view_y * focal;
     let clip_z = view_z * (far / (far - near)) - (near * far) / (far - near);
     out.position = vec4f(clip_x, clip_y, clip_z, view_z);
-    out.normal = normalize(input.normal.xyz);
-    out.color = input.color.xyz;
+    out.normal = normalize(input.normal);
+    out.color = input.color;
     return out;
 }
 

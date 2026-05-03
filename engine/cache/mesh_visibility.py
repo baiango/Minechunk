@@ -13,9 +13,9 @@ from ..meshing import gpu_mesher as wgpu_mesher
 from ..visibility import coord_manager
 from .tile_draw_batches import (
     MERGED_TILE_AGE_REFRESH_INTERVAL_SECONDS,
-    _finalize_direct_render_batch_groups,
     build_tile_draw_batches,
 )
+from .direct_render_batches import _finalize_direct_render_batch_groups
 
 
 def _renderer_module():
@@ -197,15 +197,15 @@ def visible_render_batches(
             return cached_batches, 0.0, cached_draw_calls, cached_merged, cached_visible, cached_vertices
 
     encode_start = time.perf_counter()
-    render_batch_groups: OrderedDict[tuple[int, int], list[tuple[wgpu.GPUBuffer, int, int, int]]] = OrderedDict()
+    direct_render_batch_groups: OrderedDict[tuple[int, int], list[object]] = OrderedDict()
     _draw_batches, merged_chunk_count, visible_chunk_count, visible_vertex_count, next_refresh_at = build_tile_draw_batches(
         renderer,
         None,
         encoder,
         age_gate=True,
-        direct_render_batch_groups=render_batch_groups,
+        direct_render_batch_groups=direct_render_batch_groups,
     )
-    render_batches = _finalize_direct_render_batch_groups(render_batch_groups)
+    render_batches = _finalize_direct_render_batch_groups(direct_render_batch_groups)
     render_encode_ms = (time.perf_counter() - encode_start) * 1000.0
     if not renderer._visible_tile_dirty_keys:
         cache_until = float(next_refresh_at)

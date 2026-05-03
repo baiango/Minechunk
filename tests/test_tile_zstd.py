@@ -194,6 +194,38 @@ def test_stale_visible_tile_batch_schedules_tile_zstd_readback() -> None:
     assert batch.vertex_buffer.destroyed is False
 
 
+def test_dirty_visible_empty_tile_clears_dirty_state_and_allows_cache() -> None:
+    from engine.cache.tile_draw_batches import build_tile_draw_batches
+
+    renderer = _fake_renderer()
+    renderer.tile_zstd_enabled = False
+    tile_key = (1, 0, 2)
+    batch, _raw = _tile_batch(tile_key)
+    renderer._tile_render_batches[tile_key] = batch
+    renderer._tile_dirty_keys = {tile_key}
+    renderer._visible_tile_dirty_keys = {tile_key}
+    renderer._tile_versions[tile_key] = 8
+    renderer._visible_tile_key_set = {tile_key}
+    renderer._visible_tile_masks = {tile_key: 3}
+    renderer._visible_active_tile_keys = []
+    renderer._visible_active_tile_key_set = set()
+    renderer._visible_tile_active_meshes = {}
+
+    draw_batches, merged, visible, vertices, next_refresh = build_tile_draw_batches(
+        renderer,
+        None,
+        FakeEncoder(),
+        age_gate=False,
+    )
+
+    assert draw_batches == []
+    assert (merged, visible, vertices, next_refresh) == (0, 0, 0, 0.0)
+    assert tile_key not in renderer._tile_render_batches
+    assert tile_key not in renderer._tile_dirty_keys
+    assert tile_key not in renderer._visible_tile_dirty_keys
+    assert renderer._cached_tile_draw_batches[(1, 1, 0)] == (0.0, [], 0, 0, 0)
+
+
 def test_tile_merging_disabled_keeps_visible_tile_batches_direct(monkeypatch) -> None:
     from engine.cache import tile_mesh_cache
     from engine.cache.tile_draw_batches import build_tile_draw_batches

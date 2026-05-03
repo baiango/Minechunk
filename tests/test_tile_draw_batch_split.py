@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import sys
 from types import SimpleNamespace
 
@@ -65,3 +66,32 @@ def test_direct_render_batch_normalization_merges_contiguous_ranges(monkeypatch)
         (vertex_buffer, 0, 12, 0),
         (other_buffer, 0, 3, 0),
     ]
+
+
+def test_grouped_render_batch_copy_is_deferred_until_merge(monkeypatch):
+    _install_import_stubs(monkeypatch)
+
+    from engine.cache.direct_render_batches import (
+        _extend_grouped_render_batch_groups,
+        _finalize_direct_render_batch_groups,
+    )
+
+    vertex_buffer = object()
+    groups = OrderedDict()
+    cached_group = (
+        ((id(vertex_buffer), 0), vertex_buffer, 0, ((vertex_buffer, 0, 4, 0),)),
+    )
+
+    _extend_grouped_render_batch_groups(groups, cached_group)
+
+    entry = next(iter(groups.values()))
+    assert isinstance(entry[2], tuple)
+    assert _finalize_direct_render_batch_groups(groups) == [(vertex_buffer, 0, 4, 0)]
+
+    _extend_grouped_render_batch_groups(
+        groups,
+        (((id(vertex_buffer), 0), vertex_buffer, 0, ((vertex_buffer, 0, 6, 4),)),),
+    )
+
+    assert isinstance(entry[2], list)
+    assert _finalize_direct_render_batch_groups(groups) == [(vertex_buffer, 0, 10, 0)]

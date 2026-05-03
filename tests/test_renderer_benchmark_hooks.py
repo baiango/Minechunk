@@ -64,11 +64,29 @@ def test_main_exposes_cli_benchmark_and_rc_flags() -> None:
     assert "--benchmark-mode" in source
     assert "--fixed-view" in source
     assert "--rc" in source
+    assert "--terrain-caves" in source
     assert "--tile-merge" in source
+    assert "--postprocess" in source
     assert "BooleanOptionalAction" in source
     assert "RADIANCE_CASCADES_ENABLED" in source
     assert "TILE_MERGING_ENABLED" in source
     assert "RendererLaunchConfig" in source
+
+
+def test_main_cache_numba_only_exits_before_renderer_creation(monkeypatch) -> None:
+    import main as main_module
+
+    warmed = []
+
+    monkeypatch.setattr(main_module, "_warm_numba_cache", lambda: warmed.append(True))
+    monkeypatch.setattr(main_module, "_build_renderer_from_args", lambda _args: (_ for _ in ()).throw(AssertionError("renderer should not be created")))
+
+    parser = main_module._build_arg_parser()
+    assert parser.parse_args(["--cache-numba-only"]).cache_numba_only is True
+
+    main_module.main(["--cache-numba-only"])
+
+    assert warmed == [True]
 
 
 def test_checked_in_engine_default_is_cpu() -> None:
@@ -102,6 +120,12 @@ def test_rc_and_tile_merging_default_off_with_launcher_toggle() -> None:
     assert main_parser.parse_args([]).tile_merge is None
     assert main_parser.parse_args(["--tile-merge"]).tile_merge is True
     assert main_parser.parse_args(["--no-tile-merge"]).tile_merge is False
+    assert main_parser.parse_args([]).postprocess is None
+    assert main_parser.parse_args(["--postprocess"]).postprocess is True
+    assert main_parser.parse_args(["--no-postprocess"]).postprocess is False
+    assert main_parser.parse_args([]).terrain_caves is None
+    assert main_parser.parse_args(["--terrain-caves"]).terrain_caves is True
+    assert main_parser.parse_args(["--no-terrain-caves"]).terrain_caves is False
 
     default_command = build_entrypoint_command(LauncherConfig(name="test", mode="interactive"))
     enabled_command = build_entrypoint_command(

@@ -57,7 +57,7 @@ def _clamp01(value: float) -> float:
     return value
 
 
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=True, inline="always")
 def _should_carve_cave(
     world_x: int,
     world_y: int,
@@ -117,12 +117,13 @@ def _terrain_material_from_surface_profile(
     surface_material: int,
     seed: int,
     world_height_limit: int,
+    carve_caves: bool = True,
 ) -> int:
     if world_y < 0 or world_y >= world_height_limit:
         return AIR
     if world_y >= surface_height:
         return AIR
-    if _should_carve_cave(world_x, world_y, world_z, surface_height, seed, world_height_limit):
+    if carve_caves and _should_carve_cave(world_x, world_y, world_z, surface_height, seed, world_height_limit):
         return AIR
     if world_y == 0:
         return BEDROCK
@@ -140,6 +141,7 @@ def terrain_block_material_at(
     world_z: int,
     seed: int,
     world_height_limit: int,
+    carve_caves: bool = True,
 ) -> int:
     if world_y < 0 or world_y >= world_height_limit:
         return AIR
@@ -153,5 +155,5 @@ def terrain_block_material_at(
         int(surface_material),
         seed,
         world_height_limit,
+        carve_caves,
     )
-
