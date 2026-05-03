@@ -25,6 +25,9 @@ chunk_prep_screen_raycast_pixel_stride = _config.chunk_prep_screen_raycast_pixel
 chunk_prep_screen_raycast_max_rays = _config.chunk_prep_screen_raycast_max_rays
 chunk_prep_screen_raycast_position_quantize_world = _config.chunk_prep_screen_raycast_position_quantize_world
 chunk_prep_screen_raycast_angle_quantize_radians = _config.chunk_prep_screen_raycast_angle_quantize_radians
+terrain_zstd_enabled = _config.TERRAIN_ZSTD_ENABLED
+mesh_zstd_enabled = _config.MESH_ZSTD_ENABLED
+tile_merging_enabled = _config.TILE_MERGING_ENABLED
 
 
 def __getattr__(name: str):
@@ -104,4 +107,3 @@ def truthy_env_flag(name: str, default: str = "") -> bool:
 
     value = os.environ.get(name, default).strip().lower()
     return value in ("1", "true", "yes", "on")
-

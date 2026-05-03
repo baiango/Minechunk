@@ -9,8 +9,8 @@ import wgpu
 
 from .. import render_contract as render_consts
 from ..meshing_types import ChunkMesh
-from ..meshing import gpu_mesher as wgpu_mesher
 from ..visibility import coord_manager
+from . import mesh_zstd, tile_zstd
 from .mesh_output_allocator import release_chunk_mesh_storage, retain_chunk_mesh_storage
 from .tile_cache_constants import MERGED_TILE_AGE_REFRESH_INTERVAL_SECONDS
 
@@ -49,6 +49,7 @@ def clear_tile_render_batches(renderer) -> None:
     for batch in renderer._tile_render_batches.values():
         if getattr(batch, "owns_vertex_buffer", False) and batch.vertex_buffer is not None:
             batch.vertex_buffer.destroy()
+    tile_zstd.clear_tile_zstd_cache(renderer)
     _destroy_merged_tile_buffer_reuse_state(renderer)
     renderer._tile_render_batches.clear()
     renderer._tile_dirty_keys.clear()
@@ -120,6 +121,69 @@ def _append_visible_active_mesh_for_key(renderer, tile_key_value, mesh) -> None:
     _sync_visible_active_tile_keys(renderer)
 
 
+def visible_tile_slot_meta_for_coord(renderer, coord: tuple[int, int, int]):
+    visible_origin = getattr(renderer, "_visible_chunk_origin", None)
+    if visible_origin is None:
+        return None
+    visible_rel_coord_to_tile_slot = getattr(renderer, "_visible_rel_coord_to_tile_slot", {})
+    rel_coord = (
+        int(coord[0]) - int(visible_origin[0]),
+        int(coord[1]) - int(visible_origin[1]),
+        int(coord[2]) - int(visible_origin[2]),
+    )
+    rel_slot = visible_rel_coord_to_tile_slot.get(rel_coord)
+    if rel_slot is None:
+        return None
+    rel_tile_key, slot_index = rel_slot
+    visible_tile_base = getattr(renderer, "_visible_tile_base", (0, 0, 0))
+    tile_key_value = (
+        int(visible_tile_base[0]) + int(rel_tile_key[0]),
+        int(visible_tile_base[1]) + int(rel_tile_key[1]),
+        int(visible_tile_base[2]) + int(rel_tile_key[2]),
+    )
+    return tile_key_value, int(slot_index)
+
+
+def remove_chunk_mesh_from_cache(
+    renderer,
+    key: tuple[int, int, int],
+    mesh: ChunkMesh,
+    *,
+    mark_visible_missing: bool = True,
+) -> bool:
+    key = (int(key[0]), int(key[1]), int(key[2]))
+    current = renderer.chunk_cache.get(key)
+    if current is not mesh:
+        return False
+
+    renderer.chunk_cache.pop(key, None)
+    mark_tile_dirty(renderer, mesh.chunk_x, mesh.chunk_z, getattr(mesh, "chunk_y", 0))
+    renderer._cached_tile_draw_batches.clear()
+    renderer._cached_visible_render_batches.clear()
+
+    slot_meta = visible_tile_slot_meta_for_coord(renderer, key)
+    if slot_meta is not None:
+        tile_key_value, slot_index = slot_meta
+        if int(getattr(mesh, "vertex_count", 0)) > 0:
+            _remove_visible_active_mesh_for_key(renderer, tile_key_value, mesh)
+        slots = getattr(renderer, "_visible_tile_mesh_slots", {}).get(tile_key_value)
+        if slots is not None and 0 <= slot_index < len(slots):
+            slots[slot_index] = None
+            _refresh_visible_tile_active_meshes_for_key(renderer, tile_key_value, slots)
+
+    renderer._visible_displayed_coords.discard(key)
+    if key in getattr(renderer, "_visible_chunk_coord_set", set()):
+        if mark_visible_missing and key not in getattr(renderer, "_pending_chunk_coords", set()):
+            renderer._visible_missing_coords.add(key)
+            renderer._chunk_request_queue_dirty = True
+        renderer._visible_display_state_dirty = True
+    else:
+        renderer._visible_missing_coords.discard(key)
+
+    release_chunk_mesh_storage(renderer, mesh)
+    return True
+
+
 @profile
 def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
     if not meshes:
@@ -131,29 +195,10 @@ def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
     release = lambda mesh: release_chunk_mesh_storage(renderer, mesh)
     retain = lambda mesh: retain_chunk_mesh_storage(renderer, mesh)
     visible_chunk_coord_set = renderer._visible_chunk_coord_set
-    visible_tile_mesh_slots = getattr(renderer, "_visible_tile_mesh_slots", {})
-    visible_origin = getattr(renderer, "_visible_chunk_origin", None)
-    visible_rel_coord_to_tile_slot = getattr(renderer, "_visible_rel_coord_to_tile_slot", {})
-    visible_tile_base = getattr(renderer, "_visible_tile_base", (0, 0, 0))
-
     def _visible_tile_slot_meta(coord):
-        if visible_origin is None:
-            return None
-        rel_coord = (
-            int(coord[0]) - int(visible_origin[0]),
-            int(coord[1]) - int(visible_origin[1]),
-            int(coord[2]) - int(visible_origin[2]),
-        )
-        rel_slot = visible_rel_coord_to_tile_slot.get(rel_coord)
-        if rel_slot is None:
-            return None
-        rel_tile_key, slot_index = rel_slot
-        tile_key_value = (
-            int(visible_tile_base[0]) + int(rel_tile_key[0]),
-            int(visible_tile_base[1]) + int(rel_tile_key[1]),
-            int(visible_tile_base[2]) + int(rel_tile_key[2]),
-        )
-        return tile_key_value, int(slot_index)
+        return visible_tile_slot_meta_for_coord(renderer, coord)
+
+    visible_tile_mesh_slots = getattr(renderer, "_visible_tile_mesh_slots", {})
 
     mesh_key_set: set[tuple[int, int, int]] = set()
 
@@ -201,29 +246,20 @@ def store_chunk_meshes(renderer, meshes: list[ChunkMesh]) -> None:
     if len(chunk_cache) <= max_cached_chunks:
         return
 
-    visible_displayed_coords = renderer._visible_displayed_coords
-    visible_missing_coords = renderer._visible_missing_coords
-    pop_oldest = chunk_cache.popitem
     queue_dirty = False
 
+    eviction_scan_budget = max(1, len(chunk_cache)) if mesh_zstd.mesh_zstd_enabled(renderer) else None
     while len(chunk_cache) > max_cached_chunks:
-        old_key, old_mesh = pop_oldest(last=False)
-        mark_tile_dirty(renderer, old_mesh.chunk_x, old_mesh.chunk_z, getattr(old_mesh, "chunk_y", 0))
-        slot_meta = _visible_tile_slot_meta(old_key)
-        if slot_meta is not None:
-            tile_key_value, slot_index = slot_meta
-            if int(getattr(old_mesh, "vertex_count", 0)) > 0:
-                _remove_visible_active_mesh_for_key(renderer, tile_key_value, old_mesh)
-            slots = visible_tile_mesh_slots.get(tile_key_value)
-            if slots is not None and 0 <= slot_index < len(slots):
-                slots[slot_index] = None
-                _refresh_visible_tile_active_meshes_for_key(renderer, tile_key_value, slots)
-        release(old_mesh)
-        if old_key in visible_chunk_coord_set:
-            visible_displayed_coords.discard(old_key)
-            if old_key not in pending_chunk_coords:
-                visible_missing_coords.add(old_key)
-                queue_dirty = True
+        old_key, old_mesh = next(iter(chunk_cache.items()))
+        if eviction_scan_budget is not None and mesh_zstd.should_keep_chunk_mesh_for_zstd(renderer, old_key):
+            chunk_cache.move_to_end(old_key)
+            eviction_scan_budget -= 1
+            if eviction_scan_budget <= 0:
+                break
+            continue
+        removed = remove_chunk_mesh_from_cache(renderer, old_key, old_mesh)
+        if removed and old_key in visible_chunk_coord_set and old_key not in pending_chunk_coords:
+            queue_dirty = True
 
     if queue_dirty:
         renderer._chunk_request_queue_dirty = True
@@ -321,6 +357,11 @@ def _queue_merged_tile_buffer_for_reuse(renderer, buffer, capacity_bytes: int) -
             buffer.destroy()
         except Exception:
             pass
+        return
+    if tile_zstd.tile_zstd_enabled(renderer):
+        from ..meshing import gpu_mesher as wgpu_mesher
+
+        wgpu_mesher.schedule_gpu_buffer_cleanup(renderer, [buffer], frames=3)
         return
     reuse_queue = getattr(renderer, "_merged_tile_buffer_reuse_queue", None)
     if reuse_queue is None:
@@ -470,6 +511,8 @@ def merge_tile_meshes(
     compute_pass.set_bind_group(0, bind_group)
     compute_pass.dispatch_workgroups(max(1, (total_vertices + 63) // 64), 1, 1)
     compute_pass.end()
+    from ..meshing import gpu_mesher as wgpu_mesher
+
     wgpu_mesher.schedule_gpu_buffer_cleanup(renderer, [metadata_buffer, params_buffer], frames=3)
     return merged_buffer, merged_buffer_capacity_bytes
 
@@ -503,4 +546,3 @@ def visible_tile_chunk_groups(renderer) -> tuple[dict[tuple[int, int, int], list
             tile_groups[tile_key_value] = chunks
             visible_count += len(chunks)
     return tile_groups, visible_count
-

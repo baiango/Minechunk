@@ -13,7 +13,6 @@ from .materials import (
     STONE,
     VERTEX_COMPONENTS,
     VERTICES_PER_FACE,
-    _scale_color,
     _terrain_color,
 )
 
@@ -130,10 +129,10 @@ def build_chunk_vertex_array(
                 base = _terrain_color(height)
 
             top = base
-            east = _scale_color(base, 0.80)
-            south = _scale_color(base, 0.72)
-            west = _scale_color(base, 0.64)
-            north = _scale_color(base, 0.60)
+            east = base
+            south = base
+            west = base
+            north = base
 
             vertex_index = _emit_quad(
                 vertices,
@@ -195,4 +194,3 @@ def build_chunk_vertex_array(
                 )
 
     return vertices, vertex_index
-

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 import numpy as np
 
@@ -24,6 +24,11 @@ else:
     WGPU_TERRAIN_IMPORT_ERROR = None
 
 from .types import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult, TerrainValidationReport
+from .compression import (
+    CompressedChunkVoxelResult,
+    compress_chunk_voxel_result,
+    decompress_chunk_voxel_result,
+)
 
 from .kernels import (
     AIR,
@@ -32,6 +37,7 @@ from .kernels import (
     STONE,
     terrain_block_material_at,
 )
+from ..render_constants import MAX_CACHED_CHUNKS, TERRAIN_ZSTD_ENABLED
 from ..world_constants import BLOCK_SIZE, CHUNK_SIZE, CHUNK_WORLD_SIZE, WORLD_HEIGHT_BLOCKS, VERTICAL_CHUNK_STACK_ENABLED
 from ..visibility.amanatides_woo import VoxelRayHit, first_hit as amanatides_woo_first_hit, line_of_sight as amanatides_woo_line_of_sight
 
@@ -133,12 +139,20 @@ class VoxelWorld:
         prefer_gpu_terrain: bool = False,
         prefer_metal_backend: bool = False,
         terrain_batch_size: int = 1 if WORLD_HEIGHT_BLOCKS > 256 else 16,
+        terrain_zstd_enabled: bool = TERRAIN_ZSTD_ENABLED,
+        terrain_zstd_cache_limit: int | None = None,
     ) -> None:
         self.seed = int(seed)
         self.chunk_size = int(CHUNK_SIZE)
         self.height = int(WORLD_HEIGHT_BLOCKS)
         self.block_size = float(BLOCK_SIZE)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
+        self.terrain_zstd_enabled = bool(terrain_zstd_enabled)
+        self._terrain_zstd_cache_limit = int(MAX_CACHED_CHUNKS if terrain_zstd_cache_limit is None else max(0, int(terrain_zstd_cache_limit)))
+        self._terrain_zstd_cache: OrderedDict[tuple[int, int, int], CompressedChunkVoxelResult] = OrderedDict()
+        self._terrain_zstd_cache_raw_bytes = 0
+        self._terrain_zstd_cache_compressed_bytes = 0
+        self._ready_cached_voxel_results: deque[CompressedChunkVoxelResult] = deque()
         self._collision_block_chunk_cache: OrderedDict[tuple[int, int, int], np.ndarray] = OrderedDict()
         try:
             self._collision_block_chunk_cache_limit = max(0, int(os.environ.get("MINECHUNK_COLLISION_CHUNK_CACHE", "256")))
@@ -178,6 +192,98 @@ class VoxelWorld:
                     self.chunk_size,
                     chunks_per_poll=self.terrain_batch_size,
                 )
+
+    def set_terrain_zstd_cache_limit(self, limit: int | None) -> None:
+        self._terrain_zstd_cache_limit = int(MAX_CACHED_CHUNKS if limit is None else max(0, int(limit)))
+        self._trim_terrain_zstd_cache()
+
+    def clear_terrain_zstd_cache(self) -> None:
+        self._terrain_zstd_cache.clear()
+        self._terrain_zstd_cache_raw_bytes = 0
+        self._terrain_zstd_cache_compressed_bytes = 0
+        self._ready_cached_voxel_results.clear()
+
+    def drop_terrain_zstd_cache_entries(self, keys) -> None:
+        drop_keys = {self._chunk_key(chunk_x, chunk_y, chunk_z) for chunk_x, chunk_y, chunk_z in keys}
+        if not drop_keys:
+            return
+        for key in drop_keys:
+            self._remove_terrain_zstd_cache_entry(key)
+        if self._ready_cached_voxel_results:
+            self._ready_cached_voxel_results = deque(
+                result
+                for result in self._ready_cached_voxel_results
+                if self._chunk_key(result.chunk_x, result.chunk_y, result.chunk_z) not in drop_keys
+            )
+
+    def terrain_zstd_cache_stats(self) -> dict[str, int | bool]:
+        return {
+            "enabled": bool(self.terrain_zstd_enabled),
+            "entries": len(self._terrain_zstd_cache),
+            "raw_bytes": int(self._terrain_zstd_cache_raw_bytes),
+            "compressed_bytes": int(self._terrain_zstd_cache_compressed_bytes),
+            "limit": int(self._terrain_zstd_cache_limit),
+        }
+
+    @staticmethod
+    def _chunk_key(chunk_x: int, chunk_y: int, chunk_z: int) -> tuple[int, int, int]:
+        return int(chunk_x), int(chunk_y), int(chunk_z)
+
+    def _remove_terrain_zstd_cache_entry(self, key: tuple[int, int, int]) -> None:
+        cached = self._terrain_zstd_cache.pop(key, None)
+        if cached is None:
+            return
+        self._terrain_zstd_cache_raw_bytes -= int(cached.raw_nbytes)
+        self._terrain_zstd_cache_compressed_bytes -= int(cached.compressed_nbytes)
+
+    def _trim_terrain_zstd_cache(self) -> None:
+        cache_limit = max(0, int(self._terrain_zstd_cache_limit))
+        while len(self._terrain_zstd_cache) > cache_limit:
+            _key, cached = self._terrain_zstd_cache.popitem(last=False)
+            self._terrain_zstd_cache_raw_bytes -= int(cached.raw_nbytes)
+            self._terrain_zstd_cache_compressed_bytes -= int(cached.compressed_nbytes)
+
+    def _store_terrain_zstd_result(self, result: ChunkVoxelResult | CompressedChunkVoxelResult) -> CompressedChunkVoxelResult | None:
+        if not self.terrain_zstd_enabled or self._terrain_zstd_cache_limit <= 0:
+            return None
+        compressed = compress_chunk_voxel_result(result)
+        key = self._chunk_key(compressed.chunk_x, compressed.chunk_y, compressed.chunk_z)
+        self._remove_terrain_zstd_cache_entry(key)
+        self._terrain_zstd_cache[key] = compressed
+        self._terrain_zstd_cache_raw_bytes += int(compressed.raw_nbytes)
+        self._terrain_zstd_cache_compressed_bytes += int(compressed.compressed_nbytes)
+        self._terrain_zstd_cache.move_to_end(key)
+        self._trim_terrain_zstd_cache()
+        return compressed
+
+    def _terrain_zstd_cache_get_compressed(
+        self,
+        chunk_x: int,
+        chunk_y: int,
+        chunk_z: int,
+        *,
+        require_meshing_boundaries: bool = False,
+    ) -> CompressedChunkVoxelResult | None:
+        if not self.terrain_zstd_enabled:
+            return None
+        key = self._chunk_key(chunk_x, chunk_y, chunk_z)
+        cached = self._terrain_zstd_cache.get(key)
+        if cached is None:
+            return None
+        if (
+            require_meshing_boundaries
+            and not bool(cached.is_empty)
+            and (cached.top_boundary is None or cached.bottom_boundary is None)
+        ):
+            return None
+        self._terrain_zstd_cache.move_to_end(key)
+        return cached
+
+    def _terrain_zstd_cache_get(self, chunk_x: int, chunk_y: int, chunk_z: int) -> ChunkVoxelResult | None:
+        cached = self._terrain_zstd_cache_get_compressed(chunk_x, chunk_y, chunk_z)
+        if cached is None:
+            return None
+        return decompress_chunk_voxel_result(cached)
 
     def _block_to_stacked_chunk_local(self, x: int, y: int, z: int) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
         chunk_x = int(x) // self.chunk_size
@@ -297,13 +403,45 @@ class VoxelWorld:
         return self._backend.chunk_surface_grids(chunk_x, chunk_z)
 
     def chunk_voxel_grid(self, chunk_x: int, chunk_y: int, chunk_z: int) -> tuple[np.ndarray, np.ndarray]:
-        return self._backend.chunk_voxel_grid(chunk_x, chunk_y, chunk_z)
+        cached = self._terrain_zstd_cache_get(chunk_x, chunk_y, chunk_z)
+        if cached is not None:
+            return cached.blocks, cached.materials
+        blocks, materials = self._backend.chunk_voxel_grid(chunk_x, chunk_y, chunk_z)
+        if self.terrain_zstd_enabled and not VERTICAL_CHUNK_STACK_ENABLED:
+            self._store_terrain_zstd_result(
+                ChunkVoxelResult(
+                    chunk_x=int(chunk_x),
+                    chunk_y=int(chunk_y),
+                    chunk_z=int(chunk_z),
+                    blocks=blocks,
+                    materials=materials,
+                    source="sync",
+                )
+            )
+        return blocks, materials
 
     def request_chunk_surface_batch(self, chunks: list[tuple[int, int, int]]) -> int:
         return self._backend.request_chunk_surface_batch(chunks)
 
     def request_chunk_voxel_batch(self, chunks: list[tuple[int, int, int]]) -> int:
-        return self._backend.request_chunk_voxel_batch(chunks)
+        normalized = [(int(chunk_x), int(chunk_y), int(chunk_z)) for chunk_x, chunk_y, chunk_z in chunks]
+        if not self.terrain_zstd_enabled:
+            return self._backend.request_chunk_voxel_batch(normalized)
+        missing: list[tuple[int, int, int]] = []
+        for chunk_x, chunk_y, chunk_z in normalized:
+            cached = self._terrain_zstd_cache_get_compressed(
+                chunk_x,
+                chunk_y,
+                chunk_z,
+                require_meshing_boundaries=bool(VERTICAL_CHUNK_STACK_ENABLED),
+            )
+            if cached is None:
+                missing.append((chunk_x, chunk_y, chunk_z))
+            else:
+                self._ready_cached_voxel_results.append(cached)
+        if missing:
+            return self._backend.request_chunk_voxel_batch(missing)
+        return 0
 
     def poll_ready_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         return self._backend.poll_ready_chunk_surface_batches()
@@ -314,25 +452,52 @@ class VoxelWorld:
             return []
         return method()
 
+    def poll_ready_chunk_voxel_payloads(self) -> list[ChunkVoxelResult | CompressedChunkVoxelResult]:
+        ready: list[ChunkVoxelResult | CompressedChunkVoxelResult] = []
+        while self._ready_cached_voxel_results:
+            ready.append(self._ready_cached_voxel_results.popleft())
+        backend_ready = self._backend.poll_ready_chunk_voxel_batches()
+        if self.terrain_zstd_enabled:
+            for result in backend_ready:
+                compressed = self._store_terrain_zstd_result(result)
+                ready.append(compressed if compressed is not None else result)
+            return ready
+        ready.extend(backend_ready)
+        return ready
+
     def poll_ready_chunk_voxel_batches(self) -> list[ChunkVoxelResult]:
-        return self._backend.poll_ready_chunk_voxel_batches()
+        return [decompress_chunk_voxel_result(result) for result in self.poll_ready_chunk_voxel_payloads()]
 
     def has_pending_chunk_surface_batches(self) -> bool:
         return self._backend.has_pending_chunk_surface_batches()
 
     def has_pending_chunk_voxel_batches(self) -> bool:
-        return self._backend.has_pending_chunk_voxel_batches()
+        return bool(self._ready_cached_voxel_results) or self._backend.has_pending_chunk_voxel_batches()
 
     def flush_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         return self._backend.flush_chunk_surface_batches()
 
+    def flush_chunk_voxel_payloads(self) -> list[ChunkVoxelResult | CompressedChunkVoxelResult]:
+        ready: list[ChunkVoxelResult | CompressedChunkVoxelResult] = []
+        while self._ready_cached_voxel_results:
+            ready.append(self._ready_cached_voxel_results.popleft())
+        backend_ready = self._backend.flush_chunk_voxel_batches()
+        if self.terrain_zstd_enabled:
+            for result in backend_ready:
+                compressed = self._store_terrain_zstd_result(result)
+                ready.append(compressed if compressed is not None else result)
+            return ready
+        ready.extend(backend_ready)
+        return ready
+
     def flush_chunk_voxel_batches(self) -> list[ChunkVoxelResult]:
-        return self._backend.flush_chunk_voxel_batches()
+        return [decompress_chunk_voxel_result(result) for result in self.flush_chunk_voxel_payloads()]
 
     def terrain_backend_label(self) -> str:
         return self._backend.terrain_backend_label()
 
     def destroy(self) -> None:
+        self.clear_terrain_zstd_cache()
         destroy = getattr(self._backend, "destroy", None)
         if destroy is None:
             return

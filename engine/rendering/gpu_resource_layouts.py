@@ -243,7 +243,7 @@ def create_gpu_bind_group_layouts(renderer) -> None:
         entries=[
             {
                 "binding": 0,
-                "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80},
+                "resource": {"buffer": self.camera_buffer, "offset": 0, "size": CAMERA_UNIFORM_BYTES},
             }
         ],
     )
@@ -438,6 +438,10 @@ def create_gpu_bind_group_layouts(renderer) -> None:
                 "visibility": wgpu.ShaderStage.FRAGMENT,
                 "buffer": {"type": "uniform"},
             },
+            {
+                "binding": 3,
+                "visibility": wgpu.ShaderStage.FRAGMENT,
+                "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+            },
         ],
     )
-

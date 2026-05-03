@@ -190,7 +190,7 @@ def encode_pending_captures(renderer: Any, encoder: Any) -> None:
                 {"binding": 8, "resource": self.worldspace_rc_visibility_views[2]},
                 {"binding": 9, "resource": self.worldspace_rc_visibility_views[3]},
                 {"binding": 10, "resource": self.postprocess_sampler},
-                {"binding": 11, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+                {"binding": 11, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": CAMERA_UNIFORM_BYTES}},
                 {"binding": 12, "resource": {"buffer": params_buffer, "offset": 0, "size": 32}},
                 {"binding": 13, "resource": {"buffer": self.worldspace_rc_volume_params_buffer, "offset": 0, "size": 256}},
             ],

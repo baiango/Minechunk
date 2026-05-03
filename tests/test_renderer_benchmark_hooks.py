@@ -64,8 +64,10 @@ def test_main_exposes_cli_benchmark_and_rc_flags() -> None:
     assert "--benchmark-mode" in source
     assert "--fixed-view" in source
     assert "--rc" in source
+    assert "--tile-merge" in source
     assert "BooleanOptionalAction" in source
     assert "RADIANCE_CASCADES_ENABLED" in source
+    assert "TILE_MERGING_ENABLED" in source
     assert "RendererLaunchConfig" in source
 
 
@@ -75,3 +77,52 @@ def test_checked_in_engine_default_is_cpu() -> None:
 
     assert "_DEFAULT_ENGINE_MODE = ENGINE_MODE_CPU" in source
     assert 'engine: str = "cpu"' in launcher
+
+
+def test_rc_and_tile_merging_default_off_with_launcher_toggle() -> None:
+    from benchmark_launcher import (
+        ENGINE_DEFAULTS,
+        LauncherConfig,
+        PRESETS,
+        _build_arg_parser as build_launcher_arg_parser,
+        _config_from_args,
+        build_entrypoint_command,
+        main as launcher_main,
+    )
+    from engine import renderer_config as cfg
+    from main import _build_arg_parser as build_main_arg_parser
+
+    assert cfg.RADIANCE_CASCADES_ENABLED is False
+    assert cfg.TILE_MERGING_ENABLED is False
+    assert ENGINE_DEFAULTS.rc_enabled is False
+    assert ENGINE_DEFAULTS.tile_merging_enabled is False
+
+    main_parser = build_main_arg_parser()
+    assert main_parser.parse_args([]).rc is None
+    assert main_parser.parse_args([]).tile_merge is None
+    assert main_parser.parse_args(["--tile-merge"]).tile_merge is True
+    assert main_parser.parse_args(["--no-tile-merge"]).tile_merge is False
+
+    default_command = build_entrypoint_command(LauncherConfig(name="test", mode="interactive"))
+    enabled_command = build_entrypoint_command(
+        LauncherConfig(name="test", mode="interactive", tile_merging_enabled=True)
+    )
+
+    assert "--no-tile-merge" in default_command
+    assert "--tile-merge" in enabled_command
+    assert "--rc" not in default_command
+    assert "--no-rc" not in default_command
+
+    launcher_parser = build_launcher_arg_parser("normal_window")
+    default_launcher_args = launcher_parser.parse_args([])
+    default_launcher_config = _config_from_args(PRESETS[default_launcher_args.preset], default_launcher_args)
+    assert launcher_main.__defaults__ == ("normal_window",)
+    assert default_launcher_args.preset == "normal_window"
+    assert default_launcher_config.mode == "interactive"
+    assert default_launcher_config.freeze_view_origin is False
+    assert default_launcher_config.freeze_camera is False
+    assert default_launcher_config.exit_when_view_ready is False
+
+    launcher_args = launcher_parser.parse_args(["--tile-merge"])
+    launcher_config = _config_from_args(LauncherConfig(name="test", mode="interactive"), launcher_args)
+    assert launcher_config.tile_merging_enabled is True

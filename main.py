@@ -23,6 +23,9 @@ def _configure_runtime_knobs(
     engine: str | None,
     chunk_request_budget_cap: int | None,
     rc_enabled: bool | None,
+    terrain_zstd_enabled: bool | None,
+    mesh_zstd_enabled: bool | None,
+    tile_merging_enabled: bool | None,
     allow_metal_fallback: bool,
 ) -> None:
     from engine import render_contract
@@ -56,6 +59,21 @@ def _configure_runtime_knobs(
         cfg.RADIANCE_CASCADES_ENABLED = bool(rc_enabled)
         render_contract.RADIANCE_CASCADES_ENABLED = bool(rc_enabled)
 
+    if terrain_zstd_enabled is not None:
+        cfg.TERRAIN_ZSTD_ENABLED = bool(terrain_zstd_enabled)
+        render_contract.TERRAIN_ZSTD_ENABLED = bool(terrain_zstd_enabled)
+        render_contract.terrain_zstd_enabled = bool(terrain_zstd_enabled)
+
+    if mesh_zstd_enabled is not None:
+        cfg.MESH_ZSTD_ENABLED = bool(mesh_zstd_enabled)
+        render_contract.MESH_ZSTD_ENABLED = bool(mesh_zstd_enabled)
+        render_contract.mesh_zstd_enabled = bool(mesh_zstd_enabled)
+
+    if tile_merging_enabled is not None:
+        cfg.TILE_MERGING_ENABLED = bool(tile_merging_enabled)
+        render_contract.TILE_MERGING_ENABLED = bool(tile_merging_enabled)
+        render_contract.tile_merging_enabled = bool(tile_merging_enabled)
+
     render_contract.engine_mode = cfg.engine_mode
     render_contract.chunk_prep_request_budget_cap = int(cfg.chunk_prep_request_budget_cap)
 
@@ -78,6 +96,9 @@ def _build_renderer_from_args(args: argparse.Namespace):
         fixed_view_dimensions=fixed_view_dimensions,
         terrain_batch_size=args.terrain_batch_size,
         mesh_batch_size=args.mesh_batch_size,
+        terrain_zstd_enabled=args.terrain_zstd,
+        mesh_zstd_enabled=args.mesh_zstd,
+        tile_merging_enabled=args.tile_merge,
         freeze_view_origin=_coalesce_bool(args.freeze_view_origin, mode == "fixed"),
         freeze_camera=_coalesce_bool(args.freeze_camera, mode == "fixed"),
         exit_when_view_ready=_coalesce_bool(args.exit_when_view_ready, False),
@@ -112,6 +133,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Enable or disable Radiance Cascades for this run. Use --no-rc for raster/no-RC profiling.",
     )
+    parser.add_argument(
+        "--terrain-zstd",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable zstd level-1 compression for CPU-side terrain chunk payloads.",
+    )
+    parser.add_argument(
+        "--mesh-zstd",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable experimental zstd readback compression for offscreen mesh buffers.",
+    )
+    parser.add_argument(
+        "--tile-merge",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable merged visible tile GPU buffers. Default is off to reduce footprint.",
+    )
     parser.add_argument("--seed", type=int, default=1337, help="World seed.")
     parser.add_argument(
         "--benchmark-mode",
@@ -142,10 +181,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _summarize_launch(args: argparse.Namespace) -> str:
     rc_text = "default" if args.rc is None else ("on" if args.rc else "off")
+    terrain_zstd_text = "default" if args.terrain_zstd is None else ("on" if args.terrain_zstd else "off")
+    mesh_zstd_text = "default" if args.mesh_zstd is None else ("on" if args.mesh_zstd else "off")
+    tile_merge_text = "default" if args.tile_merge is None else ("on" if args.tile_merge else "off")
     engine_text = args.engine or "configured"
     view_text = "default" if args.fixed_view is None else "×".join(str(value) for value in args.fixed_view)
     return (
         f"mode={args.benchmark_mode}, engine={engine_text}, rc={rc_text}, "
+        f"terrain_zstd={terrain_zstd_text}, mesh_zstd={mesh_zstd_text}, tile_merge={tile_merge_text}, "
         f"view={view_text}, terrain_batch={args.terrain_batch_size or 'default'}, "
         f"mesh_batch={args.mesh_batch_size or 'default'}, chunk_budget={args.chunk_request_budget_cap or 'default'}"
     )
@@ -159,6 +202,9 @@ def main(argv: list[str] | None = None) -> None:
         engine=args.engine,
         chunk_request_budget_cap=args.chunk_request_budget_cap,
         rc_enabled=args.rc,
+        terrain_zstd_enabled=args.terrain_zstd,
+        mesh_zstd_enabled=args.mesh_zstd,
+        tile_merging_enabled=args.tile_merge,
         allow_metal_fallback=bool(args.allow_metal_fallback),
     )
 

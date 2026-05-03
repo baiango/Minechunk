@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from bisect import bisect_left
 
 import wgpu
@@ -55,6 +55,68 @@ def mesh_output_allocator_stats(renderer) -> tuple[int, int, int, int, int, int]
     used_bytes = max(0, total_bytes - free_bytes)
     allocation_count = len(renderer._mesh_allocations)
     return slab_count, total_bytes, used_bytes, free_bytes, largest_free_bytes, allocation_count
+
+
+def _mesh_compaction_empty_stats(renderer, enabled: bool) -> dict[str, int | bool]:
+    if hasattr(renderer, "_mesh_output_slabs"):
+        slab_count, slab_total_bytes, _, _, _, _ = mesh_output_allocator_stats(renderer)
+    else:
+        slab_count = 0
+        slab_total_bytes = 0
+    return {
+        "enabled": bool(enabled),
+        "source_slabs": 0,
+        "retired_slab_bytes": 0,
+        "new_slab_bytes": 0,
+        "net_reclaimed_bytes": 0,
+        "copied_bytes": 0,
+        "moved_allocations": 0,
+        "moved_meshes": 0,
+        "pending_retired_bytes": 0,
+        "before_slab_bytes": int(slab_total_bytes),
+        "after_slab_bytes": int(slab_total_bytes),
+        "slab_count": int(slab_count),
+    }
+
+
+def _ensure_mesh_compaction_state(renderer) -> None:
+    if not hasattr(renderer, "_mesh_compaction_retired_cleanup_bytes") or renderer._mesh_compaction_retired_cleanup_bytes is None:
+        renderer._mesh_compaction_retired_cleanup_bytes = deque()
+    if not hasattr(renderer, "_mesh_compaction_last_stats") or renderer._mesh_compaction_last_stats is None:
+        renderer._mesh_compaction_last_stats = {}
+
+
+def _process_mesh_compaction_retired_bytes(renderer) -> int:
+    _ensure_mesh_compaction_state(renderer)
+    queue = renderer._mesh_compaction_retired_cleanup_bytes
+    if not queue:
+        return 0
+    next_queue = deque()
+    pending_bytes = 0
+    while queue:
+        frames_left, byte_count = queue.popleft()
+        frames_left = int(frames_left) - 1
+        byte_count = int(byte_count)
+        if frames_left > 0:
+            next_queue.append((frames_left, byte_count))
+            pending_bytes += byte_count
+    renderer._mesh_compaction_retired_cleanup_bytes = next_queue
+    return int(pending_bytes)
+
+
+def _mesh_compaction_pending_retired_bytes(renderer) -> int:
+    _ensure_mesh_compaction_state(renderer)
+    return sum(int(byte_count) for _, byte_count in renderer._mesh_compaction_retired_cleanup_bytes)
+
+
+def mesh_output_compaction_stats(renderer) -> dict[str, int | bool]:
+    _ensure_mesh_compaction_state(renderer)
+    stats = dict(getattr(renderer, "_mesh_compaction_last_stats", {}) or {})
+    if not stats:
+        enabled = bool(getattr(render_consts, "MESH_ZSTD_COMPACTION_ENABLED", True)) and bool(getattr(renderer, "mesh_zstd_enabled", False))
+        stats = _mesh_compaction_empty_stats(renderer, enabled)
+    stats["pending_retired_bytes"] = _mesh_compaction_pending_retired_bytes(renderer)
+    return stats
 
 
 def mesh_output_slab_size_for_request(renderer, request_bytes: int) -> int:
@@ -456,6 +518,348 @@ def allocate_mesh_output_range(renderer, request_bytes: int) -> MeshBufferAlloca
     return allocation
 
 
+def _mesh_zstd_readback_blocked_ids(renderer) -> tuple[set[int], set[int]]:
+    pending_buffers: set[int] = set()
+    pending_allocations: set[int] = set()
+    for pending in getattr(renderer, "_pending_mesh_zstd_readbacks", ()) or ():
+        vertex_buffer_id = int(getattr(pending, "vertex_buffer_id", 0) or 0)
+        if vertex_buffer_id:
+            pending_buffers.add(vertex_buffer_id)
+        allocation_id = getattr(pending, "allocation_id", None)
+        if allocation_id is not None:
+            pending_allocations.add(int(allocation_id))
+    return pending_buffers, pending_allocations
+
+
+def _chunk_meshes_by_allocation(renderer) -> dict[int, list[ChunkMesh]]:
+    meshes_by_allocation: dict[int, list[ChunkMesh]] = {}
+    for mesh in getattr(renderer, "chunk_cache", {}).values():
+        allocation_id = getattr(mesh, "allocation_id", None)
+        if allocation_id is None:
+            continue
+        allocation_id = int(allocation_id)
+        if allocation_id not in renderer._mesh_allocations:
+            continue
+        meshes_by_allocation.setdefault(allocation_id, []).append(mesh)
+    return meshes_by_allocation
+
+
+def _mesh_allocation_meshes_are_movable(allocation: MeshBufferAllocation, meshes: list[ChunkMesh]) -> bool:
+    if not meshes:
+        return False
+    if int(getattr(allocation, "refcount", 0)) != len(meshes):
+        return False
+    allocation_start = int(allocation.offset_bytes)
+    allocation_end = allocation_start + int(allocation.size_bytes)
+    vertex_stride = int(render_consts.VERTEX_STRIDE)
+    for mesh in meshes:
+        if mesh.vertex_buffer is not allocation.buffer:
+            return False
+        mesh_start = int(getattr(mesh, "vertex_offset", 0))
+        mesh_end = mesh_start + max(0, int(getattr(mesh, "vertex_count", 0))) * vertex_stride
+        if mesh_start < allocation_start or mesh_end > allocation_end:
+            return False
+    return True
+
+
+def _movable_mesh_allocations_by_slab(renderer) -> tuple[dict[int, list[tuple[MeshBufferAllocation, list[ChunkMesh]]]], set[int]]:
+    meshes_by_allocation = _chunk_meshes_by_allocation(renderer)
+    movable_by_slab: dict[int, list[tuple[MeshBufferAllocation, list[ChunkMesh]]]] = {}
+    blocked_slab_ids: set[int] = set()
+    slabs = getattr(renderer, "_mesh_output_slabs", {})
+    for allocation_id, allocation in list(getattr(renderer, "_mesh_allocations", {}).items()):
+        slab_id = getattr(allocation, "slab_id", None)
+        if slab_id is None or int(slab_id) not in slabs:
+            continue
+        slab_id = int(slab_id)
+        meshes = meshes_by_allocation.get(int(allocation_id), [])
+        if not _mesh_allocation_meshes_are_movable(allocation, meshes):
+            blocked_slab_ids.add(slab_id)
+            continue
+        movable_by_slab.setdefault(slab_id, []).append((allocation, meshes))
+    for slab_id in blocked_slab_ids:
+        movable_by_slab.pop(slab_id, None)
+    return movable_by_slab, blocked_slab_ids
+
+
+def _simulate_mesh_compaction_pack(renderer, allocation_sizes: list[int]) -> int:
+    alignment = max(1, int(getattr(renderer, "_mesh_output_binding_alignment", 1)))
+    simulated_slabs_by_class: dict[int, list[list[int]]] = {}
+    total_slab_bytes = 0
+    for allocation_size in sorted((int(size) for size in allocation_sizes), reverse=True):
+        needed_bytes = render_consts.align_up(max(1, allocation_size), alignment)
+        size_class_bytes = mesh_output_request_size_class(renderer, needed_bytes)
+        class_slabs = simulated_slabs_by_class.setdefault(size_class_bytes, [])
+        placed = False
+        for slab in class_slabs:
+            slab_size, append_offset = slab
+            aligned_offset = render_consts.align_up(append_offset, alignment)
+            alloc_end = aligned_offset + needed_bytes
+            if alloc_end <= slab_size:
+                slab[1] = alloc_end
+                placed = True
+                break
+        if placed:
+            continue
+        slab_size = mesh_output_slab_size_for_request(renderer, needed_bytes)
+        class_slabs.append([int(slab_size), int(needed_bytes)])
+        total_slab_bytes += int(slab_size)
+    return int(total_slab_bytes)
+
+
+def _allocate_mesh_compaction_range(
+    renderer,
+    new_slabs_by_class: dict[int, list[MeshOutputSlab]],
+    request_bytes: int,
+) -> tuple[MeshOutputSlab, int, int]:
+    alignment = max(1, int(getattr(renderer, "_mesh_output_binding_alignment", 1)))
+    needed_bytes = render_consts.align_up(max(1, int(request_bytes)), alignment)
+    size_class_bytes = mesh_output_request_size_class(renderer, needed_bytes)
+    class_slabs = new_slabs_by_class.setdefault(size_class_bytes, [])
+    for slab in class_slabs:
+        _ensure_slab_free_range_indexes(slab)
+        current_offset = int(slab.append_offset)
+        aligned_offset = render_consts.align_up(current_offset, alignment)
+        alloc_end = aligned_offset + needed_bytes
+        if alloc_end > int(slab.size_bytes):
+            continue
+        padding = aligned_offset - current_offset
+        if padding > 0:
+            _insert_slab_free_range(slab, current_offset, padding)
+        slab.append_offset = alloc_end
+        _touch_mesh_output_slab(renderer, slab)
+        return slab, int(aligned_offset), int(needed_bytes)
+
+    slab = create_mesh_output_slab(
+        renderer,
+        mesh_output_slab_size_for_request(renderer, needed_bytes),
+        size_class_bytes,
+    )
+    class_slabs.append(slab)
+    current_offset = int(slab.append_offset)
+    aligned_offset = render_consts.align_up(current_offset, alignment)
+    alloc_end = aligned_offset + needed_bytes
+    if alloc_end > int(slab.size_bytes):
+        raise RuntimeError("Failed to allocate compacted mesh output range.")
+    slab.append_offset = alloc_end
+    return slab, int(aligned_offset), int(needed_bytes)
+
+
+def _destroy_new_compaction_slabs(renderer, new_slabs_by_class: dict[int, list[MeshOutputSlab]]) -> None:
+    for class_slabs in new_slabs_by_class.values():
+        for slab in class_slabs:
+            _unindex_mesh_output_slab(renderer, slab)
+            renderer._mesh_output_slabs.pop(int(slab.slab_id), None)
+            try:
+                slab.buffer.destroy()
+            except Exception:
+                pass
+    refresh_mesh_output_append_slab(renderer)
+
+
+def _invalidate_moved_mesh_batches(renderer, affected_meshes: list[ChunkMesh]) -> None:
+    if not affected_meshes:
+        return
+    from .tile_mesh_cache import mark_tile_dirty
+
+    renderer._cached_tile_draw_batches.clear()
+    renderer._cached_visible_render_batches.clear()
+    seen_coords: set[tuple[int, int, int]] = set()
+    for mesh in affected_meshes:
+        coord = (int(mesh.chunk_x), int(getattr(mesh, "chunk_y", 0)), int(mesh.chunk_z))
+        if coord in seen_coords:
+            continue
+        seen_coords.add(coord)
+        mark_tile_dirty(renderer, coord[0], coord[2], coord[1])
+
+
+@profile
+def compact_mesh_output_slabs(
+    renderer,
+    *,
+    enabled: bool | None = None,
+    max_copy_bytes: int | None = None,
+    max_source_slabs: int | None = None,
+    min_reclaim_bytes: int | None = None,
+) -> dict[str, int | bool]:
+    _ensure_mesh_compaction_state(renderer)
+    pending_retired_bytes = _process_mesh_compaction_retired_bytes(renderer)
+    compaction_enabled = (
+        bool(getattr(render_consts, "MESH_ZSTD_COMPACTION_ENABLED", True))
+        and bool(getattr(renderer, "mesh_zstd_enabled", False))
+        if enabled is None
+        else bool(enabled)
+    )
+    stats = _mesh_compaction_empty_stats(renderer, compaction_enabled)
+    stats["pending_retired_bytes"] = int(pending_retired_bytes)
+    if not compaction_enabled:
+        renderer._mesh_compaction_last_stats = stats
+        return stats
+
+    max_copy_bytes = int(
+        getattr(render_consts, "MESH_ZSTD_COMPACTION_MAX_COPY_BYTES_PER_FRAME", 1024 * 1024 * 1024)
+        if max_copy_bytes is None
+        else max_copy_bytes
+    )
+    max_source_slabs = int(
+        getattr(render_consts, "MESH_ZSTD_COMPACTION_MAX_SOURCE_SLABS_PER_FRAME", 32)
+        if max_source_slabs is None
+        else max_source_slabs
+    )
+    min_reclaim_bytes = int(
+        getattr(render_consts, "MESH_ZSTD_COMPACTION_MIN_RECLAIM_BYTES", 32 * 1024 * 1024)
+        if min_reclaim_bytes is None
+        else min_reclaim_bytes
+    )
+    if max_copy_bytes <= 0 or max_source_slabs <= 0:
+        renderer._mesh_compaction_last_stats = stats
+        return stats
+
+    pending_buffer_ids, pending_allocation_ids = _mesh_zstd_readback_blocked_ids(renderer)
+    movable_by_slab, blocked_slab_ids = _movable_mesh_allocations_by_slab(renderer)
+    candidates: list[tuple[int, int, int, MeshOutputSlab, list[tuple[MeshBufferAllocation, list[ChunkMesh]]]]] = []
+    for slab_id, allocations in movable_by_slab.items():
+        if slab_id in blocked_slab_ids:
+            continue
+        slab = renderer._mesh_output_slabs.get(int(slab_id))
+        if slab is None:
+            continue
+        if id(slab.buffer) in pending_buffer_ids:
+            continue
+        if any(int(allocation.allocation_id) in pending_allocation_ids for allocation, _ in allocations):
+            continue
+        # Retiring the source slab is only valid if every live allocation in it
+        # was found in chunk_cache and can be moved.
+        live_allocations_in_slab = [
+            allocation
+            for allocation in renderer._mesh_allocations.values()
+            if getattr(allocation, "slab_id", None) is not None and int(allocation.slab_id) == int(slab_id)
+        ]
+        if len(live_allocations_in_slab) != len(allocations):
+            continue
+        free_bytes = slab_total_free_bytes(slab)
+        if free_bytes <= 0:
+            continue
+        live_bytes = sum(int(allocation.size_bytes) for allocation, _ in allocations)
+        if live_bytes <= 0:
+            continue
+        candidates.append((int(free_bytes), int(live_bytes), int(slab_id), slab, allocations))
+
+    if not candidates:
+        renderer._mesh_compaction_last_stats = stats
+        return stats
+
+    selected: list[tuple[int, int, int, MeshOutputSlab, list[tuple[MeshBufferAllocation, list[ChunkMesh]]]]] = []
+    selected_live_bytes = 0
+    for candidate in sorted(candidates, key=lambda item: (-item[0], item[1], item[2])):
+        if len(selected) >= max_source_slabs:
+            break
+        candidate_live_bytes = int(candidate[1])
+        if selected_live_bytes + candidate_live_bytes > max_copy_bytes:
+            continue
+        selected.append(candidate)
+        selected_live_bytes += candidate_live_bytes
+
+    if not selected:
+        renderer._mesh_compaction_last_stats = stats
+        return stats
+
+    source_slabs = [candidate[3] for candidate in selected]
+    source_slab_ids = {int(slab.slab_id) for slab in source_slabs}
+    source_total_bytes = sum(int(slab.size_bytes) for slab in source_slabs)
+    allocation_infos: list[tuple[MeshBufferAllocation, list[ChunkMesh]]] = []
+    seen_allocation_ids: set[int] = set()
+    for _, _, _, _, allocations in selected:
+        for allocation, meshes in allocations:
+            allocation_id = int(allocation.allocation_id)
+            if allocation_id in seen_allocation_ids:
+                continue
+            seen_allocation_ids.add(allocation_id)
+            allocation_infos.append((allocation, meshes))
+    allocation_infos.sort(key=lambda item: int(item[0].size_bytes), reverse=True)
+    new_total_bytes = _simulate_mesh_compaction_pack(
+        renderer,
+        [int(allocation.size_bytes) for allocation, _ in allocation_infos],
+    )
+    net_reclaimed_bytes = int(source_total_bytes) - int(new_total_bytes)
+    if net_reclaimed_bytes < max(0, min_reclaim_bytes):
+        renderer._mesh_compaction_last_stats = stats
+        return stats
+
+    new_slabs_by_class: dict[int, list[MeshOutputSlab]] = {}
+    moves: list[tuple[MeshBufferAllocation, object, int, int | None, MeshOutputSlab, int, int, list[ChunkMesh], list[int]]] = []
+    encoder = None
+    try:
+        encoder = renderer.device.create_command_encoder()
+        for allocation, meshes in allocation_infos:
+            old_buffer = allocation.buffer
+            old_offset = int(allocation.offset_bytes)
+            old_slab_id = allocation.slab_id
+            new_slab, new_offset, new_size = _allocate_mesh_compaction_range(
+                renderer,
+                new_slabs_by_class,
+                int(allocation.size_bytes),
+            )
+            encoder.copy_buffer_to_buffer(old_buffer, old_offset, new_slab.buffer, new_offset, int(allocation.size_bytes))
+            relative_offsets = [int(mesh.vertex_offset) - old_offset for mesh in meshes]
+            moves.append((allocation, old_buffer, old_offset, old_slab_id, new_slab, new_offset, new_size, meshes, relative_offsets))
+        if moves:
+            renderer.device.queue.submit([encoder.finish()])
+    except Exception:
+        _destroy_new_compaction_slabs(renderer, new_slabs_by_class)
+        renderer._mesh_compaction_last_stats = stats
+        return stats
+
+    affected_meshes: list[ChunkMesh] = []
+    vertex_stride = int(render_consts.VERTEX_STRIDE)
+    for allocation, _old_buffer, _old_offset, _old_slab_id, new_slab, new_offset, _new_size, meshes, relative_offsets in moves:
+        allocation.buffer = new_slab.buffer
+        allocation.offset_bytes = int(new_offset)
+        allocation.slab_id = int(new_slab.slab_id)
+        for mesh, relative_offset in zip(meshes, relative_offsets):
+            mesh.vertex_buffer = new_slab.buffer
+            mesh.vertex_offset = int(new_offset) + int(relative_offset)
+            mesh.binding_offset = int(mesh.vertex_offset % vertex_stride)
+            mesh.first_vertex = int((int(mesh.vertex_offset) - int(mesh.binding_offset)) // vertex_stride)
+            affected_meshes.append(mesh)
+
+    _invalidate_moved_mesh_batches(renderer, affected_meshes)
+
+    old_buffers = []
+    for slab in source_slabs:
+        _unindex_mesh_output_slab(renderer, slab)
+        renderer._mesh_output_slabs.pop(int(slab.slab_id), None)
+        old_buffers.append(slab.buffer)
+    if getattr(renderer, "_mesh_output_append_slab_id", None) in source_slab_ids:
+        refresh_mesh_output_append_slab(renderer)
+
+    if old_buffers:
+        from ..meshing import gpu_mesher as wgpu_mesher
+
+        delay_frames = max(1, int(getattr(render_consts, "MESH_OUTPUT_FREE_DELAY_FRAMES", 16)))
+        wgpu_mesher.schedule_gpu_buffer_cleanup(renderer, old_buffers, frames=delay_frames)
+        renderer._mesh_compaction_retired_cleanup_bytes.append((delay_frames, int(source_total_bytes)))
+        pending_retired_bytes = _mesh_compaction_pending_retired_bytes(renderer)
+
+    after_slab_count, after_slab_total_bytes, _, _, _, _ = mesh_output_allocator_stats(renderer)
+    stats.update(
+        {
+            "source_slabs": int(len(source_slabs)),
+            "retired_slab_bytes": int(source_total_bytes),
+            "new_slab_bytes": int(new_total_bytes),
+            "net_reclaimed_bytes": max(0, int(net_reclaimed_bytes)),
+            "copied_bytes": int(sum(int(allocation.size_bytes) for allocation, _, _, _, _, _, _, _, _ in moves)),
+            "moved_allocations": int(len(moves)),
+            "moved_meshes": int(len(affected_meshes)),
+            "pending_retired_bytes": int(pending_retired_bytes),
+            "after_slab_bytes": int(after_slab_total_bytes),
+            "slab_count": int(after_slab_count),
+        }
+    )
+    renderer._mesh_compaction_last_stats = stats
+    return stats
+
+
 @profile
 def coalesce_mesh_output_free_ranges(free_ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     if not free_ranges:
@@ -591,4 +995,3 @@ def release_chunk_mesh_storage(renderer, mesh: ChunkMesh) -> None:
         allocation.offset_bytes,
         allocation.size_bytes,
     )
-

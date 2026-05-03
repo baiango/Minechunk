@@ -227,7 +227,7 @@ def ensure_postprocess_targets(renderer) -> None:
                     {"binding": 1, "resource": self.scene_gbuffer_view},
                     {"binding": 2, "resource": prev_view},
                     {"binding": 3, "resource": self.postprocess_sampler},
-                    {"binding": 4, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+                    {"binding": 4, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": CAMERA_UNIFORM_BYTES}},
                     {"binding": 5, "resource": {"buffer": self.gi_params_buffer, "offset": 0, "size": 32}},
                     {"binding": 6, "resource": {"buffer": cascade_param_buffer, "offset": 0, "size": 32}},
                 ],
@@ -295,7 +295,7 @@ def ensure_postprocess_targets(renderer) -> None:
             {"binding": 8, "resource": self.worldspace_rc_visibility_views[2]},
             {"binding": 9, "resource": self.worldspace_rc_visibility_views[3]},
             {"binding": 10, "resource": self.postprocess_sampler},
-            {"binding": 11, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+            {"binding": 11, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": CAMERA_UNIFORM_BYTES}},
             {"binding": 12, "resource": {"buffer": self.gi_params_buffer, "offset": 0, "size": 32}},
             {"binding": 13, "resource": {"buffer": self.worldspace_rc_volume_params_buffer, "offset": 0, "size": 256}},
         ],
@@ -306,6 +306,7 @@ def ensure_postprocess_targets(renderer) -> None:
             {"binding": 0, "resource": self.scene_color_view},
             {"binding": 1, "resource": self.postprocess_sampler},
             {"binding": 2, "resource": {"buffer": self.final_present_params_buffer, "offset": 0, "size": 32}},
+            {"binding": 3, "resource": self.scene_gbuffer_view},
         ],
     )
     self.final_gi_bind_group = self.device.create_bind_group(
@@ -314,6 +315,6 @@ def ensure_postprocess_targets(renderer) -> None:
             {"binding": 0, "resource": self.gi_color_view},
             {"binding": 1, "resource": self.postprocess_sampler},
             {"binding": 2, "resource": {"buffer": self.final_present_params_buffer, "offset": 0, "size": 32}},
+            {"binding": 3, "resource": self.scene_gbuffer_view},
         ],
     )
-

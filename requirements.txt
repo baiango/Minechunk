@@ -1,6 +1,7 @@
 wgpu>=0.24
 rendercanvas>=2.2
 numpy>=1.24
+zstandard>=0.23
 # Optional acceleration for terrain kernels:
 numba>=0.60
 # Optional macOS Metal terrain/meshing backend. Install manually on macOS only:

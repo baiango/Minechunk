@@ -4,3 +4,4 @@ scalene-profile.html
 *.lprof
 lineprof.txt
 **/__pycache__
+compression_corpus/

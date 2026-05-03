@@ -51,8 +51,8 @@ fn material_color(material: u32, height: u32) -> vec3f {
     return mix(color, vec3f(1.0, 1.0, 1.0), altitude * 0.08);
 }
 
-fn face_color(material: u32, height: u32, shade: f32) -> vec3f {
-    return material_color(material, height) * shade;
+fn face_color(material: u32, height: u32, _shade: f32) -> vec3f {
+    return material_color(material, height);
 }
 
 fn emit_vertex(position: vec3f, normal: vec3f, color: vec3f, slot: u32) {

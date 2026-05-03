@@ -34,15 +34,21 @@ from .profiling_stats import (
 
 
 def refresh_profile_summary(renderer, now: float) -> None:
-    from .profiling_summary import refresh_profile_summary as _impl
+    from . import profiling_summary
 
-    return _impl(renderer, now)
+    return profiling_summary.refresh_profile_summary(renderer, now)
 
 
 def refresh_frame_breakdown_summary(renderer, now: float | None = None) -> None:
-    from .profiling_summary import refresh_frame_breakdown_summary as _impl
+    from . import profiling_summary
 
-    return _impl(renderer, now)
+    return profiling_summary.refresh_frame_breakdown_summary(renderer, now)
+
+
+def terrain_zstd_runtime_stats(renderer):
+    from . import profiling_summary
+
+    return profiling_summary.terrain_zstd_runtime_stats(renderer)
 
 __all__ = [
     "HUD_FONT",
@@ -68,4 +74,5 @@ __all__ = [
     "record_frame_breakdown_sample",
     "refresh_frame_breakdown_summary",
     "refresh_profile_summary",
+    "terrain_zstd_runtime_stats",
 ]

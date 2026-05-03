@@ -5,7 +5,22 @@ from types import SimpleNamespace
 
 
 def _install_import_stubs(monkeypatch):
-    monkeypatch.setitem(sys.modules, "wgpu", SimpleNamespace(GPUBuffer=object))
+    monkeypatch.setitem(
+        sys.modules,
+        "wgpu",
+        SimpleNamespace(
+            GPUBuffer=object,
+            BufferUsage=SimpleNamespace(
+                COPY_DST=1,
+                MAP_READ=2,
+                VERTEX=4,
+                STORAGE=8,
+                COPY_SRC=16,
+                UNIFORM=32,
+            ),
+            MapMode=SimpleNamespace(READ=1),
+        ),
+    )
     monkeypatch.setitem(
         sys.modules,
         "numpy",

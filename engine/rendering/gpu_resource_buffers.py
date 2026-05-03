@@ -10,7 +10,7 @@ def create_gpu_buffers(renderer) -> None:
     """Create long-lived renderer buffers and samplers."""
     self = renderer
     self.camera_buffer = self.device.create_buffer(
-        size=80,
+        size=CAMERA_UNIFORM_BYTES,
         usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
     )
     self._mesh_visibility_params_buffer = self.device.create_buffer(
@@ -48,4 +48,3 @@ def create_gpu_buffers(renderer) -> None:
         min_filter="linear",
         mipmap_filter="linear",
     )
-

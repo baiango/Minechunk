@@ -76,7 +76,7 @@ def submit_render(renderer, meshes=None):
                     entries=[
                         {"binding": 0, "resource": {"buffer": metadata_buffer}},
                         {"binding": 1, "resource": {"buffer": indirect_buffer}},
-                        {"binding": 2, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+                        {"binding": 2, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": CAMERA_UNIFORM_BYTES}},
                         {"binding": 3, "resource": {"buffer": params_buffer, "offset": 0, "size": 16}},
                     ],
                 )
@@ -106,7 +106,7 @@ def submit_render(renderer, meshes=None):
                     entries=[
                         {"binding": 0, "resource": {"buffer": metadata_buffer}},
                         {"binding": 1, "resource": {"buffer": indirect_buffer}},
-                        {"binding": 2, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": 80}},
+                        {"binding": 2, "resource": {"buffer": self.camera_buffer, "offset": 0, "size": CAMERA_UNIFORM_BYTES}},
                         {"binding": 3, "resource": {"buffer": params_buffer, "offset": 0, "size": 16}},
                     ],
                 )
@@ -245,4 +245,3 @@ def submit_render(renderer, meshes=None):
         "visible_vertices": visible_vertices,
     }
     return encoder, color_view, stats
-

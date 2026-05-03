@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import math
 import sys
 import time
 
 from .cache import mesh_allocator as mesh_cache
+from .cache import mesh_zstd
+from .cache import tile_zstd
 from .meshing import gpu_mesher as wgpu_mesher
+from .pipelines import chunk_pipeline as chunk_gen
 from .renderer_config import *
 from .terrain.world import VoxelWorld
 
@@ -23,6 +27,8 @@ def regenerate_world(renderer, metal_mesher, allow_metal_fallback) -> None:
     reset/cleanup matrix can be tested and evolved separately from frame drawing.
     """
     self = renderer
+    mesh_zstd.clear_mesh_zstd_cache(self)
+    tile_zstd.clear_tile_zstd_cache(self)
     for mesh in self.chunk_cache.values():
         mesh_cache.release_chunk_mesh_storage(self, mesh)
     self.chunk_cache.clear()
@@ -80,6 +86,11 @@ def regenerate_world(renderer, metal_mesher, allow_metal_fallback) -> None:
                 buffer.destroy()
             except Exception:
                 pass
+    self._mesh_compaction_retired_cleanup_bytes.clear()
+    self._mesh_compaction_last_stats = {}
+    self._memory_pressure_next_relief_at = 0.0
+    self._memory_pressure_last_relief_at = 0.0
+    self._memory_pressure_last_relief_bytes = 0
     while self._gpu_mesh_deferred_batch_resource_releases:
         _, resources = self._gpu_mesh_deferred_batch_resource_releases.popleft()
         wgpu_mesher.destroy_async_voxel_mesh_batch_resources(resources)
@@ -104,6 +115,8 @@ def regenerate_world(renderer, metal_mesher, allow_metal_fallback) -> None:
         prefer_gpu_terrain=self.use_gpu_terrain,
         prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
         terrain_batch_size=self.terrain_batch_size,
+        terrain_zstd_enabled=bool(getattr(self, "terrain_zstd_enabled", TERRAIN_ZSTD_ENABLED)),
+        terrain_zstd_cache_limit=int(getattr(self, "max_cached_chunks", MAX_CACHED_CHUNKS)),
     )
     if engine_mode == ENGINE_MODE_METAL and self.world.terrain_backend_label() != "Metal" and not _allow_metal_fallback():
         failure = getattr(self.world, "_gpu_backend_error", None)
@@ -129,4 +142,3 @@ def regenerate_world(renderer, metal_mesher, allow_metal_fallback) -> None:
     self.camera.yaw = math.pi
     self.camera.pitch = -1.20
     self.camera.clamp_pitch()
-

@@ -10,6 +10,7 @@ import wgpu
 from .pipelines import chunk_pipeline as chunk_gen
 from .pipelines import profiling as hud_profile
 from .cache import mesh_allocator as mesh_cache
+from .cache import mesh_zstd
 from .renderer_config import *
 from . import auto_exit, input_controller, profiling_runtime, render_contract, world_reset
 from .collision import walk_solver
@@ -80,10 +81,17 @@ class TerrainRenderer:
         freeze_view_origin: bool = False,
         freeze_camera: bool = False,
         exit_when_view_ready: bool = False,
+        terrain_zstd_enabled: bool | None = None,
+        mesh_zstd_enabled: bool | None = None,
+        tile_merging_enabled: bool | None = None,
     ) -> None:
         default_use_gpu = _engine_mode_uses_gpu_path()
         self.use_gpu_terrain = default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)
         self.use_gpu_meshing = default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)
+        self.terrain_zstd_enabled = bool(TERRAIN_ZSTD_ENABLED if terrain_zstd_enabled is None else terrain_zstd_enabled)
+        self.mesh_zstd_enabled = bool(MESH_ZSTD_ENABLED if mesh_zstd_enabled is None else mesh_zstd_enabled)
+        self.tile_merging_enabled = bool(TILE_MERGING_ENABLED if tile_merging_enabled is None else tile_merging_enabled)
+        self.tile_zstd_enabled = bool(TILE_ZSTD_ENABLED and self.mesh_zstd_enabled and self.tile_merging_enabled)
         self.terrain_batch_size = max(1, int(terrain_batch_size))
         if mesh_batch_size is None:
             self.mesh_batch_size = max(1, int(self.terrain_batch_size))
@@ -130,6 +138,7 @@ class TerrainRenderer:
             prefer_gpu_terrain=self.use_gpu_terrain,
             prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
+            terrain_zstd_enabled=self.terrain_zstd_enabled,
         )
         if engine_mode == ENGINE_MODE_METAL and self.world.terrain_backend_label() != "Metal" and not _allow_metal_fallback():
             failure = getattr(self.world, "_gpu_backend_error", None)
@@ -322,6 +331,18 @@ class TerrainRenderer:
         self._mesh_output_slabs_by_size_class: dict[int, OrderedDict[int, MeshOutputSlab]] = {}
         self._mesh_allocations: dict[int, MeshBufferAllocation] = {}
         self._deferred_mesh_output_frees: deque[tuple[int, int, int, int]] = deque()
+        self._mesh_zstd_cache: OrderedDict[tuple[int, int, int], object] = OrderedDict()
+        self._pending_mesh_zstd_readbacks: deque = deque()
+        self._pending_mesh_zstd_readback_keys: set[tuple[int, int, int]] = set()
+        self._tile_zstd_cache: OrderedDict[tuple[int, int, int], object] = OrderedDict()
+        self._pending_tile_zstd_readbacks: deque = deque()
+        self._pending_tile_zstd_readback_keys: set[tuple[int, int, int]] = set()
+        self._mesh_compaction_retired_cleanup_bytes: deque[tuple[int, int]] = deque()
+        self._mesh_compaction_last_stats: dict[str, int | bool] = {}
+        self._memory_pressure_next_relief_at = 0.0
+        self._memory_pressure_last_relief_at = 0.0
+        self._memory_pressure_last_relief_bytes = 0
+        self._memory_pressure_relief_calls = 0
         self._next_mesh_output_slab_id = 1
         self._mesh_output_append_slab_id: int | None = None
         self._next_mesh_allocation_id = 1
@@ -346,6 +367,8 @@ class TerrainRenderer:
         if self.fixed_view_box_mode and self.fixed_view_dimensions is not None:
             fixed_target_chunk_count = int(self.fixed_view_dimensions[0]) * int(self.fixed_view_dimensions[1]) * int(self.fixed_view_dimensions[2])
             self.max_cached_chunks = max(int(self.max_cached_chunks), fixed_target_chunk_count)
+        self.mesh_zstd_cache_limit = int(self.max_cached_chunks)
+        self.world.set_terrain_zstd_cache_limit(self.max_cached_chunks)
         self._cache_capacity_warned = False
         self._current_move_speed = self.camera.move_speed
         self.walk_mode = True
@@ -402,6 +425,9 @@ class TerrainRenderer:
             "chunk_stream": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "chunk_stream_bytes": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "chunk_displayed_added": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
+            "terrain_zstd_stream_entries": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
+            "terrain_zstd_stream_raw_bytes": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
+            "terrain_zstd_stream_compressed_bytes": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "camera_upload": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "swapchain_acquire": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
             "render_encode": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
@@ -417,6 +443,9 @@ class TerrainRenderer:
             "voxel_mesh_backlog": deque(maxlen=FRAME_BREAKDOWN_SAMPLE_WINDOW),
         }
         self.frame_breakdown_sample_sums: dict[str, float] = {name: 0.0 for name in self.frame_breakdown_samples}
+        self._terrain_zstd_total_entries = 0
+        self._terrain_zstd_total_raw_bytes = 0
+        self._terrain_zstd_total_compressed_bytes = 0
         self.frame_breakdown_lines: list[str] = []
         self.frame_breakdown_vertex_bytes = b""
         self.frame_breakdown_vertex_count = 0
@@ -486,6 +515,10 @@ class TerrainRenderer:
                 metal_mesher.shutdown_renderer_async_state(self)
             except Exception:
                 pass
+        try:
+            mesh_zstd.clear_mesh_zstd_cache(self)
+        except Exception:
+            pass
         try:
             self.world.destroy()
         except Exception:

@@ -9,11 +9,14 @@ Current defaults:
 - chunk size: `64 × 64 × 64`
 - block size: `0.1 m`
 - world height: `2000` blocks (`200 m`)
-- horizontal render radius: `16` chunks, circular in XZ
+- horizontal render radius: `8` chunks, circular in XZ
 - vertical render radius: `16` chunk layers above and below the camera
 - caves: enabled with 3D noise
 - default movement mode: AABB walk mode with gravity and collision
 - backend mode: `ENGINE_MODE_CPU`
+- Radiance Cascades: off by default
+- tile merging: off by default
+- terrain, offscreen mesh, and tile zstd compression: on by default
 
 The renderer presents through `wgpu`, while the checked-in default keeps terrain generation and meshing on the CPU path unless `MINECHUNK_ENGINE_MODE` or `--engine` selects `wgpu`/`metal`.
 
@@ -37,17 +40,18 @@ The branch exists to answer questions like:
 - `WORLD_HEIGHT_BLOCKS = 2000`
 - chunk world span: `6.4 m` per axis
 - total world height: `200 m`
+- CPU meshing uses run-length quads along the X/Z axes to reduce vertex output while keeping voxel occupancy exact
 
 ### Visibility
 
-- horizontal render radius: `16` chunks
+- horizontal render radius: `8` chunks
 - horizontal visibility shape: circular
-- horizontal visible chunk count at full radius: `797`
+- horizontal visible chunk count at full radius: `197`
 - vertical chunk radius: `16`
 - vertical streamed layer count: up to `33`
-- cache capacity: sized from horizontal visible chunks × streamed vertical layers
+- cache capacity: conservatively sized from the enclosing horizontal box × streamed vertical layers
 
-At full radius, the current cache target is built for roughly `26,301` visible chunk slots.
+At full radius, the circular visible set is roughly `6,501` chunk slots. The conservative cache target is sized from the enclosing `17 × 17 × 33` box, or `9,537` chunk slots.
 
 ## Current Runtime Path
 
@@ -62,6 +66,10 @@ At full radius, the current cache target is built for roughly `26,301` visible c
 - camera position in HUD
 - cave carving with 3D noise
 - surface hole / cave mouth support
+- final-present screen-space crease shadow from the G-buffer
+- terrain zstd cache for CPU-side terrain payloads
+- experimental zstd readback caches for offscreen mesh and tile payloads
+- aggressive mesh slab compaction after offscreen mesh compression
 
 ### Still CPU-side or conservative
 
@@ -70,6 +78,13 @@ At full radius, the current cache target is built for roughly `26,301` visible c
 - GPU visibility culling remains disabled in stacked mode
 - indirect GPU-driven visibility remains disabled in stacked mode
 - CPU terrain and CPU meshing are retained as fallback paths
+- active visible meshes stay uncompressed GPU buffers; zstd applies to CPU terrain payloads and offscreen/readback caches
+
+## Rendering Notes
+
+The default lighting path is intentionally simple. Radiance Cascades are available behind `--rc`, but the default launcher/runtime path keeps RC off for profiling.
+
+The final present pass applies a **screen-space crease shadow** from the G-buffer normal/depth texture. This is not physically correct ambient occlusion. It emphasizes screen-space depth and normal discontinuities, so it reads like darkened voxel creases or mesh-edge contrast rather than soft world-space contact AO.
 
 ## WGPU Port Notes
 
@@ -146,6 +161,11 @@ Current HUD includes:
 - backend diagnostics
 - chunk dimensions
 - mesh slab allocator stats
+- process memory: macOS footprint, RSS, and peak RSS
+- CPU tracked memory split: terrain payloads, collision cache, scratch arrays, and untracked remainder
+- GPU memory estimate split: mesh slabs, tile buffers, and transient buffers
+- terrain / mesh / tile zstd cache entries, raw bytes, compressed bytes, ratios, and pending readbacks
+- mesh slab compaction and pending retired slab bytes
 - visible / pending chunk counts
 - draw call count
 - camera position in meters
@@ -155,17 +175,14 @@ Because the HUD is built every frame, it adds real overhead. Treat on-screen num
 
 ## Why The Engine Looks Weird Compared To Game Engines
 
-Minechunk is intentionally not using the usual escape hatches.
+This branch still avoids most usual escape hatches. It does **not** rely on:
 
-This branch does **not** rely on:
-
-- greedy meshing
 - LOD
 - geometry decimation
 - far-field impostors
 - fake benchmark scenes with low residency pressure
 
-That makes the visuals harsher and the numbers more painful, but it also makes failures easier to diagnose.
+The CPU mesher now uses local X/Z run-length quads to reduce obvious vertex waste, but the engine still renders real nearby voxel terrain rather than swapping to far-field proxies. That makes the visuals harsher and the numbers more painful, but it also makes failures easier to diagnose.
 
 ## Known Limits In This Branch
 
@@ -176,7 +193,7 @@ Known limits:
 - WGPU meshing currently supports local chunk heights up to `128`, so tall worlds must stay stacked
 - the WGPU terrain surface stage still uses a readback fence before handing GPU buffers to the mesher
 - collision still evaluates terrain/block queries on CPU
-- performance at full `16 × 16 × 16` streaming can still be brutal because residency pressure is intentionally exposed
+- performance on large fixed views such as `16 × 16 × 16` can still be brutal because residency pressure is intentionally exposed
 - terrain generation is deterministic but not yet designed for gameplay-quality biome variety
 - there is no save/load, block editing gameplay loop, lighting system, or gameplay content stack yet
 
@@ -212,6 +229,7 @@ For automated profiling runs, skip the GUI with `--headless` and override indivi
 ```bash
 python3 benchmark_launcher.py --headless --preset fixed_16x16x16 --engine wgpu --view 16x16x16 --terrain-batch-size 128 --mesh-batch-size 32 --no-rc
 python3 benchmark_launcher.py --headless --wait --preset fly_forward_4096 --target-rendered-chunks 4096 --fly-speed-mps 20 --rc
+python3 benchmark_launcher.py --headless --preset fixed_16x16x16 --no-terrain-zstd --no-mesh-zstd --no-tile-merge --print-command
 ```
 
 The same options are available directly through `main.py`:
@@ -219,7 +237,15 @@ The same options are available directly through `main.py`:
 ```bash
 python3 main.py --benchmark-mode fixed --fixed-view 16x16x16 --exit-when-view-ready --no-rc
 python3 main.py --benchmark-mode fly_forward --fixed-view 16x16x16 --target-rendered-chunks 4096 --rc
+python3 main.py --benchmark-mode fixed --fixed-view 16x16x16 --no-terrain-zstd --no-mesh-zstd --no-tile-merge
 ```
+
+Useful runtime flags:
+
+- `--terrain-zstd / --no-terrain-zstd`: CPU-side terrain payload compression
+- `--mesh-zstd / --no-mesh-zstd`: experimental offscreen mesh readback compression
+- `--tile-merge / --no-tile-merge`: merged visible tile GPU buffers; default is off to reduce footprint
+- `--rc / --no-rc`: Radiance Cascades; default is off
 
 ## Backend Notes
 
@@ -266,7 +292,9 @@ Minechunk, in this branch, is an experimental tall-world voxel engine with:
 - 200 m world height
 - caves carved with 3D noise
 - walk collision with an AABB player body
-- WGPU terrain expansion and meshing for the active chunk stream
+- CPU-default terrain generation and X/Z run-length meshing, with WGPU/Metal experiments still available
+- screen-space crease shadow in the final present pass
+- terrain/mesh zstd compression experiments and memory-focused HUD accounting
 - a profiling-first runtime that favors debuggability over illusion
 
 If the branch feels rough, that is normal. The point right now is to make the architecture honest enough that backend bottlenecks can be fixed instead of hidden.

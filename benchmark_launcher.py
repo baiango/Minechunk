@@ -16,7 +16,10 @@ MAIN_ENTRYPOINT = PROJECT_ROOT / "main.py"
 @dataclass(frozen=True)
 class EngineDefaults:
     engine: str = "cpu"
-    rc_enabled: bool = True
+    rc_enabled: bool = False
+    terrain_zstd_enabled: bool = True
+    mesh_zstd_enabled: bool = True
+    tile_merging_enabled: bool = False
     terrain_batch_size: int = 128
     mesh_batch_size: int = 128
     chunk_request_budget_cap: int = 8
@@ -34,6 +37,9 @@ def _load_engine_defaults() -> EngineDefaults:
     return EngineDefaults(
         engine=str(getattr(cfg, "engine_mode", EngineDefaults.engine)),
         rc_enabled=bool(getattr(cfg, "RADIANCE_CASCADES_ENABLED", EngineDefaults.rc_enabled)),
+        terrain_zstd_enabled=bool(getattr(cfg, "TERRAIN_ZSTD_ENABLED", EngineDefaults.terrain_zstd_enabled)),
+        mesh_zstd_enabled=bool(getattr(cfg, "MESH_ZSTD_ENABLED", EngineDefaults.mesh_zstd_enabled)),
+        tile_merging_enabled=bool(getattr(cfg, "TILE_MERGING_ENABLED", EngineDefaults.tile_merging_enabled)),
         terrain_batch_size=terrain_batch,
         # The renderer defaults mesh_batch_size to terrain_batch_size when the
         # CLI leaves --mesh-batch-size unset. Mirror that default in the launcher.
@@ -58,6 +64,9 @@ class LauncherConfig:
     # engine/renderer_config.py or the renderer constructor default decide.
     engine: str | None = None
     rc_enabled: bool | None = None
+    terrain_zstd_enabled: bool = ENGINE_DEFAULTS.terrain_zstd_enabled
+    mesh_zstd_enabled: bool = ENGINE_DEFAULTS.mesh_zstd_enabled
+    tile_merging_enabled: bool = ENGINE_DEFAULTS.tile_merging_enabled
     seed: int = 1337
     view_x: int = 16
     view_y: int = 16
@@ -242,6 +251,9 @@ def build_entrypoint_command(config: LauncherConfig) -> list[str]:
         command.extend(["--engine", config.engine])
     if config.rc_enabled is not None:
         _bool_flag(command, bool(config.rc_enabled), "rc")
+    _bool_flag(command, bool(config.terrain_zstd_enabled), "terrain-zstd")
+    _bool_flag(command, bool(config.mesh_zstd_enabled), "mesh-zstd")
+    _bool_flag(command, bool(config.tile_merging_enabled), "tile-merge")
     command.extend(["--seed", str(config.seed)])
     command.extend(["--benchmark-mode", config.mode])
 
@@ -330,6 +342,9 @@ class LauncherApp:
         self.mode_var = tk.StringVar()
         self.engine_var = tk.StringVar()
         self.rc_mode_var = tk.StringVar()
+        self.terrain_zstd_var = tk.BooleanVar()
+        self.mesh_zstd_var = tk.BooleanVar()
+        self.tile_merging_var = tk.BooleanVar()
         self.seed_var = tk.StringVar()
         self.view_x_var = tk.StringVar()
         self.view_y_var = tk.StringVar()
@@ -450,6 +465,9 @@ class LauncherApp:
         misc_box.grid(row=9, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
         ttk.Checkbutton(misc_box, text="Allow Metal fallback", variable=self.allow_metal_fallback_var, command=self._update_summary).grid(row=0, column=0, sticky="w", padx=6, pady=2)
         ttk.Checkbutton(misc_box, text="Enable profiling HUD at start", variable=self.profiling_hud_var, command=self._update_summary).grid(row=0, column=1, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(misc_box, text="Compress terrain chunks with zstd", variable=self.terrain_zstd_var, command=self._update_summary).grid(row=0, column=2, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(misc_box, text="Compress offscreen mesh slabs with zstd", variable=self.mesh_zstd_var, command=self._update_summary).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=2)
+        ttk.Checkbutton(misc_box, text="Enable merged tile GPU buffers", variable=self.tile_merging_var, command=self._update_summary).grid(row=1, column=2, sticky="w", padx=6, pady=2)
 
         summary = ttk.Label(frame, textvariable=self.summary_var, foreground="#444")
         summary.grid(row=10, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 4))
@@ -476,7 +494,7 @@ class LauncherApp:
 
     def _preset_key_from_var(self) -> str:
         raw = self.preset_var.get().split(" — ", 1)[0].strip()
-        return raw if raw in PRESETS else "fixed_16x16x16"
+        return raw if raw in PRESETS else "normal_window"
 
     def _mode_key_from_var(self) -> str:
         raw = self.mode_var.get().split(" — ", 1)[0].strip().lower()
@@ -508,7 +526,7 @@ class LauncherApp:
     def _load_config(self, config: LauncherConfig) -> None:
         key = next((key for key, preset in PRESETS.items() if preset == config), None)
         if key is None:
-            key = "fixed_16x16x16"
+            key = "normal_window"
         self.preset_var.set(f"{key} — {PRESETS[key].name}")
         self.mode_var.set(f"{config.mode} — {MODE_LABELS.get(config.mode, config.mode)}")
         self.engine_var.set(ENGINE_DEFAULT_LABEL if config.engine is None else str(config.engine))
@@ -531,6 +549,9 @@ class LauncherApp:
         self.status_interval_var.set(str(config.status_log_interval_s))
         self.allow_metal_fallback_var.set(bool(config.allow_metal_fallback))
         self.profiling_hud_var.set(bool(config.start_profiling_hud))
+        self.terrain_zstd_var.set(bool(config.terrain_zstd_enabled))
+        self.mesh_zstd_var.set(bool(config.mesh_zstd_enabled))
+        self.tile_merging_var.set(bool(config.tile_merging_enabled))
         self._sync_mode_state()
         self._update_summary()
 
@@ -556,6 +577,9 @@ class LauncherApp:
                 status_log_interval_s=float(self.status_interval_var.get()),
                 allow_metal_fallback=bool(self.allow_metal_fallback_var.get()),
                 start_profiling_hud=bool(self.profiling_hud_var.get()),
+                terrain_zstd_enabled=bool(self.terrain_zstd_var.get()),
+                mesh_zstd_enabled=bool(self.mesh_zstd_var.get()),
+                tile_merging_enabled=bool(self.tile_merging_var.get()),
             )
         )
 
@@ -580,22 +604,25 @@ class LauncherApp:
         dims = "×".join(str(value) for value in config.view_dimensions)
         engine_text = config.engine.upper() if config.engine is not None else f"engine default {ENGINE_DEFAULTS.engine.upper()}"
         rc_text = "RC default " + ("on" if ENGINE_DEFAULTS.rc_enabled else "off") if config.rc_enabled is None else ("RC on" if config.rc_enabled else "RC off")
+        terrain_zstd_text = "terrain zstd on" if config.terrain_zstd_enabled else "terrain zstd off"
+        mesh_zstd_text = "mesh zstd on" if config.mesh_zstd_enabled else "mesh zstd off"
+        tile_merge_text = "tile merge on" if config.tile_merging_enabled else "tile merge off"
         terrain_text = _format_optional(config.terrain_batch_size, ENGINE_DEFAULTS.terrain_batch_size)
         mesh_text = _format_optional(config.mesh_batch_size, ENGINE_DEFAULTS.mesh_batch_size)
         cap_text = _format_optional(config.chunk_request_budget_cap, ENGINE_DEFAULTS.chunk_request_budget_cap)
         if config.mode == "fly_forward":
             text = (
                 f"{engine_text} fly CLI run: view {dims}, {config.fly_speed_mps:g} m/s, "
-                f"target {config.target_rendered_chunks} chunks, cap {cap_text}, {rc_text}."
+                f"target {config.target_rendered_chunks} chunks, cap {cap_text}, {rc_text}, {terrain_zstd_text}, {mesh_zstd_text}, {tile_merge_text}."
             )
         elif config.mode == "fixed":
             exit_text = "auto-exit" if config.exit_when_view_ready else "interactive"
             text = (
                 f"{engine_text} fixed CLI run: view {dims}, terrain batch {terrain_text}, "
-                f"mesh batch {mesh_text}, cap {cap_text}, {exit_text}, {rc_text}."
+                f"mesh batch {mesh_text}, cap {cap_text}, {exit_text}, {rc_text}, {terrain_zstd_text}, {mesh_zstd_text}, {tile_merge_text}."
             )
         else:
-            text = f"{engine_text} normal main.py launch, {rc_text}."
+            text = f"{engine_text} normal main.py launch, {rc_text}, {terrain_zstd_text}, {mesh_zstd_text}, {tile_merge_text}."
         self.summary_var.set(text)
         self.command_var.set(command_text)
 
@@ -662,6 +689,9 @@ def _config_from_args(default_config: LauncherConfig, args: argparse.Namespace) 
         ("mode", "mode"),
         ("engine", "engine"),
         ("rc", "rc_enabled"),
+        ("terrain_zstd", "terrain_zstd_enabled"),
+        ("mesh_zstd", "mesh_zstd_enabled"),
+        ("tile_merge", "tile_merging_enabled"),
         ("seed", "seed"),
         ("terrain_batch_size", "terrain_batch_size"),
         ("mesh_batch_size", "mesh_batch_size"),
@@ -696,6 +726,9 @@ def _build_arg_parser(default_preset: str) -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=MODE_CHOICES, default=None, help="Run mode override.")
     parser.add_argument("--engine", choices=ENGINE_CHOICES, default=None, help=f"Backend override. Omit for engine default ({ENGINE_DEFAULTS.engine}).")
     parser.add_argument("--rc", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable Radiance Cascades for this run. Use --no-rc to profile without RC. Omit for engine default.")
+    parser.add_argument("--terrain-zstd", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable zstd level-1 compression for CPU-side terrain chunk payloads.")
+    parser.add_argument("--mesh-zstd", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable experimental zstd readback compression for offscreen mesh buffers.")
+    parser.add_argument("--tile-merge", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable merged visible tile GPU buffers. Default is off to reduce footprint.")
     parser.add_argument("--seed", type=int, default=None, help="World seed.")
     parser.add_argument("--view", type=_parse_view_dimensions, default=None, help="View dimensions, for example 16x16x16.")
     parser.add_argument("--terrain-batch-size", type=int, default=None, help=f"Terrain backend poll/batch size. Omit for engine default ({ENGINE_DEFAULTS.terrain_batch_size}).")
@@ -713,9 +746,9 @@ def _build_arg_parser(default_preset: str) -> argparse.ArgumentParser:
     return parser
 
 
-def main(default_preset: str = "fixed_16x16x16") -> None:
+def main(default_preset: str = "normal_window") -> None:
     if default_preset not in PRESETS:
-        default_preset = "fixed_16x16x16"
+        default_preset = "normal_window"
     parser = _build_arg_parser(default_preset)
     args = parser.parse_args()
     config = _config_from_args(PRESETS[args.preset], args)

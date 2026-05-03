@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
+from engine import render_constants
+from engine.render_utils import pack_camera_uniform
 from engine.shader_loader import load_shader_text
+from engine.render_shaders import FINAL_BLIT_SHADER, GI_GBUFFER_SHADER, RENDER_SHADER
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +48,45 @@ def test_render_shader_module_stays_a_loader_not_a_shader_dump() -> None:
     assert len(source.splitlines()) < 260
     assert "WORLDSPACE_RC_TRACE_SHADER = \"\"\"" not in source
     assert "VOXEL_MESH_BATCH_SHADER = \"\"\"" not in source
+
+
+def test_render_shaders_replace_world_space_shading_constants() -> None:
+    assert "__BLOCK_SIZE__" not in RENDER_SHADER
+    assert "__BLOCK_SIZE__" not in GI_GBUFFER_SHADER
+    assert "__TERRAIN_WORLD_AO_WGSL__" not in RENDER_SHADER
+    assert "__TERRAIN_WORLD_AO_WGSL__" not in GI_GBUFFER_SHADER
+    assert "world_space_terrain_shade" not in RENDER_SHADER
+    assert "world_space_terrain_shade" not in GI_GBUFFER_SHADER
+    assert "terrain_material_at_block" not in RENDER_SHADER
+    assert "terrain_material_at_block" not in GI_GBUFFER_SHADER
+    assert "screen_space_ao" not in FINAL_BLIT_SHADER
+    assert "screen_space_crease_shadow" in FINAL_BLIT_SHADER
+    assert "crease_shadow_sample" in FINAL_BLIT_SHADER
+    assert "gbuffer_tex" in FINAL_BLIT_SHADER
+
+
+def test_render_shaders_let_gpu_clip_near_plane() -> None:
+    assert "vec4f(2.0, 2.0, 2.0, 1.0)" not in RENDER_SHADER
+    assert "vec4f(2.0, 2.0, 2.0, 1.0)" not in GI_GBUFFER_SHADER
+    assert "view_z <= camera.proj.z" not in RENDER_SHADER
+    assert "view_z <= camera.proj.z" not in GI_GBUFFER_SHADER
+
+
+def test_camera_uniform_stays_camera_only() -> None:
+    payload = pack_camera_uniform(
+        (1.0, 2.0, 3.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        1.0,
+        1.0,
+        0.01,
+        100.0,
+        (0.35, 0.90, 0.25),
+    )
+    assert len(payload) == render_constants.CAMERA_UNIFORM_BYTES
+    values = struct.unpack("<20f", payload)
+    assert values[-4:] == (1.0, 1.0, 0.009999999776482582, 100.0)
 
 
 def test_terrain_backends_load_external_shader_assets() -> None:

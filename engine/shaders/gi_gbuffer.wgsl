@@ -27,6 +27,18 @@ struct FragmentOutput {
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
+fn face_direction_shade(normal: vec3f) -> f32 {
+    let n = normalize(normal);
+    let axis = abs(n);
+    if (axis.y >= axis.x && axis.y >= axis.z) {
+        return select(0.50, 1.0, n.y >= 0.0);
+    }
+    if (axis.x >= axis.z) {
+        return select(0.64, 0.80, n.x >= 0.0);
+    }
+    return select(0.60, 0.72, n.z >= 0.0);
+}
+
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
@@ -35,14 +47,6 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let view_x = dot(to_point, camera.right.xyz);
     let view_y = dot(to_point, camera.up.xyz);
     let view_z = dot(to_point, camera.forward.xyz);
-
-    if (view_z <= camera.proj.z) {
-        out.position = vec4f(2.0, 2.0, 2.0, 1.0);
-        out.world_normal = normalize(input.normal.xyz);
-        out.color = input.color.xyz;
-        out.view_z = 0.0;
-        return out;
-    }
 
     let focal = camera.proj.x;
     let aspect = camera.proj.y;
@@ -61,7 +65,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> FragmentOutput {
     var out: FragmentOutput;
-    out.color = vec4f(input.color, 1.0);
+    out.color = vec4f(input.color * face_direction_shade(input.world_normal), 1.0);
     out.gbuffer = vec4f(input.world_normal, input.view_z);
     return out;
 }

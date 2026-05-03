@@ -21,6 +21,18 @@ struct VertexOutput {
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 
+fn face_direction_shade(normal: vec3f) -> f32 {
+    let n = normalize(normal);
+    let axis = abs(n);
+    if (axis.y >= axis.x && axis.y >= axis.z) {
+        return select(0.50, 1.0, n.y >= 0.0);
+    }
+    if (axis.x >= axis.z) {
+        return select(0.64, 0.80, n.x >= 0.0);
+    }
+    return select(0.60, 0.72, n.z >= 0.0);
+}
+
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
@@ -29,13 +41,6 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     let view_x = dot(to_point, camera.right.xyz);
     let view_y = dot(to_point, camera.up.xyz);
     let view_z = dot(to_point, camera.forward.xyz);
-
-    if (view_z <= camera.proj.z) {
-        out.position = vec4f(2.0, 2.0, 2.0, 1.0);
-        out.normal = normalize(input.normal.xyz);
-        out.color = input.color.xyz;
-        return out;
-    }
 
     let focal = camera.proj.x;
     let aspect = camera.proj.y;
@@ -55,5 +60,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4f {
     let light = normalize(vec3f(0.35, 0.90, 0.25));
     let diffuse = max(dot(input.normal, light), 0.0);
     let brightness = 0.32 + 0.68 * diffuse;
-    return vec4f(input.color * brightness, 1.0);
+    return vec4f(input.color * face_direction_shade(input.normal) * brightness, 1.0);
 }
