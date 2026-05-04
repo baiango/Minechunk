@@ -34,6 +34,9 @@ class RendererLaunchConfig:
     mesh_zstd_enabled: bool | None = False
     tile_merging_enabled: bool | None = None
     postprocess_enabled: bool | None = None
+    renderer_backend: str | None = None
+    terrain_backend: str | None = None
+    meshing_backend: str | None = None
 
 
 def _normalized_mode(mode: str) -> str:
@@ -100,6 +103,12 @@ def _renderer_kwargs(config: RendererLaunchConfig) -> dict[str, Any]:
         kwargs["tile_merging_enabled"] = bool(config.tile_merging_enabled)
     if config.postprocess_enabled is not None:
         kwargs["postprocess_enabled"] = bool(config.postprocess_enabled)
+    if config.renderer_backend is not None:
+        kwargs["renderer_backend"] = str(config.renderer_backend)
+    if config.terrain_backend is not None:
+        kwargs["terrain_backend"] = str(config.terrain_backend)
+    if config.meshing_backend is not None:
+        kwargs["meshing_backend"] = str(config.meshing_backend)
     return kwargs
 
 

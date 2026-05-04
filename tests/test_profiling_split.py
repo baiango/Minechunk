@@ -77,12 +77,23 @@ def test_profile_hud_reports_new_generated_and_rendered_chunks() -> None:
     chunk_pipeline_source = (ROOT / "engine" / "pipelines" / "chunk_pipeline.py").read_text(encoding="utf-8")
 
     assert "CHUNKS NEW GENERATED" in summary_source
+    assert "TERRAIN BACKEND" in summary_source
     assert "_profile_chunks_generated" in summary_source
     assert "_profile_chunks_rendered" in summary_source
     assert "chunk_generated" in renderer_source
     assert "chunk_rendered_added" in renderer_source
     assert "_last_new_rendered_chunks" in renderer_source
     assert "_last_chunk_stream_generated" in chunk_pipeline_source
+
+
+def test_profile_frame_time_percentiles_include_p999() -> None:
+    from types import SimpleNamespace
+
+    from engine.pipelines.profiling_stats import profile_frame_time_percentiles
+
+    renderer = SimpleNamespace(profile_window_frame_times=[value / 1000.0 for value in range(1, 1001)])
+
+    assert profile_frame_time_percentiles(renderer) == (500.0, 950.0, 990.0, 999.0)
 
 
 def test_process_memory_stats_reports_rss() -> None:

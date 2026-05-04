@@ -599,7 +599,7 @@ def refresh_profile_summary(renderer, now: float) -> None:
     renderer_module = _renderer_module()
     avg_cpu_ms = renderer.profile_window_cpu_ms / max(1, renderer.profile_window_frames)
     avg_fps = profile_average_fps(renderer)
-    frame_p50_ms, frame_p95_ms, frame_p99_ms = profile_frame_time_percentiles(renderer)
+    frame_p50_ms, frame_p95_ms, frame_p99_ms, frame_p999_ms = profile_frame_time_percentiles(renderer)
     generated_chunks = int(getattr(renderer, "_profile_chunks_generated", 0))
     rendered_chunks = int(getattr(renderer, "_profile_chunks_rendered", 0))
 
@@ -640,11 +640,12 @@ def refresh_profile_summary(renderer, now: float) -> None:
     )
     lines = [
         f"AVG FPS {avg_fps:5.1f}  CPU {avg_cpu_ms:5.1f}MS",
-        f"FRAME P50 {frame_p50_ms:5.1f}MS  P95 {frame_p95_ms:5.1f}MS  P99 {frame_p99_ms:5.1f}MS",
+        f"FRAME P50 {frame_p50_ms:5.1f}MS  P95 {frame_p95_ms:5.1f}MS  P99 {frame_p99_ms:5.1f}MS  P99.9 {frame_p999_ms:5.1f}MS",
         f"CHUNKS NEW GENERATED {generated_chunks:4d}  RENDERED {rendered_chunks:4d}",
         f"RENDER API  {renderer.render_api_label}",
         f"RENDER BACKEND {renderer.render_backend_label}",
-        f"ENGINE MODE {renderer.engine_mode_label}",
+        f"TERRAIN BACKEND {renderer.world.terrain_backend_label()}",
+        f"MESH BACKEND {renderer.mesh_backend_label}",
         f"PRESENT     FPS {renderer_module.SWAPCHAIN_MAX_FPS}  VSYNC {'ON' if renderer_module.SWAPCHAIN_USE_VSYNC else 'OFF'}",
         f"PROCESS MEM FOOT {_format_bytes_short(int(process_memory['footprint_bytes']))}  RSS {_format_bytes_short(int(process_memory['rss_bytes']))}  PEAK {_format_bytes_short(int(process_memory['peak_rss_bytes']))}",
         f"MEM MAC INT {_format_bytes_short(int(process_memory['internal_bytes']))}  IO {_format_bytes_short(int(process_memory['iokit_bytes']))}  GFX {_format_bytes_short(int(process_memory['graphics_footprint_bytes']))}  REUSE {_format_bytes_short(int(process_memory['reusable_bytes']))}  COMP {_format_bytes_short(int(process_memory['compressed_bytes']))}  RELIEF {_format_bytes_short(int(pressure_stats['last_relief_bytes']))}",

@@ -36,6 +36,16 @@ struct VoxelVertex {
     float4 color;
 };
 
+constant float CAVE_FREQUENCY_SCALE = 1.0f;
+constant float CAVE_DETAIL_FREQUENCY_MULTIPLIER = 3.0f;
+constant float CAVE_DETAIL_WEIGHT = 0.18f;
+constant int CAVE_BEDROCK_CLEARANCE = 3;
+constant float CAVE_ACTIVE_BAND_MIN = 0.58f;
+constant float CAVE_PRIMARY_THRESHOLD = 0.66f;
+constant float CAVE_VERTICAL_BONUS = 0.06f;
+constant float CAVE_DEPTH_BONUS_SCALE = 0.0015f;
+constant float CAVE_DEPTH_BONUS_MAX = 0.06f;
+
 inline uint plane_size(uint sampleSize) {
     return sampleSize * sampleSize;
 }
@@ -143,40 +153,35 @@ inline float clamp01(float value) {
 }
 
 inline bool should_carve_cave(int worldX, int worldY, int worldZ, int surfaceHeight, uint seed, uint worldHeightLimit) {
-    if (worldY <= 3) {
+    if (worldY <= CAVE_BEDROCK_CLEARANCE) {
+        return false;
+    }
+    int depthBelowSurface = surfaceHeight - worldY;
+    if (depthBelowSurface <= 0) {
         return false;
     }
     if (worldY >= int(worldHeightLimit) - 2) {
         return false;
     }
-    int depthBelowSurface = surfaceHeight - worldY;
     float normalizedY = float(worldY) / float(max(1u, worldHeightLimit - 1u));
-    float verticalBand = clamp01(1.0f - abs(normalizedY - 0.45f) * 1.6f);
-    if (verticalBand <= 0.0f) {
+    float verticalBand = 1.0f;
+    if (normalizedY > 0.45f) {
+        verticalBand = clamp01(1.0f - (normalizedY - 0.45f) * 1.6f);
+    }
+    if (verticalBand <= CAVE_ACTIVE_BAND_MIN) {
         return false;
     }
+
     float xf = float(worldX);
     float yf = float(worldY);
     float zf = float(worldZ);
-    constexpr float caveFrequencyScale = 0.5f;
-    float cavePrimary = value_noise_3d(xf, yf * 0.85f, zf, seed + 101u, 0.018f * caveFrequencyScale);
-    float caveDetail = value_noise_3d(xf, yf * 1.15f, zf, seed + 149u, 0.041666668f * caveFrequencyScale);
-    float caveShape = value_noise_3d(xf, yf * 0.35f, zf, seed + 173u, 0.009765625f * caveFrequencyScale);
-    float density = cavePrimary * 0.70f + caveDetail * 0.25f - caveShape * 0.10f;
-    float depthBonus = min(float(depthBelowSurface) * 0.004f, 0.12f);
-    float shallowBonus = depthBelowSurface <= 6 ? (6.0f - float(depthBelowSurface)) * (0.12f / 6.0f) : 0.0f;
-    float threshold = 0.62f - verticalBand * 0.08f - depthBonus - shallowBonus;
-    if (density > threshold) {
-        return true;
-    }
-    if (depthBelowSurface <= 2) {
-        float breachPrimary = value_noise_2d(xf, zf, seed + 211u, 0.020833334f);
-        float breachDetail = value_noise_3d(xf, yf, zf, seed + 233u, 0.03125f * caveFrequencyScale);
-        float breachDensity = breachPrimary * 0.65f + breachDetail * 0.35f;
-        float breachThreshold = 0.78f - verticalBand * 0.06f;
-        return breachDensity > breachThreshold;
-    }
-    return false;
+    float caveFrequency = 0.018f * CAVE_FREQUENCY_SCALE;
+    float cavePrimary = value_noise_3d(xf, yf * 0.85f, zf, seed + 101u, caveFrequency);
+    float caveDetail = value_noise_3d(xf, yf * 0.85f, zf, seed + 157u, caveFrequency * CAVE_DETAIL_FREQUENCY_MULTIPLIER);
+    float caveValue = cavePrimary + caveDetail * CAVE_DETAIL_WEIGHT;
+    float depthBonus = min(float(depthBelowSurface) * CAVE_DEPTH_BONUS_SCALE, CAVE_DEPTH_BONUS_MAX);
+    float threshold = CAVE_PRIMARY_THRESHOLD - verticalBand * CAVE_VERTICAL_BONUS - depthBonus;
+    return caveValue > threshold;
 }
 
 inline uint terrain_material_from_surface_profile(int worldX, int worldY, int worldZ, int surfaceHeight, uint surfaceMaterial, uint seed, uint worldHeightLimit) {

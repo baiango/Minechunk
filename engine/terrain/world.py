@@ -35,8 +35,8 @@ from .kernels import (
     BEDROCK,
     DIRT,
     STONE,
-    terrain_block_material_at,
 )
+from .kernels.zig_kernel import terrain_block_material_at
 from ..render_constants import MAX_CACHED_CHUNKS, TERRAIN_ZSTD_ENABLED
 from ..world_constants import BLOCK_SIZE, CHUNK_SIZE, CHUNK_WORLD_SIZE, WORLD_HEIGHT_BLOCKS, VERTICAL_CHUNK_STACK_ENABLED
 from ..visibility.amanatides_woo import VoxelRayHit, first_hit as amanatides_woo_first_hit, line_of_sight as amanatides_woo_line_of_sight
@@ -335,7 +335,7 @@ class VoxelWorld:
         # voxel payloads, not from the CPU scalar sampler below.  Sampling the
         # active backend's chunk grid keeps collision aligned with the visible
         # mesh even when WGPU/Metal use their own shader math and precision.
-        if self.terrain_backend_label() != "CPU":
+        if not self.terrain_backend_label().startswith("CPU"):
             chunk_key, local = self._block_to_stacked_chunk_local(x, y, z)
             local_x, local_y, local_z = local
             blocks = self._collision_blocks_for_chunk(*chunk_key)

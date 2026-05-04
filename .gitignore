@@ -1,7 +1,16 @@
 .DS_Store
+.venv/
+.pytest_cache/
+.mypy_cache/
 scalene-profile.json
 scalene-profile.html
 *.lprof
 lineprof.txt
 **/__pycache__
 compression_corpus/
+
+# Local build and packaging outputs
+.zig-cache/
+zig-cache/
+zig-out/
+engine/terrain/kernels/native/libminechunk_terrain.*

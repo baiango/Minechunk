@@ -1,5 +1,51 @@
 from __future__ import annotations
 
+import numpy as np
+
+
+def test_cpu_backend_label_reports_selected_numba_kernel(monkeypatch) -> None:
+    from engine.terrain.backends import cpu_terrain_backend
+
+    monkeypatch.setenv("MINECHUNK_TERRAIN_KERNEL", "numba")
+
+    backend = cpu_terrain_backend.CpuTerrainBackend(seed=1, height=32, chunk_size=4)
+
+    assert backend.terrain_backend_label() == "CPU/Numba"
+
+
+def test_cpu_backend_label_reports_selected_zig_kernel(monkeypatch) -> None:
+    from engine.terrain.backends import cpu_terrain_backend
+
+    monkeypatch.setenv("MINECHUNK_TERRAIN_KERNEL", "zig")
+
+    backend = cpu_terrain_backend.CpuTerrainBackend(seed=1, height=32, chunk_size=4)
+
+    assert backend.terrain_backend_label() == "CPU/Zig"
+
+
+def test_cpu_surface_poll_uses_batch_fill(monkeypatch) -> None:
+    from engine.terrain.backends import cpu_terrain_backend
+
+    calls = []
+
+    def fake_fill_surface_batch(heights, materials, chunk_xs, chunk_zs, chunk_size, seed, height) -> None:
+        calls.append((tuple(chunk_xs.tolist()), tuple(chunk_zs.tolist()), heights.shape))
+        for index in range(len(chunk_xs)):
+            heights[index].fill(index + 10)
+            materials[index].fill(index + 20)
+
+    monkeypatch.setattr(cpu_terrain_backend, "fill_chunk_surface_grids_batch", fake_fill_surface_batch)
+
+    backend = cpu_terrain_backend.CpuTerrainBackend(seed=1, height=32, chunk_size=4, chunks_per_poll=2)
+    backend.request_chunk_surface_batch([(3, 0, 5), (4, 0, 6), (7, 0, 8)])
+
+    ready = backend.poll_ready_chunk_surface_batches()
+
+    assert len(ready) == 2
+    assert calls == [((3, 4), (5, 6), (2, 36))]
+    np.testing.assert_array_equal(ready[0].heights, np.full(36, 10, dtype=np.uint32))
+    np.testing.assert_array_equal(ready[1].materials, np.full(36, 21, dtype=np.uint32))
+
 
 def test_cpu_voxel_poll_reuses_surface_grid_for_vertical_stack(monkeypatch) -> None:
     from engine.terrain.backends import cpu_terrain_backend

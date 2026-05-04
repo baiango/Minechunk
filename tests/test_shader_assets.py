@@ -94,3 +94,31 @@ def test_terrain_backends_load_external_shader_assets() -> None:
     metal_common = (ROOT / "engine" / "terrain" / "backends" / "metal_terrain_common.py").read_text(encoding="utf-8")
     assert 'load_shader_text("terrain_surface.wgsl")' in wgpu_common
     assert 'load_shader_text("terrain_surface.metal")' in metal_common
+
+
+def test_gpu_cave_formula_stays_shared() -> None:
+    shader_paths = [
+        SHADER_DIR / "voxel_surface_expand.wgsl",
+        ROOT / "engine" / "metal_voxel_mesher.metal",
+        SHADER_DIR / "worldspace_rc_trace.wgsl",
+    ]
+    for path in shader_paths:
+        text = path.read_text(encoding="utf-8")
+        assert "CAVE_PRIMARY_THRESHOLD" in text
+        assert "CAVE_DETAIL_FREQUENCY_MULTIPLIER" in text
+        assert "CAVE_DETAIL_WEIGHT" in text
+        assert "CAVE_DEPTH_BONUS_SCALE" in text
+        assert "CAVE_DEPTH_BONUS_MAX" in text
+        assert "value_noise_3d" in text
+        assert "seed + 101" in text
+        assert "seed + 157" in text
+        assert "0.018" in text
+        assert "CAVE_SURFACE_CLEARANCE" not in text
+        assert "CAVE_BREACH" not in text
+        assert "SURFACE_BREACH" not in text
+        assert "seed + 211" not in text
+        assert "breach_detail" not in text
+        assert "breachDetail" not in text
+        assert "abs(normalized_y - 0.45)" not in text
+        assert "abs(normalizedY - 0.45" not in text
+        assert "normalized_y > 0.45" in text or "normalizedY > 0.45" in text

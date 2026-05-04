@@ -35,9 +35,15 @@ const SAND: u32 = 5u;
 const SNOW: u32 = 6u;
 
 const TERRAIN_FREQUENCY_SCALE: f32 = 0.30000000;
-const CAVE_FREQUENCY_SCALE: f32 = 0.50000000;
-const SURFACE_BREACH_FREQUENCY_SCALE: f32 = 1.00000000;
+const CAVE_FREQUENCY_SCALE: f32 = 1.00000000;
+const CAVE_DETAIL_FREQUENCY_MULTIPLIER: f32 = 3.00000000;
+const CAVE_DETAIL_WEIGHT: f32 = 0.18000000;
 const CAVE_BEDROCK_CLEARANCE: i32 = 3;
+const CAVE_ACTIVE_BAND_MIN: f32 = 0.58000000;
+const CAVE_PRIMARY_THRESHOLD: f32 = 0.66000000;
+const CAVE_VERTICAL_BONUS: f32 = 0.06000000;
+const CAVE_DEPTH_BONUS_SCALE: f32 = 0.00150000;
+const CAVE_DEPTH_BONUS_MAX: f32 = 0.06000000;
 const GOLDEN_ANGLE: f32 = 2.39996322972865332;
 
 const SKY_VISIBILITY_STEPS: u32 = __SKY_VISIBILITY_STEPS__u;
@@ -234,47 +240,36 @@ fn should_carve_cave(world_x: i32, world_y: i32, world_z: i32, surface_height: u
     if (world_y <= CAVE_BEDROCK_CLEARANCE) {
         return false;
     }
+    let depth_below_surface_i = i32(surface_height) - world_y;
+    if (depth_below_surface_i <= 0) {
+        return false;
+    }
     if (world_y >= i32(world_height_limit()) - 2) {
         return false;
     }
 
-    let depth_below_surface = f32(i32(surface_height) - world_y);
     let normalized_y = f32(world_y) / f32(max(1u, world_height_limit() - 1u));
-    var vertical_band = 1.0 - abs(normalized_y - 0.45) * 1.6;
-    vertical_band = saturate(vertical_band);
-    if (vertical_band <= 0.0) {
-        return false;
+    var vertical_band = 1.0;
+    if (normalized_y > 0.45) {
+        vertical_band = saturate(1.0 - (normalized_y - 0.45) * 1.6);
     }
 
     let seed = seed_u32();
+    if (vertical_band <= CAVE_ACTIVE_BAND_MIN) {
+        return false;
+    }
+
     let xf = f32(world_x);
     let yf = f32(world_y);
     let zf = f32(world_z);
-    let cave_primary = value_noise_3d(xf, yf * 0.85, zf, seed + 101u, 0.018 * CAVE_FREQUENCY_SCALE);
-    let cave_detail = value_noise_3d(xf, yf * 1.15, zf, seed + 149u, 0.041666668 * CAVE_FREQUENCY_SCALE);
-    let cave_shape = value_noise_3d(xf, yf * 0.35, zf, seed + 173u, 0.009765625 * CAVE_FREQUENCY_SCALE);
-    let density = cave_primary * 0.70 + cave_detail * 0.25 - cave_shape * 0.10;
-
-    let depth_bonus = min(depth_below_surface * 0.004, 0.12);
-    var shallow_bonus = 0.0;
-    if (depth_below_surface <= 6.0) {
-        shallow_bonus = (6.0 - depth_below_surface) * (0.12 / 6.0);
-    }
-
-    let threshold = 0.62 - vertical_band * 0.08 - depth_bonus - shallow_bonus;
-    if (density > threshold) {
-        return true;
-    }
-
-    if (depth_below_surface <= 2.0) {
-        let breach_primary = value_noise_2d(xf, zf, seed + 211u, 0.020833334 * SURFACE_BREACH_FREQUENCY_SCALE);
-        let breach_detail = value_noise_3d(xf, yf, zf, seed + 233u, 0.03125 * CAVE_FREQUENCY_SCALE);
-        let breach_density = breach_primary * 0.65 + breach_detail * 0.35;
-        let breach_threshold = 0.78 - vertical_band * 0.06;
-        return breach_density > breach_threshold;
-    }
-
-    return false;
+    let cave_frequency = 0.018 * CAVE_FREQUENCY_SCALE;
+    let cave_primary = value_noise_3d(xf, yf * 0.85, zf, seed + 101u, cave_frequency);
+    let cave_detail = value_noise_3d(xf, yf * 0.85, zf, seed + 157u, cave_frequency * CAVE_DETAIL_FREQUENCY_MULTIPLIER);
+    let cave_value = cave_primary + cave_detail * CAVE_DETAIL_WEIGHT;
+    let depth_below_surface = f32(depth_below_surface_i);
+    let depth_bonus = min(depth_below_surface * CAVE_DEPTH_BONUS_SCALE, CAVE_DEPTH_BONUS_MAX);
+    let threshold = CAVE_PRIMARY_THRESHOLD - vertical_band * CAVE_VERTICAL_BONUS - depth_bonus;
+    return cave_value > threshold;
 }
 
 fn material_at_block(world_x: i32, world_y: i32, world_z: i32) -> u32 {

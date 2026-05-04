@@ -37,6 +37,16 @@ struct ChunkCoordBuffer {
 @group(0) @binding(4) var<uniform> params: ExpandParams;
 @group(0) @binding(5) var<storage, read> chunk_coords: ChunkCoordBuffer;
 
+const CAVE_FREQUENCY_SCALE: f32 = 1.0;
+const CAVE_DETAIL_FREQUENCY_MULTIPLIER: f32 = 3.0;
+const CAVE_DETAIL_WEIGHT: f32 = 0.18;
+const CAVE_BEDROCK_CLEARANCE: i32 = 3;
+const CAVE_ACTIVE_BAND_MIN: f32 = 0.58;
+const CAVE_PRIMARY_THRESHOLD: f32 = 0.66;
+const CAVE_VERTICAL_BONUS: f32 = 0.06;
+const CAVE_DEPTH_BONUS_SCALE: f32 = 0.0015;
+const CAVE_DEPTH_BONUS_MAX: f32 = 0.06;
+
 fn mix_u32(value: u32) -> u32 {
     var x = value;
     x = x ^ (x >> 16u);
@@ -143,53 +153,41 @@ fn clamp01(value: f32) -> f32 {
 }
 
 fn should_carve_cave(world_x: i32, world_y: i32, world_z: i32, surface_height: i32, seed: u32, world_height_limit: u32) -> bool {
-    if (world_y <= 3) {
+    if (world_y <= CAVE_BEDROCK_CLEARANCE) {
+        return false;
+    }
+    let depth_below_surface = surface_height - world_y;
+    if (depth_below_surface <= 0) {
         return false;
     }
     if (world_y >= i32(world_height_limit) - 2) {
         return false;
     }
 
-    let depth_below_surface = surface_height - world_y;
     let normalized_y = f32(world_y) / f32(max(1u, world_height_limit - 1u));
-    let vertical_band = clamp01(1.0 - abs(normalized_y - 0.45) * 1.6);
-    if (vertical_band <= 0.0) {
+    var vertical_band = 1.0;
+    if (normalized_y > 0.45) {
+        vertical_band = clamp01(1.0 - (normalized_y - 0.45) * 1.6);
+    }
+    if (vertical_band <= CAVE_ACTIVE_BAND_MIN) {
         return false;
     }
 
     let xf = f32(world_x);
     let yf = f32(world_y);
     let zf = f32(world_z);
-    let cave_frequency_scale = 0.5;
-    let cave_primary = value_noise_3d(xf, yf * 0.85, zf, seed + 101u, 0.018 * cave_frequency_scale);
-    let cave_detail = value_noise_3d(xf, yf * 1.15, zf, seed + 149u, 0.041666668 * cave_frequency_scale);
-    let cave_shape = value_noise_3d(xf, yf * 0.35, zf, seed + 173u, 0.009765625 * cave_frequency_scale);
-    let density = cave_primary * 0.70 + cave_detail * 0.25 - cave_shape * 0.10;
+    let cave_frequency = 0.018 * CAVE_FREQUENCY_SCALE;
+    let cave_primary = value_noise_3d(xf, yf * 0.85, zf, seed + 101u, cave_frequency);
+    let cave_detail = value_noise_3d(xf, yf * 0.85, zf, seed + 157u, cave_frequency * CAVE_DETAIL_FREQUENCY_MULTIPLIER);
+    let cave_value = cave_primary + cave_detail * CAVE_DETAIL_WEIGHT;
 
-    var depth_bonus = f32(depth_below_surface) * 0.004;
-    if (depth_bonus > 0.12) {
-        depth_bonus = 0.12;
+    var depth_bonus = f32(depth_below_surface) * CAVE_DEPTH_BONUS_SCALE;
+    if (depth_bonus > CAVE_DEPTH_BONUS_MAX) {
+        depth_bonus = CAVE_DEPTH_BONUS_MAX;
     }
 
-    var shallow_bonus = 0.0;
-    if (depth_below_surface <= 6) {
-        shallow_bonus = (6.0 - f32(depth_below_surface)) * (0.12 / 6.0);
-    }
-
-    let threshold = 0.62 - vertical_band * 0.08 - depth_bonus - shallow_bonus;
-    if (density > threshold) {
-        return true;
-    }
-
-    if (depth_below_surface <= 2) {
-        let breach_primary = value_noise_2d(xf, zf, seed + 211u, 0.020833334);
-        let breach_detail = value_noise_3d(xf, yf, zf, seed + 233u, 0.03125 * cave_frequency_scale);
-        let breach_density = breach_primary * 0.65 + breach_detail * 0.35;
-        let breach_threshold = 0.78 - vertical_band * 0.06;
-        return breach_density > breach_threshold;
-    }
-
-    return false;
+    let threshold = CAVE_PRIMARY_THRESHOLD - vertical_band * CAVE_VERTICAL_BONUS - depth_bonus;
+    return cave_value > threshold;
 }
 
 fn terrain_material_from_surface_profile(world_x: i32, world_y: i32, world_z: i32, surface_height: i32, surface_material: u32, seed: u32, world_height_limit: u32) -> u32 {

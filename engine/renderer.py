@@ -63,6 +63,13 @@ def _engine_mode_uses_gpu_path() -> bool:
     return engine_mode != ENGINE_MODE_CPU
 
 
+def _normalize_backend_choice(value: str | None, *, default: str, supported: tuple[str, ...]) -> str:
+    selected = default if value is None else str(value).strip().lower()
+    if selected not in supported:
+        raise ValueError(f"backend must be one of: {', '.join(supported)}")
+    return selected
+
+
 def _allow_metal_fallback() -> bool:
     return render_contract.truthy_env_flag("MINECHUNK_ALLOW_METAL_FALLBACK")
 
@@ -86,10 +93,21 @@ class TerrainRenderer:
         tile_merging_enabled: bool | None = None,
         postprocess_enabled: bool | None = None,
         terrain_caves_enabled: bool | None = None,
+        renderer_backend: str | None = None,
+        terrain_backend: str | None = None,
+        meshing_backend: str | None = None,
     ) -> None:
         default_use_gpu = _engine_mode_uses_gpu_path()
-        self.use_gpu_terrain = default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)
-        self.use_gpu_meshing = default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)
+        default_gpu_backend = ENGINE_MODE_METAL if engine_mode == ENGINE_MODE_METAL else ENGINE_MODE_WGPU
+        if terrain_backend is None:
+            terrain_backend = default_gpu_backend if (default_use_gpu if use_gpu_terrain is None else bool(use_gpu_terrain)) else ENGINE_MODE_CPU
+        if meshing_backend is None:
+            meshing_backend = default_gpu_backend if (default_use_gpu if use_gpu_meshing is None else bool(use_gpu_meshing)) else ENGINE_MODE_CPU
+        self.renderer_backend_kind = _normalize_backend_choice(renderer_backend, default=ENGINE_MODE_WGPU, supported=(ENGINE_MODE_WGPU,))
+        self.terrain_backend_kind = _normalize_backend_choice(terrain_backend, default=ENGINE_MODE_CPU, supported=(ENGINE_MODE_CPU, ENGINE_MODE_WGPU, ENGINE_MODE_METAL))
+        self.meshing_backend_kind = _normalize_backend_choice(meshing_backend, default=ENGINE_MODE_CPU, supported=(ENGINE_MODE_CPU, ENGINE_MODE_WGPU, ENGINE_MODE_METAL))
+        self.use_gpu_terrain = self.terrain_backend_kind != ENGINE_MODE_CPU
+        self.use_gpu_meshing = self.meshing_backend_kind != ENGINE_MODE_CPU
         self.terrain_zstd_enabled = bool(TERRAIN_ZSTD_ENABLED if terrain_zstd_enabled is None else terrain_zstd_enabled)
         self.terrain_caves_enabled = True if terrain_caves_enabled is None else bool(terrain_caves_enabled)
         self.mesh_zstd_enabled = bool(MESH_ZSTD_ENABLED if mesh_zstd_enabled is None else mesh_zstd_enabled)
@@ -102,7 +120,7 @@ class TerrainRenderer:
             self.mesh_batch_size = max(1, int(mesh_batch_size))
         self._pending_surface_gpu_batch_target_multiplier = 2 if CHUNK_SIZE >= 64 else 10
         self.base_title = "Minechunk"
-        self.engine_mode_label = engine_mode
+        self.engine_mode_label = f"render={self.renderer_backend_kind} terrain={self.terrain_backend_kind} meshing={self.meshing_backend_kind}"
         self.canvas = RenderCanvas(
             title=self.base_title,
             size=(1280, 800),
@@ -139,21 +157,23 @@ class TerrainRenderer:
             seed,
             gpu_device=self.device,
             prefer_gpu_terrain=self.use_gpu_terrain,
-            prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
+            prefer_metal_backend=self.terrain_backend_kind == ENGINE_MODE_METAL,
             terrain_batch_size=self.terrain_batch_size,
             terrain_zstd_enabled=self.terrain_zstd_enabled,
             terrain_caves_enabled=self.terrain_caves_enabled,
         )
-        if engine_mode == ENGINE_MODE_METAL and self.world.terrain_backend_label() != "Metal" and not _allow_metal_fallback():
+        if self.terrain_backend_kind == ENGINE_MODE_METAL and self.world.terrain_backend_label() != "Metal" and not _allow_metal_fallback():
             failure = getattr(self.world, "_gpu_backend_error", None)
             detail = f" ({type(failure).__name__}: {failure!s})" if failure is not None else ""
             raise RuntimeError(
-                "ENGINE_MODE_METAL was requested, but the active terrain backend is "
+                "Metal terrain backend was requested, but the active terrain backend is "
                 f"{self.world.terrain_backend_label()!r}{detail}. Refusing CPU/WGPU fallback. "
                 "Run `python3 -m pip install -r requirements.txt`, or launch with --allow-metal-fallback."
             )
         self.mesh_backend_label = "CPU"
-        self._using_metal_meshing = bool(self.use_gpu_meshing and engine_mode == ENGINE_MODE_METAL and metal_mesher is not None)
+        self._using_metal_meshing = bool(self.use_gpu_meshing and self.meshing_backend_kind == ENGINE_MODE_METAL and metal_mesher is not None)
+        if self.use_gpu_meshing and self.meshing_backend_kind == ENGINE_MODE_METAL and metal_mesher is None and not _allow_metal_fallback():
+            raise RuntimeError("Metal meshing backend was requested, but the optional Metal mesher is unavailable.")
         if self.use_gpu_meshing:
             self.mesh_backend_label = "Metal" if self._using_metal_meshing else "Wgpu"
         if self._using_metal_meshing and metal_mesher is not None:
@@ -675,11 +695,16 @@ class TerrainRenderer:
     def _current_chunk_origin(self) -> tuple[int, int, int]:
         current = self._camera_chunk_origin()
         if self.fixed_view_box_mode and VERTICAL_CHUNK_STACK_ENABLED:
-            min_origin_y = int(self._view_extent_neg_y)
-            max_origin_y = max(min_origin_y, int(VERTICAL_CHUNK_COUNT - 1 - self._view_extent_pos_y))
+            world_layers = max(1, int(VERTICAL_CHUNK_COUNT))
+            requested_layers = max(1, int(self._view_extent_neg_y) + int(self._view_extent_pos_y) + 1)
+            current_y = max(0, min(world_layers - 1, int(current[1])))
+            if requested_layers < world_layers:
+                min_origin_y = max(0, int(self._view_extent_neg_y))
+                max_origin_y = max(min_origin_y, int(world_layers - 1 - self._view_extent_pos_y))
+                current_y = min(max(current_y, min_origin_y), max_origin_y)
             current = (
                 int(current[0]),
-                min(max(int(current[1]), min_origin_y), max_origin_y),
+                current_y,
                 int(current[2]),
             )
         if self.freeze_view_origin:

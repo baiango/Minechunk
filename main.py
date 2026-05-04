@@ -20,7 +20,10 @@ def _parse_view_dimensions(value: str) -> tuple[int, int, int]:
 
 def _configure_runtime_knobs(
     *,
-    engine: str | None,
+    renderer_backend: str | None,
+    terrain_backend: str | None,
+    meshing_backend: str | None,
+    terrain_kernel: str | None,
     chunk_request_budget_cap: int | None,
     rc_enabled: bool | None,
     terrain_zstd_enabled: bool | None,
@@ -36,21 +39,22 @@ def _configure_runtime_knobs(
     else:
         os.environ.pop("MINECHUNK_ALLOW_METAL_FALLBACK", None)
 
-    if engine is not None:
-        mode = engine.strip().lower()
-        mapping = {
-            "cpu": cfg.ENGINE_MODE_CPU,
-            "wgpu": cfg.ENGINE_MODE_WGPU,
-            "metal": cfg.ENGINE_MODE_METAL,
-        }
-        cfg.engine_mode = mapping[mode]
-        if chunk_request_budget_cap is None:
-            default_budget_for_engine = getattr(
-                cfg,
-                "default_chunk_prep_request_budget_cap_for_engine",
-                lambda engine_mode: 2 if engine_mode == cfg.ENGINE_MODE_CPU else 8,
-            )
-            cfg.chunk_prep_request_budget_cap = int(default_budget_for_engine(cfg.engine_mode))
+    if renderer_backend is not None and renderer_backend.strip().lower() != "wgpu":
+        raise ValueError("renderer backend must be wgpu")
+
+    for label, backend in (("terrain backend", terrain_backend), ("meshing backend", meshing_backend)):
+        if backend is not None and backend.strip().lower() not in ("cpu", "wgpu", "metal"):
+            raise ValueError(f"{label} must be one of: cpu, wgpu, metal")
+
+    if terrain_kernel is not None:
+        kernel = terrain_kernel.strip().lower()
+        if kernel not in ("auto", "numba", "zig"):
+            raise ValueError("terrain kernel must be one of: auto, numba, zig")
+        os.environ["MINECHUNK_TERRAIN_KERNEL"] = kernel
+        if kernel == "numba":
+            os.environ["MINECHUNK_DISABLE_ZIG_TERRAIN"] = "1"
+        else:
+            os.environ.pop("MINECHUNK_DISABLE_ZIG_TERRAIN", None)
 
     if chunk_request_budget_cap is not None:
         cfg.chunk_prep_request_budget_cap = max(1, int(chunk_request_budget_cap))
@@ -212,6 +216,9 @@ def _build_renderer_from_args(args: argparse.Namespace):
         mesh_zstd_enabled=args.mesh_zstd,
         tile_merging_enabled=args.tile_merge,
         postprocess_enabled=args.postprocess,
+        renderer_backend=args.renderer_backend,
+        terrain_backend=args.terrain_backend,
+        meshing_backend=args.meshing_backend,
         freeze_view_origin=_coalesce_bool(args.freeze_view_origin, mode == "fixed"),
         freeze_camera=_coalesce_bool(args.freeze_camera, mode == "fixed"),
         exit_when_view_ready=_coalesce_bool(args.exit_when_view_ready, False),
@@ -230,15 +237,33 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description="Run Minechunk.")
     parser.add_argument(
-        "--engine",
+        "--renderer-backend",
+        choices=("wgpu",),
+        default=None,
+        help="Renderer/presentation backend. WGPU is currently the supported renderer.",
+    )
+    parser.add_argument(
+        "--terrain-backend",
         choices=("cpu", "wgpu", "metal"),
         default=None,
-        help="Override the configured backend. Default is the value in engine/renderer_config.py.",
+        help="Terrain generation backend. Omit for the configured runtime default.",
+    )
+    parser.add_argument(
+        "--meshing-backend",
+        choices=("cpu", "wgpu", "metal"),
+        default=None,
+        help="Voxel meshing backend. Omit for the configured runtime default.",
     )
     parser.add_argument(
         "--allow-metal-fallback",
         action="store_true",
         help="Allow Metal mode to fall back to WGPU/CPU instead of failing loudly.",
+    )
+    parser.add_argument(
+        "--terrain-kernel",
+        choices=("auto", "numba", "zig"),
+        default=None,
+        help="CPU terrain kernel selection. auto uses Zig when the shared library is present, otherwise Numba.",
     )
     parser.add_argument(
         "--rc",
@@ -316,10 +341,14 @@ def _summarize_launch(args: argparse.Namespace) -> str:
     mesh_zstd_text = "default" if args.mesh_zstd is None else ("on" if args.mesh_zstd else "off")
     tile_merge_text = "default" if args.tile_merge is None else ("on" if args.tile_merge else "off")
     postprocess_text = "default" if args.postprocess is None else ("on" if args.postprocess else "off")
-    engine_text = args.engine or "configured"
+    renderer_backend_text = args.renderer_backend or "configured"
+    terrain_backend_text = args.terrain_backend or "configured"
+    meshing_backend_text = args.meshing_backend or "configured"
+    terrain_kernel_text = args.terrain_kernel or "auto"
     view_text = "default" if args.fixed_view is None else "×".join(str(value) for value in args.fixed_view)
     return (
-        f"mode={args.benchmark_mode}, engine={engine_text}, rc={rc_text}, "
+        f"mode={args.benchmark_mode}, renderer={renderer_backend_text}, terrain_backend={terrain_backend_text}, "
+        f"meshing_backend={meshing_backend_text}, terrain_kernel={terrain_kernel_text}, rc={rc_text}, "
         f"terrain_zstd={terrain_zstd_text}, terrain_caves={terrain_caves_text}, "
         f"mesh_zstd={mesh_zstd_text}, tile_merge={tile_merge_text}, "
         f"postprocess={postprocess_text}, view={view_text}, terrain_batch={args.terrain_batch_size or 'default'}, "
@@ -332,7 +361,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     _configure_runtime_knobs(
-        engine=args.engine,
+        renderer_backend=args.renderer_backend,
+        terrain_backend=args.terrain_backend,
+        meshing_backend=args.meshing_backend,
+        terrain_kernel=args.terrain_kernel,
         chunk_request_budget_cap=args.chunk_request_budget_cap,
         rc_enabled=args.rc,
         terrain_zstd_enabled=args.terrain_zstd,

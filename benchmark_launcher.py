@@ -15,7 +15,9 @@ MAIN_ENTRYPOINT = PROJECT_ROOT / "main.py"
 
 @dataclass(frozen=True)
 class EngineDefaults:
-    engine: str = "cpu"
+    renderer_backend: str = "wgpu"
+    terrain_backend: str = "cpu"
+    meshing_backend: str = "cpu"
     rc_enabled: bool = False
     terrain_zstd_enabled: bool = False
     mesh_zstd_enabled: bool = False
@@ -34,8 +36,11 @@ def _load_engine_defaults() -> EngineDefaults:
         return EngineDefaults()
 
     terrain_batch = int(getattr(cfg, "DEFAULT_MESH_BATCH_SIZE", EngineDefaults.terrain_batch_size))
+    engine_mode = str(getattr(cfg, "engine_mode", "cpu"))
     return EngineDefaults(
-        engine=str(getattr(cfg, "engine_mode", EngineDefaults.engine)),
+        renderer_backend="wgpu",
+        terrain_backend=engine_mode,
+        meshing_backend=engine_mode,
         rc_enabled=bool(getattr(cfg, "RADIANCE_CASCADES_ENABLED", EngineDefaults.rc_enabled)),
         terrain_zstd_enabled=bool(getattr(cfg, "TERRAIN_ZSTD_ENABLED", EngineDefaults.terrain_zstd_enabled)),
         mesh_zstd_enabled=bool(getattr(cfg, "MESH_ZSTD_ENABLED", EngineDefaults.mesh_zstd_enabled)),
@@ -50,9 +55,15 @@ def _load_engine_defaults() -> EngineDefaults:
 
 
 ENGINE_DEFAULTS = _load_engine_defaults()
-ENGINE_CHOICES = ("cpu", "wgpu", "metal")
-ENGINE_DEFAULT_LABEL = f"engine default ({ENGINE_DEFAULTS.engine})"
-RC_DEFAULT_LABEL = f"engine default ({'on' if ENGINE_DEFAULTS.rc_enabled else 'off'})"
+RENDERER_BACKEND_CHOICES = ("wgpu",)
+TERRAIN_BACKEND_CHOICES = ("cpu", "wgpu", "metal")
+MESHING_BACKEND_CHOICES = ("cpu", "wgpu", "metal")
+RENDERER_BACKEND_DEFAULT_LABEL = f"runtime default ({ENGINE_DEFAULTS.renderer_backend})"
+TERRAIN_BACKEND_DEFAULT_LABEL = f"runtime default ({ENGINE_DEFAULTS.terrain_backend})"
+MESHING_BACKEND_DEFAULT_LABEL = f"runtime default ({ENGINE_DEFAULTS.meshing_backend})"
+TERRAIN_KERNEL_CHOICES = ("auto", "numba", "zig")
+TERRAIN_KERNEL_DEFAULT_LABEL = "runtime default (auto)"
+RC_DEFAULT_LABEL = f"runtime default ({'on' if ENGINE_DEFAULTS.rc_enabled else 'off'})"
 RC_CHOICES = (RC_DEFAULT_LABEL, "on", "off")
 
 
@@ -62,7 +73,10 @@ class LauncherConfig:
     mode: str
     # None means: leave the corresponding main.py CLI flag unset and let
     # engine/renderer_config.py or the renderer constructor default decide.
-    engine: str | None = None
+    renderer_backend: str | None = None
+    terrain_backend: str | None = None
+    meshing_backend: str | None = None
+    terrain_kernel: str | None = None
     rc_enabled: bool | None = None
     terrain_zstd_enabled: bool = ENGINE_DEFAULTS.terrain_zstd_enabled
     mesh_zstd_enabled: bool = ENGINE_DEFAULTS.mesh_zstd_enabled
@@ -186,27 +200,44 @@ def _positive_float(value: Any, field_name: str) -> float:
     return parsed
 
 
-def _normalize_optional_engine(value: str | None) -> str | None:
+def _normalize_optional_backend(value: str | None, choices: tuple[str, ...], label: str) -> str | None:
     if value is None:
         return None
-    engine = str(value).strip().lower()
-    if not engine or engine.startswith("engine default") or engine == "default":
+    backend = str(value).strip().lower()
+    if not backend or backend.startswith("runtime default") or backend == "default":
         return None
-    if engine not in ENGINE_CHOICES:
-        raise ValueError(f"engine must be one of: {', '.join(ENGINE_CHOICES)}, or engine default")
-    return engine
+    if backend not in choices:
+        raise ValueError(f"{label} must be one of: {', '.join(choices)}, or runtime default")
+    return backend
+
+
+def _normalize_optional_terrain_kernel(value: str | None) -> str | None:
+    if value is None:
+        return None
+    kernel = str(value).strip().lower()
+    if not kernel or kernel.startswith("runtime default") or kernel == "default":
+        return None
+    if kernel not in TERRAIN_KERNEL_CHOICES:
+        raise ValueError(f"terrain kernel must be one of: {', '.join(TERRAIN_KERNEL_CHOICES)}, or runtime default")
+    return kernel
 
 
 def validate_config(config: LauncherConfig) -> LauncherConfig:
     mode = str(config.mode).strip().lower().replace("-", "_")
     if mode not in MODE_CHOICES:
         raise ValueError(f"mode must be one of: {', '.join(MODE_CHOICES)}")
-    engine = _normalize_optional_engine(config.engine)
+    renderer_backend = _normalize_optional_backend(config.renderer_backend, RENDERER_BACKEND_CHOICES, "renderer backend")
+    terrain_backend = _normalize_optional_backend(config.terrain_backend, TERRAIN_BACKEND_CHOICES, "terrain backend")
+    meshing_backend = _normalize_optional_backend(config.meshing_backend, MESHING_BACKEND_CHOICES, "meshing backend")
+    terrain_kernel = _normalize_optional_terrain_kernel(config.terrain_kernel)
 
     return replace(
         config,
         mode=mode,
-        engine=engine,
+        renderer_backend=renderer_backend,
+        terrain_backend=terrain_backend,
+        meshing_backend=meshing_backend,
+        terrain_kernel=terrain_kernel,
         seed=_non_negative_int(config.seed, "seed"),
         view_x=_positive_int(config.view_x, "view X"),
         view_y=_positive_int(config.view_y, "view Y"),
@@ -247,8 +278,14 @@ def build_entrypoint_command(config: LauncherConfig) -> list[str]:
     """Build the exact CLI command the launcher runs."""
     config = validate_config(config)
     command = [sys.executable, str(MAIN_ENTRYPOINT)]
-    if config.engine is not None:
-        command.extend(["--engine", config.engine])
+    if config.renderer_backend is not None:
+        command.extend(["--renderer-backend", config.renderer_backend])
+    if config.terrain_backend is not None:
+        command.extend(["--terrain-backend", config.terrain_backend])
+    if config.meshing_backend is not None:
+        command.extend(["--meshing-backend", config.meshing_backend])
+    if config.terrain_kernel is not None:
+        command.extend(["--terrain-kernel", config.terrain_kernel])
     if config.rc_enabled is not None:
         _bool_flag(command, bool(config.rc_enabled), "rc")
     _bool_flag(command, bool(config.terrain_zstd_enabled), "terrain-zstd")
@@ -340,7 +377,10 @@ class LauncherApp:
 
         self.preset_var = tk.StringVar()
         self.mode_var = tk.StringVar()
-        self.engine_var = tk.StringVar()
+        self.renderer_backend_var = tk.StringVar()
+        self.terrain_backend_var = tk.StringVar()
+        self.meshing_backend_var = tk.StringVar()
+        self.terrain_kernel_var = tk.StringVar()
         self.rc_mode_var = tk.StringVar()
         self.terrain_zstd_var = tk.BooleanVar()
         self.mesh_zstd_var = tk.BooleanVar()
@@ -403,10 +443,16 @@ class LauncherApp:
         mode.grid(row=2, column=1, sticky="ew", **pad)
         mode.bind("<<ComboboxSelected>>", lambda _event: self._sync_mode_state())
 
-        ttk.Label(frame, text="Engine").grid(row=2, column=2, sticky="w", **pad)
-        engine = ttk.Combobox(frame, textvariable=self.engine_var, values=(ENGINE_DEFAULT_LABEL, *ENGINE_CHOICES), width=22, state="readonly")
-        engine.grid(row=2, column=3, sticky="ew", **pad)
-        engine.bind("<<ComboboxSelected>>", lambda _event: self._update_summary())
+        ttk.Label(frame, text="Renderer").grid(row=2, column=2, sticky="w", **pad)
+        renderer_backend = ttk.Combobox(
+            frame,
+            textvariable=self.renderer_backend_var,
+            values=(RENDERER_BACKEND_DEFAULT_LABEL, *RENDERER_BACKEND_CHOICES),
+            width=22,
+            state="readonly",
+        )
+        renderer_backend.grid(row=2, column=3, sticky="ew", **pad)
+        renderer_backend.bind("<<ComboboxSelected>>", lambda _event: self._update_summary())
 
         ttk.Label(frame, text="Seed").grid(row=3, column=0, sticky="w", **pad)
         self._entry(frame, self.seed_var, 1, 3, width=12)
@@ -435,7 +481,7 @@ class LauncherApp:
         ttk.Label(
             frame,
             text=(
-                "blank = engine defaults: "
+                "blank = runtime defaults: "
                 f"terrain {ENGINE_DEFAULTS.terrain_batch_size}, "
                 f"mesh {ENGINE_DEFAULTS.mesh_batch_size}, "
                 f"cap {ENGINE_DEFAULTS.chunk_request_budget_cap}"
@@ -468,6 +514,36 @@ class LauncherApp:
         ttk.Checkbutton(misc_box, text="Compress terrain chunks with zstd", variable=self.terrain_zstd_var, command=self._update_summary).grid(row=0, column=2, sticky="w", padx=6, pady=2)
         ttk.Checkbutton(misc_box, text="Compress offscreen mesh slabs with zstd", variable=self.mesh_zstd_var, command=self._update_summary).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=2)
         ttk.Checkbutton(misc_box, text="Enable merged tile GPU buffers", variable=self.tile_merging_var, command=self._update_summary).grid(row=1, column=2, sticky="w", padx=6, pady=2)
+        ttk.Label(misc_box, text="Terrain backend").grid(row=2, column=0, sticky="w", padx=6, pady=2)
+        terrain_backend = ttk.Combobox(
+            misc_box,
+            textvariable=self.terrain_backend_var,
+            values=(TERRAIN_BACKEND_DEFAULT_LABEL, *TERRAIN_BACKEND_CHOICES),
+            width=22,
+            state="readonly",
+        )
+        terrain_backend.grid(row=2, column=1, sticky="w", padx=6, pady=2)
+        terrain_backend.bind("<<ComboboxSelected>>", lambda _event: self._update_summary())
+        ttk.Label(misc_box, text="Meshing backend").grid(row=2, column=2, sticky="w", padx=6, pady=2)
+        meshing_backend = ttk.Combobox(
+            misc_box,
+            textvariable=self.meshing_backend_var,
+            values=(MESHING_BACKEND_DEFAULT_LABEL, *MESHING_BACKEND_CHOICES),
+            width=22,
+            state="readonly",
+        )
+        meshing_backend.grid(row=2, column=3, sticky="w", padx=6, pady=2)
+        meshing_backend.bind("<<ComboboxSelected>>", lambda _event: self._update_summary())
+        ttk.Label(misc_box, text="Terrain kernel").grid(row=3, column=0, sticky="w", padx=6, pady=2)
+        terrain_kernel = ttk.Combobox(
+            misc_box,
+            textvariable=self.terrain_kernel_var,
+            values=(TERRAIN_KERNEL_DEFAULT_LABEL, *TERRAIN_KERNEL_CHOICES),
+            width=22,
+            state="readonly",
+        )
+        terrain_kernel.grid(row=3, column=1, sticky="w", padx=6, pady=2)
+        terrain_kernel.bind("<<ComboboxSelected>>", lambda _event: self._update_summary())
 
         summary = ttk.Label(frame, textvariable=self.summary_var, foreground="#444")
         summary.grid(row=10, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 4))
@@ -500,18 +576,27 @@ class LauncherApp:
         raw = self.mode_var.get().split(" — ", 1)[0].strip().lower()
         return raw if raw in MODE_CHOICES else "fixed"
 
-    def _engine_from_var(self) -> str | None:
-        return _normalize_optional_engine(self.engine_var.get())
+    def _renderer_backend_from_var(self) -> str | None:
+        return _normalize_optional_backend(self.renderer_backend_var.get(), RENDERER_BACKEND_CHOICES, "renderer backend")
+
+    def _terrain_backend_from_var(self) -> str | None:
+        return _normalize_optional_backend(self.terrain_backend_var.get(), TERRAIN_BACKEND_CHOICES, "terrain backend")
+
+    def _meshing_backend_from_var(self) -> str | None:
+        return _normalize_optional_backend(self.meshing_backend_var.get(), MESHING_BACKEND_CHOICES, "meshing backend")
+
+    def _terrain_kernel_from_var(self) -> str | None:
+        return _normalize_optional_terrain_kernel(self.terrain_kernel_var.get())
 
     def _rc_from_var(self) -> bool | None:
         raw = self.rc_mode_var.get().strip().lower()
-        if not raw or raw.startswith("engine default") or raw == "default":
+        if not raw or raw.startswith("runtime default") or raw == "default":
             return None
         if raw == "on":
             return True
         if raw == "off":
             return False
-        raise ValueError("Radiance Cascades must be engine default, on, or off")
+        raise ValueError("Radiance Cascades must be runtime default, on, or off")
 
     @staticmethod
     def _optional_int_from_var(variable: Any, field_name: str) -> int | None:
@@ -529,7 +614,10 @@ class LauncherApp:
             key = "normal_window"
         self.preset_var.set(f"{key} — {PRESETS[key].name}")
         self.mode_var.set(f"{config.mode} — {MODE_LABELS.get(config.mode, config.mode)}")
-        self.engine_var.set(ENGINE_DEFAULT_LABEL if config.engine is None else str(config.engine))
+        self.renderer_backend_var.set(RENDERER_BACKEND_DEFAULT_LABEL if config.renderer_backend is None else str(config.renderer_backend))
+        self.terrain_backend_var.set(TERRAIN_BACKEND_DEFAULT_LABEL if config.terrain_backend is None else str(config.terrain_backend))
+        self.meshing_backend_var.set(MESHING_BACKEND_DEFAULT_LABEL if config.meshing_backend is None else str(config.meshing_backend))
+        self.terrain_kernel_var.set(TERRAIN_KERNEL_DEFAULT_LABEL if config.terrain_kernel is None else str(config.terrain_kernel))
         if config.rc_enabled is None:
             self.rc_mode_var.set(RC_DEFAULT_LABEL)
         else:
@@ -560,7 +648,10 @@ class LauncherApp:
             LauncherConfig(
                 name="Custom GUI launch",
                 mode=self._mode_key_from_var(),
-                engine=self._engine_from_var(),
+                renderer_backend=self._renderer_backend_from_var(),
+                terrain_backend=self._terrain_backend_from_var(),
+                meshing_backend=self._meshing_backend_from_var(),
+                terrain_kernel=self._terrain_kernel_from_var(),
                 rc_enabled=self._rc_from_var(),
                 seed=int(self.seed_var.get()),
                 view_x=int(self.view_x_var.get()),
@@ -602,7 +693,11 @@ class LauncherApp:
             self.command_var.set("")
             return
         dims = "×".join(str(value) for value in config.view_dimensions)
-        engine_text = config.engine.upper() if config.engine is not None else f"engine default {ENGINE_DEFAULTS.engine.upper()}"
+        renderer_text = config.renderer_backend.upper() if config.renderer_backend is not None else f"renderer {ENGINE_DEFAULTS.renderer_backend.upper()}"
+        terrain_backend = config.terrain_backend.upper() if config.terrain_backend is not None else f"terrain {ENGINE_DEFAULTS.terrain_backend.upper()}"
+        meshing_backend = config.meshing_backend.upper() if config.meshing_backend is not None else f"meshing {ENGINE_DEFAULTS.meshing_backend.upper()}"
+        backend_text = f"{renderer_text}, {terrain_backend}, {meshing_backend}"
+        kernel_text = f"kernel {config.terrain_kernel}" if config.terrain_kernel is not None else "kernel auto"
         rc_text = "RC default " + ("on" if ENGINE_DEFAULTS.rc_enabled else "off") if config.rc_enabled is None else ("RC on" if config.rc_enabled else "RC off")
         terrain_zstd_text = "terrain zstd on" if config.terrain_zstd_enabled else "terrain zstd off"
         mesh_zstd_text = "mesh zstd on" if config.mesh_zstd_enabled else "mesh zstd off"
@@ -612,17 +707,17 @@ class LauncherApp:
         cap_text = _format_optional(config.chunk_request_budget_cap, ENGINE_DEFAULTS.chunk_request_budget_cap)
         if config.mode == "fly_forward":
             text = (
-                f"{engine_text} fly CLI run: view {dims}, {config.fly_speed_mps:g} m/s, "
-                f"target {config.target_rendered_chunks} chunks, cap {cap_text}, {rc_text}, {terrain_zstd_text}, {mesh_zstd_text}, {tile_merge_text}."
+                f"{backend_text} fly CLI run: view {dims}, {config.fly_speed_mps:g} m/s, "
+                f"target {config.target_rendered_chunks} chunks, cap {cap_text}, {kernel_text}, {rc_text}, {terrain_zstd_text}, {mesh_zstd_text}, {tile_merge_text}."
             )
         elif config.mode == "fixed":
             exit_text = "auto-exit" if config.exit_when_view_ready else "interactive"
             text = (
-                f"{engine_text} fixed CLI run: view {dims}, terrain batch {terrain_text}, "
-                f"mesh batch {mesh_text}, cap {cap_text}, {exit_text}, {rc_text}, {terrain_zstd_text}, {mesh_zstd_text}, {tile_merge_text}."
+                f"{backend_text} fixed CLI run: view {dims}, terrain batch {terrain_text}, "
+                f"mesh batch {mesh_text}, cap {cap_text}, {exit_text}, {kernel_text}, {rc_text}, {terrain_zstd_text}, {mesh_zstd_text}, {tile_merge_text}."
             )
         else:
-            text = f"{engine_text} normal main.py launch, {rc_text}, {terrain_zstd_text}, {mesh_zstd_text}, {tile_merge_text}."
+            text = f"{backend_text} normal main.py launch, {kernel_text}, {rc_text}, {terrain_zstd_text}, {mesh_zstd_text}, {tile_merge_text}."
         self.summary_var.set(text)
         self.command_var.set(command_text)
 
@@ -687,7 +782,10 @@ def _config_from_args(default_config: LauncherConfig, args: argparse.Namespace) 
     changes: dict[str, Any] = {}
     for arg_name, field_name in (
         ("mode", "mode"),
-        ("engine", "engine"),
+        ("renderer_backend", "renderer_backend"),
+        ("terrain_backend", "terrain_backend"),
+        ("meshing_backend", "meshing_backend"),
+        ("terrain_kernel", "terrain_kernel"),
         ("rc", "rc_enabled"),
         ("terrain_zstd", "terrain_zstd_enabled"),
         ("mesh_zstd", "mesh_zstd_enabled"),
@@ -724,16 +822,19 @@ def _build_arg_parser(default_preset: str) -> argparse.ArgumentParser:
     parser.add_argument("--headless", action="store_true", help="Skip the Tk GUI and spawn the selected main.py command immediately.")
     parser.add_argument("--wait", action="store_true", help="After spawning main.py, wait for it and return its exit code. Omit this to keep the launcher non-blocking.")
     parser.add_argument("--mode", choices=MODE_CHOICES, default=None, help="Run mode override.")
-    parser.add_argument("--engine", choices=ENGINE_CHOICES, default=None, help=f"Backend override. Omit for engine default ({ENGINE_DEFAULTS.engine}).")
-    parser.add_argument("--rc", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable Radiance Cascades for this run. Use --no-rc to profile without RC. Omit for engine default.")
+    parser.add_argument("--renderer-backend", choices=RENDERER_BACKEND_CHOICES, default=None, help=f"Renderer backend override. Omit for runtime default ({ENGINE_DEFAULTS.renderer_backend}).")
+    parser.add_argument("--terrain-backend", choices=TERRAIN_BACKEND_CHOICES, default=None, help=f"Terrain backend override. Omit for runtime default ({ENGINE_DEFAULTS.terrain_backend}).")
+    parser.add_argument("--meshing-backend", choices=MESHING_BACKEND_CHOICES, default=None, help=f"Meshing backend override. Omit for runtime default ({ENGINE_DEFAULTS.meshing_backend}).")
+    parser.add_argument("--terrain-kernel", choices=TERRAIN_KERNEL_CHOICES, default=None, help="CPU terrain kernel override. auto uses Zig when built, otherwise Numba.")
+    parser.add_argument("--rc", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable Radiance Cascades for this run. Use --no-rc to profile without RC. Omit for runtime default.")
     parser.add_argument("--terrain-zstd", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable zstd level-1 compression for CPU-side terrain chunk payloads. Default is off.")
     parser.add_argument("--mesh-zstd", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable experimental zstd readback compression for offscreen mesh buffers. Default is off.")
     parser.add_argument("--tile-merge", action=argparse.BooleanOptionalAction, default=None, help="Enable or disable merged visible tile GPU buffers. Default is off to reduce footprint.")
     parser.add_argument("--seed", type=int, default=None, help="World seed.")
     parser.add_argument("--view", type=_parse_view_dimensions, default=None, help="View dimensions, for example 16x16x16.")
-    parser.add_argument("--terrain-batch-size", type=int, default=None, help=f"Terrain backend poll/batch size. Omit for engine default ({ENGINE_DEFAULTS.terrain_batch_size}).")
-    parser.add_argument("--mesh-batch-size", type=int, default=None, help=f"Mesh drain/finalize batch size. Omit for engine default ({ENGINE_DEFAULTS.mesh_batch_size}).")
-    parser.add_argument("--chunk-request-budget-cap", type=int, default=None, help=f"Chunk prep request budget cap. Omit for engine default ({ENGINE_DEFAULTS.chunk_request_budget_cap}).")
+    parser.add_argument("--terrain-batch-size", type=int, default=None, help=f"Terrain backend poll/batch size. Omit for runtime default ({ENGINE_DEFAULTS.terrain_batch_size}).")
+    parser.add_argument("--mesh-batch-size", type=int, default=None, help=f"Mesh drain/finalize batch size. Omit for runtime default ({ENGINE_DEFAULTS.mesh_batch_size}).")
+    parser.add_argument("--chunk-request-budget-cap", type=int, default=None, help=f"Chunk prep request budget cap. Omit for runtime default ({ENGINE_DEFAULTS.chunk_request_budget_cap}).")
     parser.add_argument("--fly-speed-mps", type=float, default=None, help=f"Fly-forward benchmark speed in meters per second. Default uses BASE_FLY_SPEED ({ENGINE_DEFAULTS.fly_speed_mps:g}).")
     parser.add_argument("--target-rendered-chunks", type=int, default=None, help="Unique rendered chunk target for fly-forward mode.")
     parser.add_argument("--status-log-interval-s", type=float, default=None, help="Fly-forward status log interval in seconds.")

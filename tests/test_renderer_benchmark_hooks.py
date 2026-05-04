@@ -52,6 +52,10 @@ def test_launcher_runs_main_cli_instead_of_importing_renderer() -> None:
     assert "main.py" in source
     assert "--rc" in source
     assert "--no-rc" in source
+    assert "--renderer-backend" in source
+    assert "--terrain-backend" in source
+    assert "--meshing-backend" in source
+    assert "--engine" not in source
     assert "--wait" in source
     assert "from engine.renderer" not in source
     assert "from engine import renderer\n" not in source
@@ -65,6 +69,11 @@ def test_main_exposes_cli_benchmark_and_rc_flags() -> None:
     assert "--fixed-view" in source
     assert "--rc" in source
     assert "--terrain-caves" in source
+    assert "--renderer-backend" in source
+    assert "--terrain-backend" in source
+    assert "--meshing-backend" in source
+    assert "--engine" not in source
+    assert "--terrain-kernel" in source
     assert "--tile-merge" in source
     assert "--postprocess" in source
     assert "BooleanOptionalAction" in source
@@ -89,12 +98,30 @@ def test_main_cache_numba_only_exits_before_renderer_creation(monkeypatch) -> No
     assert warmed == [True]
 
 
-def test_checked_in_engine_default_is_cpu() -> None:
+def test_checked_in_runtime_default_keeps_cpu_terrain_and_meshing() -> None:
     source = (ROOT / "engine" / "renderer_config.py").read_text(encoding="utf-8")
     launcher = BENCHMARK_LAUNCHER.read_text(encoding="utf-8")
 
     assert "_DEFAULT_ENGINE_MODE = ENGINE_MODE_CPU" in source
-    assert 'engine: str = "cpu"' in launcher
+    assert 'terrain_backend: str = "cpu"' in launcher
+    assert 'meshing_backend: str = "cpu"' in launcher
+    assert 'renderer_backend: str = "wgpu"' in launcher
+
+
+def test_fixed_view_origin_stays_inside_world_when_view_is_taller_than_world() -> None:
+    from types import SimpleNamespace
+
+    from engine.renderer import TerrainRenderer
+
+    renderer = SimpleNamespace(
+        fixed_view_box_mode=True,
+        _view_extent_neg_y=32,
+        _view_extent_pos_y=31,
+        freeze_view_origin=False,
+        _camera_chunk_origin=lambda: (3, 4, -5),
+    )
+
+    assert TerrainRenderer._current_chunk_origin(renderer) == (3, 4, -5)
 
 
 def test_rc_and_tile_merging_default_off_with_launcher_toggle() -> None:
@@ -126,14 +153,38 @@ def test_rc_and_tile_merging_default_off_with_launcher_toggle() -> None:
     assert main_parser.parse_args([]).terrain_caves is None
     assert main_parser.parse_args(["--terrain-caves"]).terrain_caves is True
     assert main_parser.parse_args(["--no-terrain-caves"]).terrain_caves is False
+    assert main_parser.parse_args(["--renderer-backend", "wgpu"]).renderer_backend == "wgpu"
+    assert main_parser.parse_args(["--terrain-backend", "wgpu"]).terrain_backend == "wgpu"
+    assert main_parser.parse_args(["--meshing-backend", "metal"]).meshing_backend == "metal"
+    assert main_parser.parse_args(["--terrain-kernel", "numba"]).terrain_kernel == "numba"
+    assert main_parser.parse_args(["--terrain-kernel", "zig"]).terrain_kernel == "zig"
 
     default_command = build_entrypoint_command(LauncherConfig(name="test", mode="interactive"))
+    zig_kernel_command = build_entrypoint_command(
+        LauncherConfig(name="test", mode="interactive", terrain_kernel="zig")
+    )
+    split_backend_command = build_entrypoint_command(
+        LauncherConfig(
+            name="test",
+            mode="interactive",
+            renderer_backend="wgpu",
+            terrain_backend="wgpu",
+            meshing_backend="cpu",
+        )
+    )
     enabled_command = build_entrypoint_command(
         LauncherConfig(name="test", mode="interactive", tile_merging_enabled=True)
     )
 
     assert "--no-tile-merge" in default_command
     assert "--tile-merge" in enabled_command
+    assert "--terrain-kernel" not in default_command
+    assert "--terrain-kernel" in zig_kernel_command
+    assert "zig" in zig_kernel_command
+    assert "--renderer-backend" in split_backend_command
+    assert "--terrain-backend" in split_backend_command
+    assert "--meshing-backend" in split_backend_command
+    assert "--engine" not in split_backend_command
     assert "--rc" not in default_command
     assert "--no-rc" not in default_command
 
@@ -150,3 +201,12 @@ def test_rc_and_tile_merging_default_off_with_launcher_toggle() -> None:
     launcher_args = launcher_parser.parse_args(["--tile-merge"])
     launcher_config = _config_from_args(LauncherConfig(name="test", mode="interactive"), launcher_args)
     assert launcher_config.tile_merging_enabled is True
+
+    launcher_args = launcher_parser.parse_args(["--terrain-kernel", "numba"])
+    launcher_config = _config_from_args(LauncherConfig(name="test", mode="interactive"), launcher_args)
+    assert launcher_config.terrain_kernel == "numba"
+
+    launcher_args = launcher_parser.parse_args(["--terrain-backend", "metal", "--meshing-backend", "wgpu"])
+    launcher_config = _config_from_args(LauncherConfig(name="test", mode="interactive"), launcher_args)
+    assert launcher_config.terrain_backend == "metal"
+    assert launcher_config.meshing_backend == "wgpu"

@@ -22,13 +22,27 @@ except NameError:  # pragma: no cover - only used outside kernprof
 def visible_rel_y_bounds_for_origin_y(renderer: Any, origin_y: int) -> tuple[int, int]:
     if not VERTICAL_CHUNK_STACK_ENABLED:
         return (0, 0)
-    requested_min_rel_y = -int(renderer._view_extent_neg_y)
-    requested_max_rel_y = int(renderer._view_extent_pos_y)
-    min_rel_y = max(requested_min_rel_y, -int(origin_y))
-    max_rel_y = min(requested_max_rel_y, int(VERTICAL_CHUNK_COUNT - 1 - int(origin_y)))
-    if min_rel_y > max_rel_y:
+    world_layers = max(1, int(VERTICAL_CHUNK_COUNT))
+    requested_origin_y = int(origin_y)
+    clamped_origin_y = max(0, min(world_layers - 1, requested_origin_y))
+    view_neg_y = max(0, int(renderer._view_extent_neg_y))
+    view_pos_y = max(0, int(renderer._view_extent_pos_y))
+    requested_layers = max(1, int(view_neg_y + view_pos_y + 1))
+    visible_layers = min(requested_layers, world_layers)
+
+    min_y = clamped_origin_y - view_neg_y
+    max_y = min_y + visible_layers - 1
+    if min_y < 0:
+        max_y -= min_y
+        min_y = 0
+    if max_y >= world_layers:
+        min_y -= max_y - (world_layers - 1)
+        max_y = world_layers - 1
+    min_y = max(0, int(min_y))
+    max_y = min(world_layers - 1, int(max_y))
+    if min_y > max_y:
         return (0, 0)
-    return (int(min_rel_y), int(max_rel_y))
+    return (int(min_y - requested_origin_y), int(max_y - requested_origin_y))
 
 
 @profile
@@ -68,14 +82,16 @@ def build_visible_layout_template(
         return cached
 
     if VERTICAL_CHUNK_STACK_ENABLED:
-        cy_order: list[int] = [0]
+        cy_order: list[int] = []
+        if min_rel_y <= 0 <= max_rel_y:
+            cy_order.append(0)
         max_offset = max(-min_rel_y, max_rel_y)
         for offset in range(1, max_offset + 1):
             up = offset
             down = -offset
-            if up <= max_rel_y:
+            if min_rel_y <= up <= max_rel_y:
                 cy_order.append(up)
-            if down >= min_rel_y:
+            if min_rel_y <= down <= max_rel_y:
                 cy_order.append(down)
     else:
         cy_order = [0]

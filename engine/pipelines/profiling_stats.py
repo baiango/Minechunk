@@ -23,9 +23,9 @@ def profile_end_frame(renderer, started_at: float | None, frame_dt: float) -> No
         refresh_profile_summary(renderer, ended_at)
 
 
-def profile_frame_time_percentiles(renderer) -> tuple[float, float, float]:
+def profile_frame_time_percentiles(renderer) -> tuple[float, float, float, float]:
     if not renderer.profile_window_frame_times:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     ordered = sorted(renderer.profile_window_frame_times)
     count = len(ordered)
 
@@ -33,7 +33,7 @@ def profile_frame_time_percentiles(renderer) -> tuple[float, float, float]:
         index = max(0, min(count - 1, math.ceil(percentile * count) - 1))
         return ordered[index] * 1000.0
 
-    return pick(0.50), pick(0.95), pick(0.99)
+    return pick(0.50), pick(0.95), pick(0.99), pick(0.999)
 
 
 def profile_average_fps(renderer) -> float:
@@ -66,4 +66,3 @@ def frame_breakdown_average(renderer, name: str) -> float:
     if sample_sums is not None:
         return float(sample_sums.get(name, 0.0)) / max(1, len(samples))
     return sum(samples) / len(samples)
-

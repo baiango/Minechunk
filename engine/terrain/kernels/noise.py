@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
 from .numba_compat import njit
 
 @njit(cache=True, fastmath=True, inline="always")
@@ -21,7 +23,7 @@ def _hash2(ix: int, iy: int, seed: int) -> float:
     h = (h ^ (((iy & 0xFFFFFFFF) * 0x85EBCA6B) & 0xFFFFFFFF)) & 0xFFFFFFFF
     h = (h ^ (((seed & 0xFFFFFFFF) * 0xC2B2AE35) & 0xFFFFFFFF)) & 0xFFFFFFFF
     h = _mix_u32(h)
-    return float(h & 0x00FFFFFF) / 16777215.0
+    return np.float32(h & 0x00FFFFFF) / np.float32(16777215.0)
 
 
 @njit(cache=True, fastmath=True, inline="always")
@@ -31,23 +33,27 @@ def _hash3(ix: int, iy: int, iz: int, seed: int) -> float:
     h = (h ^ (((iz & 0xFFFFFFFF) * 0xC2B2AE35) & 0xFFFFFFFF)) & 0xFFFFFFFF
     h = (h ^ (((seed & 0xFFFFFFFF) * 0x27D4EB2F) & 0xFFFFFFFF)) & 0xFFFFFFFF
     h = _mix_u32(h)
-    return float(h & 0x00FFFFFF) / 16777215.0
+    return np.float32(h & 0x00FFFFFF) / np.float32(16777215.0)
 
 
 @njit(cache=True, fastmath=True, inline="always")
 def _fade(t: float) -> float:
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+    t32 = np.float32(t)
+    return t32 * t32 * t32 * (t32 * (t32 * np.float32(6.0) - np.float32(15.0)) + np.float32(10.0))
 
 
 @njit(cache=True, fastmath=True, inline="always")
 def _lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * t
+    a32 = np.float32(a)
+    b32 = np.float32(b)
+    t32 = np.float32(t)
+    return a32 + (b32 - a32) * t32
 
 
 @njit(cache=True, fastmath=True, inline="always")
 def _value_noise_2d(x: float, y: float, seed: int, frequency: float) -> float:
-    x *= frequency
-    y *= frequency
+    x = np.float32(x) * np.float32(frequency)
+    y = np.float32(y) * np.float32(frequency)
 
     x0 = math.floor(x)
     y0 = math.floor(y)
@@ -68,14 +74,14 @@ def _value_noise_2d(x: float, y: float, seed: int, frequency: float) -> float:
     v = _fade(yf)
     nx0 = _lerp(v00, v10, u)
     nx1 = _lerp(v01, v11, u)
-    return _lerp(nx0, nx1, v) * 2.0 - 1.0
+    return _lerp(nx0, nx1, v) * np.float32(2.0) - np.float32(1.0)
 
 
 @njit(cache=True, fastmath=True, inline="always")
 def _value_noise_3d(x: float, y: float, z: float, seed: int, frequency: float) -> float:
-    x *= frequency
-    y *= frequency
-    z *= frequency
+    x = np.float32(x) * np.float32(frequency)
+    y = np.float32(y) * np.float32(frequency)
+    z = np.float32(z) * np.float32(frequency)
 
     x0 = math.floor(x)
     y0 = math.floor(y)
@@ -110,4 +116,4 @@ def _value_noise_3d(x: float, y: float, z: float, seed: int, frequency: float) -
     x11 = _lerp(c011, c111, u)
     y0v = _lerp(x00, x10, v)
     y1v = _lerp(x01, x11, v)
-    return _lerp(y0v, y1v, w) * 2.0 - 1.0
+    return _lerp(y0v, y1v, w) * np.float32(2.0) - np.float32(1.0)

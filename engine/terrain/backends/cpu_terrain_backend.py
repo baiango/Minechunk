@@ -6,13 +6,15 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..types import ChunkSurfaceGpuBatch, ChunkSurfaceResult, ChunkVoxelResult
-from ...terrain.kernels import (
+from ...terrain.kernels.zig_kernel import (
     fill_chunk_surface_grids,
+    fill_chunk_surface_grids_batch,
     fill_stacked_chunk_voxel_grid,
     fill_stacked_chunk_voxel_grid_with_neighbor_planes,
     fill_stacked_chunk_voxel_grid_with_neighbor_planes_from_surface,
     fill_chunk_voxel_grid,
     surface_profile_at as sample_surface_profile_at,
+    terrain_kernel_label,
 )
 from ...world_constants import CHUNK_SIZE as DEFAULT_CHUNK_SIZE, VERTICAL_CHUNK_STACK_ENABLED
 
@@ -44,6 +46,7 @@ class CpuTerrainBackend:
         self.height = self.chunk_size if height is None else int(height)
         self.chunks_per_poll = max(1, int(chunks_per_poll))
         self.terrain_caves_enabled = bool(terrain_caves_enabled)
+        self._terrain_kernel_label = terrain_kernel_label()
         self._pending_jobs: deque[_PendingChunkJob] = deque()
         self._pending_voxel_jobs: deque[_PendingChunkJob] = deque()
         self._next_job_id = 1
@@ -143,25 +146,44 @@ class CpuTerrainBackend:
     def poll_ready_chunk_surface_batches(self) -> list[ChunkSurfaceResult]:
         ready: list[ChunkSurfaceResult] = []
         budget = self.chunks_per_poll
+        batch_chunks: list[tuple[int, int, int]] = []
         while self._pending_jobs and budget > 0:
             job = self._pending_jobs[0]
             while job.cursor < len(job.chunk_coords) and budget > 0:
-                chunk_x, chunk_y, chunk_z = job.chunk_coords[job.cursor]
-                heights, materials = self.chunk_surface_grids(chunk_x, chunk_z)
-                ready.append(
-                    ChunkSurfaceResult(
-                        chunk_x=chunk_x,
-                        chunk_y=chunk_y,
-                        chunk_z=chunk_z,
-                        heights=heights,
-                        materials=materials,
-                        source="cpu",
-                    )
-                )
+                batch_chunks.append(job.chunk_coords[job.cursor])
                 job.cursor += 1
                 budget -= 1
             if job.cursor >= len(job.chunk_coords):
                 self._pending_jobs.popleft()
+        if not batch_chunks:
+            return ready
+
+        sample_size = self.chunk_size + 2
+        cell_count = sample_size * sample_size
+        heights_batch = np.empty((len(batch_chunks), cell_count), dtype=np.uint32)
+        materials_batch = np.empty_like(heights_batch)
+        chunk_xs = np.array([chunk_x for chunk_x, _chunk_y, _chunk_z in batch_chunks], dtype=np.int32)
+        chunk_zs = np.array([chunk_z for _chunk_x, _chunk_y, chunk_z in batch_chunks], dtype=np.int32)
+        fill_chunk_surface_grids_batch(
+            heights_batch,
+            materials_batch,
+            chunk_xs,
+            chunk_zs,
+            self.chunk_size,
+            self.seed,
+            self.height,
+        )
+        for index, (chunk_x, chunk_y, chunk_z) in enumerate(batch_chunks):
+            ready.append(
+                ChunkSurfaceResult(
+                    chunk_x=chunk_x,
+                    chunk_y=chunk_y,
+                    chunk_z=chunk_z,
+                    heights=heights_batch[index],
+                    materials=materials_batch[index],
+                    source="cpu",
+                )
+            )
         return ready
 
     @profile
@@ -279,4 +301,4 @@ class CpuTerrainBackend:
         return ready
 
     def terrain_backend_label(self) -> str:
-        return "CPU"
+        return f"CPU/{self._terrain_kernel_label}"

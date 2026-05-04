@@ -121,19 +121,20 @@ def regenerate_world(renderer, metal_mesher, allow_metal_fallback) -> None:
         int(time.time()) & 0x7FFFFFFF,
         gpu_device=self.device,
         prefer_gpu_terrain=self.use_gpu_terrain,
-        prefer_metal_backend=engine_mode == ENGINE_MODE_METAL,
+        prefer_metal_backend=getattr(self, "terrain_backend_kind", engine_mode) == ENGINE_MODE_METAL,
         terrain_batch_size=self.terrain_batch_size,
         terrain_zstd_enabled=bool(getattr(self, "terrain_zstd_enabled", TERRAIN_ZSTD_ENABLED)),
         terrain_zstd_cache_limit=int(getattr(self, "max_cached_chunks", MAX_CACHED_CHUNKS)),
+        terrain_caves_enabled=bool(getattr(self, "terrain_caves_enabled", True)),
     )
-    if engine_mode == ENGINE_MODE_METAL and self.world.terrain_backend_label() != "Metal" and not _allow_metal_fallback():
+    if getattr(self, "terrain_backend_kind", engine_mode) == ENGINE_MODE_METAL and self.world.terrain_backend_label() != "Metal" and not _allow_metal_fallback():
         failure = getattr(self.world, "_gpu_backend_error", None)
         detail = f" ({type(failure).__name__}: {failure!s})" if failure is not None else ""
         raise RuntimeError(
-            "ENGINE_MODE_METAL was requested after reset, but the active terrain backend is "
+            "Metal terrain backend was requested after reset, but the active terrain backend is "
             f"{self.world.terrain_backend_label()!r}{detail}. Refusing CPU/WGPU fallback."
         )
-    self._using_metal_meshing = bool(self.use_gpu_meshing and engine_mode == ENGINE_MODE_METAL and metal_mesher is not None)
+    self._using_metal_meshing = bool(self.use_gpu_meshing and getattr(self, "meshing_backend_kind", engine_mode) == ENGINE_MODE_METAL and metal_mesher is not None)
     if self.use_gpu_meshing:
         self.mesh_backend_label = "Metal" if self._using_metal_meshing else "Wgpu"
     if self._using_metal_meshing and metal_mesher is not None:

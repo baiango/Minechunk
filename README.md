@@ -11,14 +11,16 @@ Current defaults:
 - world height: `2000` blocks (`200 m`)
 - horizontal render radius: `8` chunks, circular in XZ
 - vertical render radius: `16` chunk layers above and below the camera
-- caves: enabled with 3D noise
+- caves: enabled with gated 3D noise
 - default movement mode: AABB walk mode with gravity and collision
-- backend mode: `ENGINE_MODE_CPU`
+- renderer backend: WGPU
+- terrain backend: CPU
+- meshing backend: CPU
 - Radiance Cascades: off by default
 - tile merging: off by default
 - terrain, offscreen mesh, and tile zstd compression: on by default
 
-The renderer presents through `wgpu`, while the checked-in default keeps terrain generation and meshing on the CPU path unless `MINECHUNK_ENGINE_MODE` or `--engine` selects `wgpu`/`metal`.
+The renderer presents through `wgpu`, while terrain generation and meshing can be selected independently from the launcher or with `--terrain-backend` and `--meshing-backend`.
 
 ## What This Branch Is For
 
@@ -28,7 +30,7 @@ The branch exists to answer questions like:
 
 - can a Python voxel engine stream a real visible scene without hiding the cost?
 - what changes when the engine moves from 2D chunk columns to a true `(chunk_x, chunk_y, chunk_z)` stack?
-- how much memory, chunk churn, and frame time show up when the world is tall and nearby caves can breach the surface?
+- how much memory, chunk churn, and frame time show up when the world is tall and cave voxel fill is part of the terrain path?
 - how far can WGPU terrain and meshing be pushed before Python orchestration becomes the next bottleneck?
 
 ## World Contract
@@ -64,8 +66,8 @@ At full radius, the circular visible set is roughly `6,501` chunk slots. The con
 - AABB walk collision
 - profiling HUD
 - camera position in HUD
-- cave carving with 3D noise
-- surface hole / cave mouth support
+- cave carving with gated 3D noise
+- 3D caves that can naturally punch through the terrain skin
 - final-present screen-space crease shadow from the G-buffer
 - terrain zstd cache for CPU-side terrain payloads
 - experimental zstd readback caches for offscreen mesh and tile payloads
@@ -93,30 +95,33 @@ The stacked chunk WGPU path is not the old 2D-column path simply switched back o
 This branch ports the stream around local vertical chunks instead:
 
 1. The WGPU terrain backend generates batched surface height/material grids for `(chunk_x, chunk_y, chunk_z)` requests.
-2. `VOXEL_SURFACE_EXPAND_SHADER` expands each surface grid into a local `64`-block-high voxel chunk on the GPU.
-3. The expansion shader writes two extra ghost Y layers, so top/bottom faces can be culled correctly across vertical chunk boundaries.
-4. `VOXEL_MESH_BATCH_SHADER` counts faces, scans per-chunk offsets, and emits final vertices from that local chunk storage.
+2. The portable path reads those surface grids back and expands them through the shared CPU voxel-fill code, so cave carving follows the same Numba/Zig terrain model.
+3. Same-API GPU terrain plus GPU meshing can still use a zero-copy surface-buffer handoff.
+4. In that zero-copy path, `VOXEL_SURFACE_EXPAND_SHADER` expands each surface grid into a local `64`-block-high voxel chunk on the GPU using the same 3D cave formula, then `VOXEL_MESH_BATCH_SHADER` counts faces, scans per-chunk offsets, and emits vertices.
 5. Final mesh bounds and cache keys remain vertical-stack aware.
 
 The CPU fallback path still exists because collision, debug queries, and safe recovery are easier to keep deterministic while the WGPU stream is being validated.
 
 ## Terrain Model
 
-Terrain starts from layered 2D height noise, then fills solid voxels below the sampled surface. Caves are carved afterward with 3D noise.
+Terrain starts from layered 2D height noise, then fills solid voxels below the sampled surface. Caves are carved afterward with a gated 3D noise model.
 
 Current checked-in frequency tuning:
 
 - `TERRAIN_FREQUENCY_SCALE = 0.3`
-- `CAVE_FREQUENCY_SCALE = 0.5`
+- `CAVE_FREQUENCY_SCALE = 1.0`
+- `CAVE_DETAIL_FREQUENCY_MULTIPLIER = 3.0`
+- `CAVE_DETAIL_WEIGHT = 0.18`
 
 Broadly, that means:
 
 - hills come from layered 2D value noise
-- caves come from layered 3D value noise
-- caves are allowed to breach the surface in this branch
+- caves come from a primary 3D value-noise field plus a light high-frequency detail octave
+- the 3D cave field can carve from just above bedrock up to the terrain skin, so visible mouths stay connected to the same cave model
+- cave checks are skipped above the upper active vertical/depth range
 - material bands are derived from surface height and world height
 
-The important point is that the final mesh is built from **voxel occupancy**, not from a pure heightfield shell. If a cave removes voxels, the WGPU expansion/meshing path sees that occupancy directly.
+The important point is that the final mesh is built from **voxel occupancy**, not from a pure heightfield shell. In the portable terrain path, WGPU/Metal surface output is converted to voxel occupancy through the shared CPU fill so caves match the Numba/Zig model. In same-API zero-copy GPU meshing, the WGPU/Metal expansion shaders carry the same 3D cave constants.
 
 ## Movement And Collision
 
@@ -205,6 +210,35 @@ Install dependencies:
 python3 -m pip install -r requirements.txt
 ```
 
+Optional Zig terrain kernel:
+
+```bash
+python3 tools/build_zig_terrain.py
+```
+
+The build writes `libminechunk_terrain` into `engine/terrain/kernels/native/`. The CPU terrain backend loads it automatically through `ctypes` when present, otherwise it falls back to the existing Python/Numba kernels. CPU surface polling uses the Zig batch entry point so multiple chunks can be filled in one native call. Both CPU terrain kernels use f32 terrain noise/profile math; the Zig surface-grid path uses four-lane `@Vector(4, f32)` SIMD for adjacent X columns, and the Zig batch voxel path uses active cave-range gating plus four-lane SIMD cave checks. Use `MINECHUNK_TERRAIN_ZIG_LIB=/path/to/libminechunk_terrain` to point at a custom build, or `MINECHUNK_DISABLE_ZIG_TERRAIN=1` to force the fallback path.
+
+The launcher and `main.py` also expose the CPU terrain kernel choice directly:
+
+```bash
+python3 main.py --terrain-kernel auto   # Zig when built, otherwise Numba
+python3 main.py --terrain-kernel numba  # force Python/Numba kernels
+python3 main.py --terrain-kernel zig    # require the Zig shared library
+```
+
+Terrain kernel microbenchmark:
+
+```bash
+python3 tools/benchmark_terrain_kernels.py --chunks 128
+```
+
+Recent local reference on the default 128-chunk benchmark:
+
+- Numba f32: surface batch about `11-16 ms`, caves-off voxel fill about `16-24 ms`, caves-on voxel fill about `140-180 ms`
+- Zig f32/SIMD: surface batch about `1.3-2.1 ms`, caves-off voxel fill about `6.8-11.5 ms`, caves-on voxel fill about `60-75 ms`
+
+These numbers are hardware and thermal-state dependent; use the script above for the current machine.
+
 Run:
 
 ```bash
@@ -227,7 +261,7 @@ python3 benchmark_launcher.py --preset fly_forward_4096 --print-command
 For automated profiling runs, skip the GUI with `--headless` and override individual knobs. Headless launches are non-blocking by default; add `--wait` only when a script should block until `main.py` exits and return its exit code:
 
 ```bash
-python3 benchmark_launcher.py --headless --preset fixed_16x16x16 --engine wgpu --view 16x16x16 --terrain-batch-size 128 --mesh-batch-size 32 --no-rc
+python3 benchmark_launcher.py --headless --preset fixed_16x16x16 --terrain-backend wgpu --meshing-backend wgpu --view 16x16x16 --terrain-batch-size 128 --mesh-batch-size 32 --no-rc
 python3 benchmark_launcher.py --headless --wait --preset fly_forward_4096 --target-rendered-chunks 4096 --fly-speed-mps 20 --rc
 python3 benchmark_launcher.py --headless --preset fixed_16x16x16 --no-terrain-zstd --no-mesh-zstd --no-tile-merge --print-command
 ```
@@ -242,6 +276,9 @@ python3 main.py --benchmark-mode fixed --fixed-view 16x16x16 --no-terrain-zstd -
 
 Useful runtime flags:
 
+- `--renderer-backend wgpu`: renderer/presentation backend
+- `--terrain-backend cpu|wgpu|metal`: terrain generation backend
+- `--meshing-backend cpu|wgpu|metal`: voxel meshing backend
 - `--terrain-zstd / --no-terrain-zstd`: CPU-side terrain payload compression
 - `--mesh-zstd / --no-mesh-zstd`: experimental offscreen mesh readback compression
 - `--tile-merge / --no-tile-merge`: merged visible tile GPU buffers; default is off to reduce footprint
@@ -249,15 +286,19 @@ Useful runtime flags:
 
 ## Backend Notes
 
-Renderer backend selection lives in `engine/renderer_config.py`.
+Backend selection is exposed by the launcher and `main.py`.
 
-Available modes:
+Available renderer backend:
 
-- `ENGINE_MODE_CPU`
-- `ENGINE_MODE_WGPU`
-- `ENGINE_MODE_METAL`
+- `wgpu`
 
-The checked-in config now uses `ENGINE_MODE_CPU`. With stacked chunks enabled, that means:
+Available terrain and meshing backends:
+
+- `cpu`
+- `wgpu`
+- `metal`
+
+The checked-in defaults are CPU terrain and CPU meshing. With stacked chunks enabled, that means:
 
 - presentation: WGPU
 - terrain generation: CPU
@@ -274,7 +315,13 @@ The checked-in config now uses `ENGINE_MODE_CPU`. With stacked chunks enabled, t
 - `engine/terrain/world.py` — terrain world facade and backend selection
 - `engine/terrain/backends/cpu_terrain_backend.py` — stacked CPU fallback terrain path
 - `engine/terrain/backends/wgpu_terrain_backend.py` — WGPU terrain surface backend
-- `engine/terrain/kernels/core.py` — CPU terrain noise, cave carving, and fallback voxel fill kernels
+- `engine/terrain/kernels/noise.py` — shared Numba value-noise helpers
+- `engine/terrain/kernels/terrain_profile.py` — f32 surface profile and cave model
+- `engine/terrain/kernels/voxel_fill.py` — Numba stacked voxel fill kernels
+- `engine/terrain/kernels/zig_kernel.py` — ctypes wrapper for the optional Zig terrain kernel
+- `engine/terrain/kernels/native/terrain_kernel.zig` — Zig terrain kernel source
+- `tools/build_zig_terrain.py` — Zig shared-library build helper
+- `tools/benchmark_terrain_kernels.py` — Numba/Zig terrain microbenchmark
 - `engine/meshing/gpu_mesher.py` — WGPU surface expansion and voxel mesh batching
 - `engine/render_shaders.py` — Python shader loader/token substitution for checked-in shader assets
 - `engine/shaders/` — WGSL/MSL shader source files for render, terrain, meshing, RC, visibility, HUD, and postprocess passes
@@ -290,7 +337,7 @@ Minechunk, in this branch, is an experimental tall-world voxel engine with:
 - true stacked vertical chunks
 - 10 cm blocks
 - 200 m world height
-- caves carved with 3D noise
+- caves carved with upper-gated 3D noise that can reach the surface and continue down near bedrock
 - walk collision with an AABB player body
 - CPU-default terrain generation and X/Z run-length meshing, with WGPU/Metal experiments still available
 - screen-space crease shadow in the final present pass
